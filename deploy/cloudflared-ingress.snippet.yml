@@ -1,0 +1,7 @@
+# Add this rule to /etc/cloudflared/config.yml *above* the final `http_status:404` rule.
+# The tunnel (avalon-tunnel) already exists on AVALON; this only adds a hostname.
+  - hostname: monitor.avalontech.xyz
+    service: http://localhost:8787
+    originRequest:
+      noTLSVerify: false
+      connectTimeout: 10s

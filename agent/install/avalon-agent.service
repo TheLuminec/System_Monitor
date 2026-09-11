@@ -1,0 +1,19 @@
+[Unit]
+Description=Avalon Monitor agent
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/avalon-agent/venv/bin/python /opt/avalon-agent/avalon_agent.py --config /etc/avalon-agent/agent.conf
+Restart=always
+RestartSec=5
+Nice=10
+# Runs as root so it can read all disks/sensors/process names; it never writes anything.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

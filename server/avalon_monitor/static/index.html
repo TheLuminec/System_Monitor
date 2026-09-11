@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Avalon Monitor</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/theme.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/"><span class="logo">A</span>Avalon <small>Monitor</small></a>
+    <div class="fleet-stats" id="fleet-stats"></div>
+    <div class="spacer"></div>
+    <div class="seg" id="range-seg" role="group" aria-label="Time range"></div>
+    <button class="iconbtn" id="theme-btn" title="Toggle theme" aria-label="Toggle theme">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3a9 9 0 1 0 9 9c0-.5 0-1-.1-1.4A5.5 5.5 0 0 1 12.4 3.1C12.3 3 12.1 3 12 3z"/></svg>
+    </button>
+    <div class="userchip" id="userchip"><span class="conn" id="conn"></span><span id="user">…</span></div>
+  </header>
+  <main id="app"></main>
+  <div class="toast" id="toast"></div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

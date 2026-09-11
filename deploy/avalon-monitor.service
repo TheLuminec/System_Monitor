@@ -1,0 +1,32 @@
+[Unit]
+Description=Avalon Monitor hub (system resource dashboard)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=avalon-monitor
+Group=avalon-monitor
+WorkingDirectory=/opt/avalon-monitor/server
+EnvironmentFile=/etc/avalon-monitor/monitor.env
+Environment=AVM_ENV_FILE=/etc/avalon-monitor/monitor.env
+ExecStart=/opt/avalon-monitor/venv/bin/python -m avalon_monitor.main
+Restart=always
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/avalon-monitor
+StateDirectory=avalon-monitor
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
