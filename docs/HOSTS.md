@@ -32,11 +32,27 @@ AVM_WATCH_MOUNTS=/run/media/feng/Data
 ```
 
 Install (from a copy of `agent/` on Miami; agree timing with whoever owns the
-running jobs first — the unit runs at `Nice=10` and only *reads* `nvidia-smi`):
+running jobs first — the unit runs at `Nice=10` and only *reads* `nvidia-smi`).
+
+**Recommended for Miami — rootless, matching how its queue runner already runs**
+(`systemd --user` with linger). No sudo, nothing system-wide, venv under
+`~/.local/share/avalon-agent`, config at `~/.config/avalon-agent/agent.conf`:
+
+```bash
+./install/install-linux.sh --user --server http://avalon:8787 --token avm_… --name miami
+nano ~/.config/avalon-agent/agent.conf     # paste the block above
+systemctl --user restart avalon-agent
+# linger is already enabled on Miami for the queue runner; elsewhere: sudo loginctl enable-linger $USER
+```
+
+Running as the login user is enough: disk usage, sensors, `nvidia-smi`, and
+`/proc` process names/cmdlines are all readable without root.
+
+*Generic root install* (system unit, `/opt/avalon-agent`, `/etc/avalon-agent`):
 
 ```bash
 sudo ./install/install-linux.sh --server http://avalon:8787 --token avm_… --name miami
-sudo nano /etc/avalon-agent/agent.conf     # paste the block above
+sudo nano /etc/avalon-agent/agent.conf
 sudo systemctl restart avalon-agent
 ```
 
