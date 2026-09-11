@@ -41,6 +41,7 @@ from every machine, live on one page.
 | `agent/install/` | `install-linux.sh` + systemd unit, `install-windows.ps1` (Scheduled Task) |
 | `deploy/` | hub systemd unit, `install-server.sh`, cloudflared ingress snippet |
 | `docs/CLOUDFLARE.md` | step-by-step tunnel + Access setup |
+| `docs/HOSTS.md` | ready-to-paste `agent.conf` per machine (Miami, DESKTOP-C, AVALON, Pi) |
 
 ## 1. Install the hub on AVALON
 
@@ -105,6 +106,8 @@ AVM_TAGS=gpu,training               # shown as chips on the host page
 AVM_WATCH_PROCESSES=queue_runner.sh # process alive?  (name or cmdline substring)
 AVM_WATCH_FILES=/srv/queue/heartbeat:120   # file touched within N seconds?
 AVM_WATCH_TCP=127.0.0.1:11434       # port open?
+AVM_WATCH_MOUNTS=/run/media/feng/Data          # volume still mounted?
+AVM_WATCH_CONTENT=/srv/queue/current.txt       # show a file's first line (e.g. the running job)
 AVM_LHM_URL=http://localhost:8085/data.json  # Windows: LibreHardwareMonitor for temps / AMD-Intel GPUs
 ```
 

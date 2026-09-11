@@ -19,6 +19,10 @@ AVM_PROCESSES=8
 #AVM_WATCH_FILES=/home/user/.queue/heartbeat:120
 #   TCP ports that should be open:
 #AVM_WATCH_TCP=127.0.0.1:11434
+#   paths that must be mounted (removable / network volumes a job depends on):
+#AVM_WATCH_MOUNTS=/run/media/user/Data
+#   small text files whose first line is shown on the card (e.g. "current job"):
+#AVM_WATCH_CONTENT=/srv/queue/current.txt
 
 # Windows only: LibreHardwareMonitor's web server for CPU temp / AMD-Intel GPU data.
 #AVM_LHM_URL=http://localhost:8085/data.json

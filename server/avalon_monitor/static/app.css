@@ -129,6 +129,7 @@ main { padding: 20px; max-width: 1800px; margin: 0 auto; }
 .chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; background: var(--surface-2); border: 1px solid var(--border); color: var(--ink-2); white-space: nowrap; }
 .chip.ok { color: var(--s-good); border-color: color-mix(in srgb, var(--s-good) 35%, transparent); }
 .chip.bad { color: var(--s-crit); border-color: color-mix(in srgb, var(--s-crit) 45%, transparent); background: color-mix(in srgb, var(--s-crit) 10%, transparent); }
+.chip b { font-weight: 600; color: var(--ink-3); }
 .chip.warn { color: var(--s-warn); border-color: color-mix(in srgb, var(--s-warn) 35%, transparent); }
 
 .meters { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }

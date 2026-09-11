@@ -211,6 +211,10 @@ function updateCard(card, host) {
 
   const checks = $('[data-f="checks"]', card); checks.innerHTML = "";
   for (const c of s.checks || []) {
+    if (c.kind === "content" && c.ok) {
+      checks.append(h("span", { class: "chip", title: `${c.name} · updated ${fmt.ago(c.value)}` }, h("b", {}, c.name + ": "), c.detail));
+      continue;
+    }
     checks.append(h("span", { class: "chip " + (c.ok ? "ok" : "bad"), title: c.detail || "", html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(c.name) }));
   }
   if (s.memory?.committed != null && s.memory?.commit_limit) {

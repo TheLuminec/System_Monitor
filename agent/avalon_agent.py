@@ -16,6 +16,8 @@ Configuration (env vars override the config file; file is KEY=VALUE lines):
     AVM_WATCH_PROCESSES comma list of process names/cmdline substrings to check
     AVM_WATCH_FILES     comma list of path[:max_age_sec] heartbeat files to check
     AVM_WATCH_TCP       comma list of host:port to check
+    AVM_WATCH_MOUNTS    comma list of paths that must be mount points (removable/network volumes)
+    AVM_WATCH_CONTENT   comma list of small text files whose first line is shown (e.g. a "current job" file)
     AVM_LHM_URL         http://localhost:8085/data.json  (LibreHardwareMonitor on Windows)
     AVM_LOG_LEVEL       info
 
@@ -68,6 +70,8 @@ DEFAULTS = {
     "AVM_WATCH_PROCESSES": "",
     "AVM_WATCH_FILES": "",
     "AVM_WATCH_TCP": "",
+    "AVM_WATCH_MOUNTS": "",
+    "AVM_WATCH_CONTENT": "",
     "AVM_LHM_URL": "",
     "AVM_LOG_LEVEL": "info",
 }
@@ -740,6 +744,22 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
                            "detail": "updated %ds ago (max %ds)" % (age, max_age), "value": round(age, 1)})
         except OSError:
             checks.append({"name": os.path.basename(path) or path, "kind": "file", "ok": False, "detail": "missing"})
+    for path in _csv(cfg["AVM_WATCH_MOUNTS"]):
+        try:
+            mounted = os.path.ismount(path)
+        except OSError:
+            mounted = False
+        checks.append({"name": os.path.basename(path.rstrip("/\\")) or path, "kind": "mount", "ok": mounted,
+                       "detail": ("mounted at " + path) if mounted else ("NOT mounted: " + path)})
+    for path in _csv(cfg["AVM_WATCH_CONTENT"]):
+        name = os.path.basename(path) or path
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                line = f.readline().strip()
+            age = time.time() - os.stat(path).st_mtime
+            checks.append({"name": name, "kind": "content", "ok": True, "detail": line[:160] or "(empty)", "value": round(age, 1)})
+        except OSError as e:
+            checks.append({"name": name, "kind": "content", "ok": False, "detail": "unreadable: %s" % e.strerror})
     for item in _csv(cfg["AVM_WATCH_TCP"]):
         host, _, port = item.rpartition(":")
         t0 = time.monotonic()
