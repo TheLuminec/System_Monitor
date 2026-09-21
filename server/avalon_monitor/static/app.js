@@ -230,6 +230,7 @@ function updateCard(card, host) {
     const cls = c.ok ? (c.kind === "unit" && !(c.value > 0) ? "" : "ok") : (c.level === "warning" ? "warn" : "bad");
     checks.append(h("span", { class: "chip " + cls, title: c.detail || "", html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(label) }));
   }
+  if (host.agent_outdated && host.status === "online") checks.append(h("span", { class: "chip warn", title: `running agent ${host.agent_version || "?"}; the hub serves a newer script and the agent updates itself on its next report` }, "agent updating"));
   if (s.memory?.committed != null && s.memory?.commit_limit) {
     const cp = (100 * s.memory.committed) / s.memory.commit_limit;
     if (cp >= 85) checks.append(h("span", { class: "chip warn", title: `committed ${fmt.bytes(s.memory.committed)} of ${fmt.bytes(s.memory.commit_limit)} limit` }, `commit ${Math.round(cp)}%`));
@@ -357,7 +358,7 @@ function renderEditor(host) {
   for (const k of CHECK_KINDS) for (const v of (cfg[k.key] || "").split(",").map((x) => x.trim()).filter(Boolean)) rows.push({ key: k.key, value: v });
   const agentRev = host.agent_rev, hubRev = host.check_rev || 0;
   const status = agentRev == null
-    ? (host.status === "online" ? "agent predates remote checks - upgrade it to 1.1.0 (copy avalon_agent.py, then respawn)" : "")
+    ? (host.status === "online" ? "agent predates remote checks (1.1+) - copy the new avalon_agent.py over once; from 1.2 on, agents update themselves" : "")
     : agentRev === hubRev ? `agent is running revision ${hubRev}` : `revision ${hubRev} saved - agent still on ${agentRev}, applies on its next push`;
   const list = h("div", { class: "editor-rows" });
   const rowEl = (r) => {
@@ -423,6 +424,7 @@ function updateDetail(host) {
   meta.append(chip(osLabel(hi)), chip(hi.arch || "?"), chip((hi.cpu_model || "cpu").replace(/\s+/g, " ").slice(0, 48) + (hi.cpu_count ? ` · ${hi.cpu_count}c` : "")));
   if (hi.uptime_sec != null) meta.append(chip("up " + fmt.dur(hi.uptime_sec)));
   meta.append(chip(host.status === "online" ? "live" : "seen " + fmt.ago(host.age_sec), host.status === "online" ? "ok" : "bad"));
+  if (hi.agent_version) meta.append(chip(`agent ${hi.agent_version}` + (host.agent_outdated ? " → updating" : ""), host.agent_outdated ? "warn" : ""));
   for (const t of hi.tags || []) meta.append(chip("#" + t));
 
   // KPIs

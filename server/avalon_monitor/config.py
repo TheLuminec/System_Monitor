@@ -80,6 +80,11 @@ class Settings:
     gpu_stall_minutes: int = 10
     gpu_stall_percent: float = 5.0
 
+    # Agent auto-update: the hub serves this script (default: the agent/ dir shipped
+    # beside server/) and agents replace themselves when its hash changes.
+    agent_script: str = ""
+    agent_auto_update: bool = True
+
     # Public URL (informational; used in /api/v1/config for the UI)
     public_url: str = ""
 
@@ -107,6 +112,8 @@ def load_settings() -> Settings:
     s.max_payload_bytes = int(env.get("AVM_MAX_PAYLOAD_BYTES", s.max_payload_bytes))
     s.gpu_stall_minutes = int(env.get("AVM_RULE_GPU_STALL_MINUTES", s.gpu_stall_minutes))
     s.gpu_stall_percent = float(env.get("AVM_RULE_GPU_STALL_PERCENT", s.gpu_stall_percent))
+    s.agent_script = env.get("AVM_AGENT_SCRIPT", "")
+    s.agent_auto_update = _bool(env.get("AVM_AGENT_AUTO_UPDATE"), True)
     s.public_url = env.get("AVM_PUBLIC_URL", "")
     return s
 

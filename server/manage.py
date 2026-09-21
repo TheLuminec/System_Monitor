@@ -9,6 +9,7 @@
     manage.py stats
     manage.py checks NAME [--set AVM_WATCH_PROCESSES=nginx,sshd ...] [--clear]
     manage.py respawn NAME|all        # agent re-execs itself on its next push
+    manage.py agents                  # served agent version vs. what each host runs
 
 Uses the same AVM_* environment (or .env) as the server, so run it with the
 server's environment file, e.g.:
@@ -59,6 +60,7 @@ def main(argv=None) -> int:
     p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     p.add_argument("--clear", action="store_true", help="remove all remote settings (agent falls back to its file)")
     sub.add_parser("respawn", help="ask an agent (or all) to re-exec itself").add_argument("name")
+    sub.add_parser("agents", help="agent versions: served by the hub vs running on each host")
 
     args = ap.parse_args(argv)
     db = Database(settings.db_path)
@@ -115,6 +117,17 @@ def main(argv=None) -> int:
             for n in targets:
                 db.set_command(n, "respawn")
                 print(f"queued respawn for {n}")
+        elif args.cmd == "agents":
+            from avalon_monitor.main import agent_bundle
+            agent_bundle.refresh()
+            print(f"hub serves agent {agent_bundle.version or '(none)'} {agent_bundle.sha256[:12]} from {agent_bundle.path}")
+            print(f"auto-update {'on' if settings.agent_auto_update else 'OFF (AVM_AGENT_AUTO_UPDATE=false)'}\n")
+            for h in db.list_hosts():
+                smp = h.last_sample or {}
+                ver = (smp.get("host") or {}).get("agent_version") or "-"
+                sha = smp.get("agent_sha256")
+                state = "up to date" if sha == agent_bundle.sha256 else ("no self-update support (<1.2)" if not sha else "OUTDATED - updates on next push")
+                print(f"{h.name:<14} {ver:<8} {state}   (seen {_age(h.last_seen)})")
         elif args.cmd == "stats":
             for k, v in db.stats().items():
                 print(f"{k:<14} {v}")

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,6 +27,7 @@ logging.basicConfig(level=settings.log_level.upper(), format="%(asctime)s %(leve
 log = logging.getLogger("avalon")
 
 STATIC_DIR = Path(__file__).parent / "static"
+AGENT_SCRIPT = Path(settings.agent_script) if settings.agent_script else Path(__file__).resolve().parents[2] / "agent" / "avalon_agent.py"
 RANGES = {"15m": 900, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 
 # Agent settings the dashboard may set remotely (pushed to the agent in every ingest reply).
@@ -58,9 +61,41 @@ class LiveHub:
             self.clients.discard(ws)
 
 
+class AgentBundle:
+    """The agent script the hub hands out, re-read when the file changes."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._mtime = -1.0
+        self.data = b""
+        self.sha256 = ""
+        self.version = ""
+        self.refresh()
+
+    def refresh(self) -> None:
+        try:
+            st = self.path.stat()
+        except OSError:
+            self.data, self.sha256, self.version, self._mtime = b"", "", "", -1.0
+            return
+        if st.st_mtime == self._mtime:
+            return
+        self.data = self.path.read_bytes()
+        self.sha256 = hashlib.sha256(self.data).hexdigest()
+        m = re.search(rb'^AGENT_VERSION\s*=\s*"([^"]+)"', self.data, re.M)
+        self.version = m.group(1).decode() if m else "?"
+        self._mtime = st.st_mtime
+        log.info("serving agent %s (%s) from %s", self.version, self.sha256[:12], self.path)
+
+    @property
+    def available(self) -> bool:
+        return bool(self.data)
+
+
 db = Database(settings.db_path)
 authz = Authorizer(settings)
 hub = LiveHub()
+agent_bundle = AgentBundle(AGENT_SCRIPT)
 gpu_stall = GpuStallRule(minutes=settings.gpu_stall_minutes, percent=settings.gpu_stall_percent)
 
 
@@ -127,6 +162,10 @@ def host_public(h: HostRow, full: bool = False) -> dict[str, Any]:
         "summary": _summary_of(h.last_sample),
         "check_rev": h.check_rev,
         "agent_rev": (h.last_sample or {}).get("config_rev"),
+        "agent_version": ((h.last_sample or {}).get("host") or {}).get("agent_version"),
+        "agent_sha256": (h.last_sample or {}).get("agent_sha256"),
+        "agent_outdated": bool(agent_bundle.available and (h.last_sample or {}).get("agent_sha256")
+                               and (h.last_sample or {}).get("agent_sha256") != agent_bundle.sha256),
     }
     if full:
         out["sample"] = h.last_sample
@@ -262,7 +301,41 @@ async def ingest(request: Request):
         if cmd:
             reply["command"] = cmd
             log.info("sent command %r to %s", cmd, updated.name)
+    agent_bundle.refresh()
+    if agent_bundle.available:
+        reply["agent"] = {"version": agent_bundle.version, "sha256": agent_bundle.sha256,
+                          "auto_update": settings.agent_auto_update}
     return reply
+
+
+@app.get("/api/v1/agent/script")
+async def agent_script(request: Request):
+    """The current agent script, for self-update. Same access rules as ingest."""
+    ip = client_ip(request)
+    try:
+        authz.ingest_allowed(request.headers, ip)
+    except AuthError as e:
+        raise HTTPException(e.status, e.detail)
+    auth = request.headers.get("authorization", "")
+    host = await run_in_threadpool(db.host_by_token, auth[7:].strip()) if auth.lower().startswith("bearer ") else None
+    if host is None or not host.enabled:
+        raise HTTPException(401, "unknown or disabled token")
+    agent_bundle.refresh()
+    if not agent_bundle.available:
+        raise HTTPException(404, "hub has no agent script to serve")
+    return Response(agent_bundle.data, media_type="text/x-python",
+                    headers={"X-Agent-Version": agent_bundle.version, "X-Agent-Sha256": agent_bundle.sha256})
+
+
+@app.get("/api/v1/agent")
+async def agent_info(ident: Identity = Depends(require_viewer)):
+    agent_bundle.refresh()
+    hosts = await run_in_threadpool(db.list_hosts)
+    return {"version": agent_bundle.version, "sha256": agent_bundle.sha256, "path": str(agent_bundle.path),
+            "auto_update": settings.agent_auto_update,
+            "hosts": [{"name": h.name, "version": ((h.last_sample or {}).get("host") or {}).get("agent_version"),
+                       "sha256": (h.last_sample or {}).get("agent_sha256"),
+                       "up_to_date": (h.last_sample or {}).get("agent_sha256") == agent_bundle.sha256} for h in hosts]}
 
 
 # -------------------------------------------------------------- dashboard API
@@ -275,6 +348,7 @@ async def get_config(ident: Identity = Depends(require_viewer)):
         "ranges": RANGES,
         "metrics": list(METRICS),
         "access_enabled": settings.access_enabled,
+        "agent_version": agent_bundle.version,
     }
 
 

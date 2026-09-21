@@ -31,4 +31,7 @@ AVM_PROCESSES=8
 # Windows only: LibreHardwareMonitor's web server for CPU temp / AMD-Intel GPU data.
 #AVM_LHM_URL=http://localhost:8085/data.json
 
+# Replace this script with the hub's copy when the hub is upgraded (verified by hash), then respawn.
+AVM_AUTO_UPDATE=true
+
 AVM_LOG_LEVEL=info

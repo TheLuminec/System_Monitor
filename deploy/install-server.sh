@@ -20,7 +20,7 @@ id -u "$SVC_USER" >/dev/null 2>&1 || useradd --system --home-dir "$DATA_DIR" --s
 echo "==> copying code to $APP_DIR"
 mkdir -p "$APP_DIR"
 rsync -a --delete --exclude '.venv' --exclude '__pycache__' --exclude '*.db*' --exclude '.env' "$REPO_DIR/server/" "$APP_DIR/server/"
-cp "$REPO_DIR/agent/avalon_agent.py" "$APP_DIR/"  # handy for running the hub's own agent
+rsync -a --delete --exclude '__pycache__' "$REPO_DIR/agent/" "$APP_DIR/agent/"   # served to agents for self-update
 
 echo "==> python venv"
 [[ -x "$APP_DIR/venv/bin/python" ]] || python3 -m venv "$APP_DIR/venv"
@@ -62,6 +62,10 @@ Avalon Monitor hub installed.
   Enroll a host:        avalon-monitor-manage add-host <name>
   Logs:                 journalctl -u avalon-monitor -f
   Config:               $ETC_DIR/monitor.env  (then: systemctl restart avalon-monitor)
+
+Agents self-update from this hub: every enrolled agent (1.2+) replaces itself with
+$APP_DIR/agent/avalon_agent.py on its next report when the file changes.
+Check with: avalon-monitor-manage agents
 
 Next: docs/CLOUDFLARE.md to publish it at monitor.avalontech.xyz behind Cloudflare Access.
 MSG

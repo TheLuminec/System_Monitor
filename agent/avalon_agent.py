@@ -28,6 +28,7 @@ Configuration (env vars override the config file; file is KEY=VALUE lines):
     AVM_WATCH_NONEMPTY  comma list of files that should have at least one non-blank line (e.g. queue.txt);
                         an empty one raises a warning chip - silence from a queue is not success
     AVM_LHM_URL         http://localhost:8085/data.json  (LibreHardwareMonitor on Windows)
+    AVM_AUTO_UPDATE     true    replace this script with the hub's copy when its hash changes, then respawn
     AVM_LOG_LEVEL       info
 
 The hub may override the AVM_WATCH_* / AVM_PROCESSES / AVM_TAGS / AVM_MEM_AVAILABLE_WARN_GB
@@ -43,6 +44,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -64,7 +66,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -92,6 +94,7 @@ DEFAULTS = {
     "AVM_WATCH_JOBS": "",
     "AVM_MEM_AVAILABLE_WARN_GB": "",
     "AVM_LHM_URL": "",
+    "AVM_AUTO_UPDATE": "true",
     "AVM_LOG_LEVEL": "info",
 }
 
@@ -987,6 +990,69 @@ class RemoteConfig:
         return out
 
 
+# ---------------------------------------------------------- self-update
+_SELF_PATH = os.path.abspath(__file__)
+_SELF_SHA: Dict[str, Optional[str]] = {"value": None}
+_UPDATE_BACKOFF = {"until": 0.0}
+
+
+def self_sha256() -> Optional[str]:
+    if _SELF_SHA["value"] is None:
+        try:
+            with open(_SELF_PATH, "rb") as f:
+                _SELF_SHA["value"] = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return None
+    return _SELF_SHA["value"]
+
+
+def self_update(cfg: Dict[str, str], info: Dict[str, Any]) -> bool:
+    """Replace this script with the hub's copy if its hash differs. Returns True if replaced."""
+    want = info.get("sha256")
+    if not want or want == self_sha256():
+        return False
+    if not info.get("auto_update", True) or cfg["AVM_AUTO_UPDATE"].strip().lower() not in ("1", "true", "yes", "on"):
+        return False
+    if time.monotonic() < _UPDATE_BACKOFF["until"]:
+        return False
+    _UPDATE_BACKOFF["until"] = time.monotonic() + 600  # one attempt per 10 min, success resets by respawning
+    url = cfg["AVM_SERVER_URL"].rstrip("/") + "/api/v1/agent/script"
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + cfg["AVM_TOKEN"], "User-Agent": "avalon-agent/" + AGENT_VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = r.read()
+    except Exception as e:
+        log.warning("self-update: download failed: %s", e)
+        return False
+    got = hashlib.sha256(data).hexdigest()
+    if got != want:
+        log.warning("self-update: hash mismatch (hub says %s, got %s) - not installing", want[:12], got[:12])
+        return False
+    try:
+        compile(data, _SELF_PATH, "exec")  # never install a script that cannot even parse
+    except SyntaxError as e:
+        log.error("self-update: new script has a syntax error (%s) - not installing", e)
+        return False
+    tmp = _SELF_PATH + ".new"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        try:
+            os.chmod(tmp, os.stat(_SELF_PATH).st_mode)
+        except OSError:
+            pass
+        os.replace(tmp, _SELF_PATH)
+    except OSError as e:
+        log.error("self-update: cannot write %s: %s", _SELF_PATH, e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+    log.info("self-update: installed agent %s (%s), respawning", info.get("version", "?"), got[:12])
+    return True
+
+
 def respawn() -> None:
     """Replace this process with a fresh copy of itself (new script/config, same supervisor)."""
     log.info("respawning on hub request")
@@ -1065,6 +1131,7 @@ def main(argv=None) -> int:
                 _HOST_STATIC.clear()  # tags are part of the cached host info
             sample = collect_sample(eff, interval)
             sample["config_rev"] = remote.rev if remote.rev is not None else 0
+            sample["agent_sha256"] = self_sha256()
             reply = push(cfg, sample)
             if failures:
                 log.info("hub reachable again")
@@ -1072,6 +1139,8 @@ def main(argv=None) -> int:
             if remote.apply(reply):
                 log.info("applied remote settings rev %s: %s", remote.rev, ", ".join(sorted(remote.overrides)) or "(cleared)")
             if reply.get("command") == "respawn":
+                respawn()
+            if isinstance(reply.get("agent"), dict) and self_update(cfg, reply["agent"]):
                 respawn()
         except urllib.error.HTTPError as e:
             failures += 1

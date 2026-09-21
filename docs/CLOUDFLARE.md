@@ -40,7 +40,7 @@ until Access is set up. Good.
 1. <https://one.dash.cloudflare.com> → **Access → Applications → Add an application → Self-hosted**.
 2. Application name: `Avalon Monitor`. Domain: `monitor.avalontech.xyz`.
    Session duration: 24h is comfortable for a personal dashboard.
-3. **Policy**: name `Owner`, action *Allow*, include → *Emails* → `theluminec@gmail.com`
+3. **Policy**: name `Owner`, action *Allow*, include → *Emails* → `you@example.com` (the address you sign in with)
    (add more emails, or an *Emails ending in* rule, as you like).
    Leave the default *One-time PIN* login method on, or add Google/GitHub under
    **Settings → Authentication** for one-click sign-in.

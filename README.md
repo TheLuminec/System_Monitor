@@ -38,7 +38,7 @@ from every machine, live on one page.
 | `server/avalon_monitor/` | hub: `main.py` (API/WS), `db.py` (storage), `auth.py` (Access + tokens), `static/` (dashboard) |
 | `server/manage.py` | enroll / list / disable / remove hosts, rotate tokens |
 | `agent/avalon_agent.py` | the agent (only dependency: `psutil`) |
-| `agent/install/` | `install-linux.sh` + systemd unit, `install-windows.ps1` (Scheduled Task) |
+| `agent/install/` | `install-linux.sh` (root or `--user`) + systemd unit, `install-windows.ps1` (Scheduled Task) |
 | `deploy/` | hub systemd unit, `install-server.sh`, cloudflared ingress snippet |
 | `docs/CLOUDFLARE.md` | step-by-step tunnel + Access setup |
 | `docs/HOSTS.md` | ready-to-paste `agent.conf` per machine (Miami, DESKTOP-C, AVALON, Pi) |
@@ -129,6 +129,24 @@ GPU sources, in order: `nvidia-smi` (Linux & Windows), amdgpu `sysfs`
 LibreHardwareMonitor (Windows). Because a job can be data-loader-bound while the
 GPU idles, the host page shows per-process CPU right beside GPU utilisation,
 and the fleet card shows the busiest process.
+
+### Upgrading later — agents update themselves
+
+Agents (1.2+) compare the SHA-256 of their own script with the one the hub
+serves in every report reply. When you upgrade the hub
+(`git pull && sudo ./deploy/install-server.sh`), each agent downloads the new
+`avalon_agent.py` on its next report, verifies the hash, checks it compiles,
+replaces itself atomically and re-execs — the whole fleet converges within
+one interval, with no per-machine steps and no inbound ports. Check with
+`avalon-monitor-manage agents`; pause fleet-wide with
+`AVM_AGENT_AUTO_UPDATE=false` on the hub or per host with
+`AVM_AUTO_UPDATE=false` in its `agent.conf`. A script that fails the hash or
+syntax check is never installed. The download uses the same token and
+tailnet-only rules as ingest (Tailscale encrypts the hop).
+
+Checks can be edited from the dashboard (host page → **Checks**) and a
+**Respawn agent** button re-execs an agent in place; both ride the same reply
+channel.
 
 ## 3. Publish it at `monitor.avalontech.xyz`
 
