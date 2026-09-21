@@ -131,6 +131,7 @@ class Sample(BaseModel):
     interval: Optional[float] = None
     config_rev: Optional[int] = None    # revision of hub-pushed check config the agent is running (None: unsupported)
     agent_sha256: Optional[str] = None  # sha256 of the agent's own script file (for auto-update)
+    agent_update_error: Optional[str] = None  # last self-update failure, if any
     host: HostInfo
     cpu: CpuMetrics = Field(default_factory=CpuMetrics)
     memory: MemoryMetrics = Field(default_factory=MemoryMetrics)

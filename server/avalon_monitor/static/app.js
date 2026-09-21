@@ -1,5 +1,5 @@
 // Avalon Monitor dashboard. Zero-build ES module: fleet view, host detail, live WebSocket.
-import { TimeChart, drawSparkline } from "./charts.js";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.2.0";
 
 // ------------------------------------------------------------------ utils
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -230,7 +230,8 @@ function updateCard(card, host) {
     const cls = c.ok ? (c.kind === "unit" && !(c.value > 0) ? "" : "ok") : (c.level === "warning" ? "warn" : "bad");
     checks.append(h("span", { class: "chip " + cls, title: c.detail || "", html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(label) }));
   }
-  if (host.agent_outdated && host.status === "online") checks.append(h("span", { class: "chip warn", title: `running agent ${host.agent_version || "?"}; the hub serves a newer script and the agent updates itself on its next report` }, "agent updating"));
+  if (host.agent_update_error) checks.append(h("span", { class: "chip bad", title: host.agent_update_error }, "agent update failed"));
+  else if (host.agent_outdated && host.status === "online") checks.append(h("span", { class: "chip warn", title: `running agent ${host.agent_version || "?"}; the hub serves a newer script and the agent updates itself on its next report` }, "agent updating"));
   if (s.memory?.committed != null && s.memory?.commit_limit) {
     const cp = (100 * s.memory.committed) / s.memory.commit_limit;
     if (cp >= 85) checks.append(h("span", { class: "chip warn", title: `committed ${fmt.bytes(s.memory.committed)} of ${fmt.bytes(s.memory.commit_limit)} limit` }, `commit ${Math.round(cp)}%`));
@@ -424,7 +425,11 @@ function updateDetail(host) {
   meta.append(chip(osLabel(hi)), chip(hi.arch || "?"), chip((hi.cpu_model || "cpu").replace(/\s+/g, " ").slice(0, 48) + (hi.cpu_count ? ` · ${hi.cpu_count}c` : "")));
   if (hi.uptime_sec != null) meta.append(chip("up " + fmt.dur(hi.uptime_sec)));
   meta.append(chip(host.status === "online" ? "live" : "seen " + fmt.ago(host.age_sec), host.status === "online" ? "ok" : "bad"));
-  if (hi.agent_version) meta.append(chip(`agent ${hi.agent_version}` + (host.agent_outdated ? " → updating" : ""), host.agent_outdated ? "warn" : ""));
+  if (hi.agent_version) {
+    const c = chip(`agent ${hi.agent_version}` + (host.agent_update_error ? " · update failed" : host.agent_outdated ? " → updating" : ""), host.agent_update_error ? "bad" : host.agent_outdated ? "warn" : "");
+    if (host.agent_update_error) c.title = host.agent_update_error;
+    meta.append(c);
+  }
   for (const t of hi.tags || []) meta.append(chip("#" + t));
 
   // KPIs
@@ -469,7 +474,7 @@ function updateDetail(host) {
     h("td", {}, x.label), h("td", { class: "r num" }, fmt.temp(x.current)), h("td", { class: "r num muted" }, fmt.temp(x.high)), h("td", { class: "r num muted" }, fmt.temp(x.critical))))));
   tb.append(h("div", { class: "card table-card" }, h("h3", {}, "Host"), h("dl", { class: "kvlist" },
     ...[["Hostname", hi.hostname], ["OS", osLabel(hi)], ["Kernel", hi.kernel], ["Platform", hi.platform], ["CPU", hi.cpu_model], ["Cores", hi.cpu_count != null ? `${hi.cpu_count} logical · ${hi.cpu_count_physical ?? "?"} physical` : null],
-      ["Booted", hi.boot_time ? new Date(hi.boot_time * 1000).toLocaleString() : null], ["Agent", hi.agent_version ? "v" + hi.agent_version : null], ["Agent IP", host.last_ip], ["Interval", s.interval ? s.interval + " s" : null], ["Notes", host.notes]]
+      ["Booted", hi.boot_time ? new Date(hi.boot_time * 1000).toLocaleString() : null], ["Agent", hi.agent_version ? "v" + hi.agent_version : null], ["Agent update", host.agent_update_error ? "FAILED: " + host.agent_update_error : null], ["Agent IP", host.last_ip], ["Interval", s.interval ? s.interval + " s" : null], ["Notes", host.notes]]
       .filter(([, v]) => v).flatMap(([k2, v]) => [h("dt", {}, k2), h("dd", {}, v)]))));
 }
 

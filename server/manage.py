@@ -128,6 +128,8 @@ def main(argv=None) -> int:
                 sha = smp.get("agent_sha256")
                 state = "up to date" if sha == agent_bundle.sha256 else ("no self-update support (<1.2)" if not sha else "OUTDATED - updates on next push")
                 print(f"{h.name:<14} {ver:<8} {state}   (seen {_age(h.last_seen)})")
+                if smp.get("agent_update_error"):
+                    print(f"{'':<14} last self-update error: {smp['agent_update_error']}")
         elif args.cmd == "stats":
             for k, v in db.stats().items():
                 print(f"{k:<14} {v}")

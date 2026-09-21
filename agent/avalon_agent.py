@@ -994,16 +994,24 @@ class RemoteConfig:
 _SELF_PATH = os.path.abspath(__file__)
 _SELF_SHA: Dict[str, Optional[str]] = {"value": None}
 _UPDATE_BACKOFF = {"until": 0.0}
+_UPDATE_STATE: Dict[str, Optional[str]] = {"error": None}
 
 
 def self_sha256() -> Optional[str]:
+    """Hash of this script with line endings normalised, so a CRLF copy of the same code is not 'outdated'."""
     if _SELF_SHA["value"] is None:
         try:
             with open(_SELF_PATH, "rb") as f:
-                _SELF_SHA["value"] = hashlib.sha256(f.read()).hexdigest()
+                _SELF_SHA["value"] = hashlib.sha256(f.read().replace(b"\r\n", b"\n")).hexdigest()
         except OSError:
             return None
     return _SELF_SHA["value"]
+
+
+def _update_failed(msg: str) -> bool:
+    _UPDATE_STATE["error"] = msg
+    log.error("self-update: %s", msg)
+    return False
 
 
 def self_update(cfg: Dict[str, str], info: Dict[str, Any]) -> bool:
@@ -1022,17 +1030,14 @@ def self_update(cfg: Dict[str, str], info: Dict[str, Any]) -> bool:
         with urllib.request.urlopen(req, timeout=20) as r:
             data = r.read()
     except Exception as e:
-        log.warning("self-update: download failed: %s", e)
-        return False
-    got = hashlib.sha256(data).hexdigest()
+        return _update_failed("download failed: %s" % e)
+    got = hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
     if got != want:
-        log.warning("self-update: hash mismatch (hub says %s, got %s) - not installing", want[:12], got[:12])
-        return False
+        return _update_failed("hash mismatch (hub says %s, got %s) - not installing" % (want[:12], got[:12]))
     try:
         compile(data, _SELF_PATH, "exec")  # never install a script that cannot even parse
     except SyntaxError as e:
-        log.error("self-update: new script has a syntax error (%s) - not installing", e)
-        return False
+        return _update_failed("new script has a syntax error (%s) - not installing" % e)
     tmp = _SELF_PATH + ".new"
     try:
         with open(tmp, "wb") as f:
@@ -1041,16 +1046,31 @@ def self_update(cfg: Dict[str, str], info: Dict[str, Any]) -> bool:
             os.chmod(tmp, os.stat(_SELF_PATH).st_mode)
         except OSError:
             pass
-        os.replace(tmp, _SELF_PATH)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, _SELF_PATH)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(1.0)  # Windows: antivirus / indexer may hold the new file briefly
     except OSError as e:
-        log.error("self-update: cannot write %s: %s", _SELF_PATH, e)
         try:
             os.remove(tmp)
         except OSError:
             pass
-        return False
+        return _update_failed("cannot replace %s: %s (running as %s)" % (_SELF_PATH, e, _whoami()))
+    _UPDATE_STATE["error"] = None
     log.info("self-update: installed agent %s (%s), respawning", info.get("version", "?"), got[:12])
     return True
+
+
+def _whoami() -> str:
+    try:
+        import getpass
+        return getpass.getuser()
+    except Exception:
+        return "?"
 
 
 def respawn() -> None:
@@ -1132,6 +1152,7 @@ def main(argv=None) -> int:
             sample = collect_sample(eff, interval)
             sample["config_rev"] = remote.rev if remote.rev is not None else 0
             sample["agent_sha256"] = self_sha256()
+            sample["agent_update_error"] = _UPDATE_STATE["error"]
             reply = push(cfg, sample)
             if failures:
                 log.info("hub reachable again")
@@ -1140,8 +1161,12 @@ def main(argv=None) -> int:
                 log.info("applied remote settings rev %s: %s", remote.rev, ", ".join(sorted(remote.overrides)) or "(cleared)")
             if reply.get("command") == "respawn":
                 respawn()
-            if isinstance(reply.get("agent"), dict) and self_update(cfg, reply["agent"]):
-                respawn()
+            if isinstance(reply.get("agent"), dict):
+                try:
+                    if self_update(cfg, reply["agent"]):
+                        respawn()
+                except Exception as e:  # never let an update problem stop reporting
+                    _update_failed("unexpected error: %r" % e)
         except urllib.error.HTTPError as e:
             failures += 1
             if failures in (1, 10) or failures % 100 == 0:

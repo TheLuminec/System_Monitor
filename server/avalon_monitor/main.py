@@ -166,6 +166,7 @@ def host_public(h: HostRow, full: bool = False) -> dict[str, Any]:
         "agent_sha256": (h.last_sample or {}).get("agent_sha256"),
         "agent_outdated": bool(agent_bundle.available and (h.last_sample or {}).get("agent_sha256")
                                and (h.last_sample or {}).get("agent_sha256") != agent_bundle.sha256),
+        "agent_update_error": (h.last_sample or {}).get("agent_update_error"),
     }
     if full:
         out["sample"] = h.last_sample
@@ -248,6 +249,9 @@ async def security_headers(request: Request, call_next):
     )
     if request.url.path == "/" or request.url.path.endswith(".html"):
         response.headers["Cache-Control"] = "no-store"
+    elif request.url.path.startswith("/static/"):
+        # Always revalidate (ETag) so a hub upgrade reaches open browsers without a hard refresh.
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 
@@ -335,6 +339,7 @@ async def agent_info(ident: Identity = Depends(require_viewer)):
             "auto_update": settings.agent_auto_update,
             "hosts": [{"name": h.name, "version": ((h.last_sample or {}).get("host") or {}).get("agent_version"),
                        "sha256": (h.last_sample or {}).get("agent_sha256"),
+                       "update_error": (h.last_sample or {}).get("agent_update_error"),
                        "up_to_date": (h.last_sample or {}).get("agent_sha256") == agent_bundle.sha256} for h in hosts]}
 
 
@@ -483,7 +488,8 @@ async def index(request: Request):
         authz.viewer(request.headers, request.cookies, client_ip(request))
     except AuthError as e:
         return JSONResponse({"detail": e.detail}, status_code=e.status)
-    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
+    html = (STATIC_DIR / "index.html").read_text().replace("__V__", __version__)
+    return Response(html, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
