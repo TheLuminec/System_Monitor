@@ -23,6 +23,10 @@ AVM_PROCESSES=8
 #AVM_WATCH_MOUNTS=/run/media/user/Data
 #   small text files whose first line is shown on the card (e.g. "current job"):
 #AVM_WATCH_CONTENT=/srv/queue/current.txt
+#   globs that must match nothing - a crashed run announces itself with a marker file:
+#AVM_WATCH_MARKERS=/srv/queue/*.failed
+#   files that should never be empty - an empty queue is a warning, not success:
+#AVM_WATCH_NONEMPTY=/srv/queue/queue.txt
 
 # Windows only: LibreHardwareMonitor's web server for CPU temp / AMD-Intel GPU data.
 #AVM_LHM_URL=http://localhost:8085/data.json

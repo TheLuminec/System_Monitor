@@ -29,7 +29,19 @@ AVM_WATCH_FILES=/run/media/feng/Data/CalebProject/scratch/queue/runner.heartbeat
 AVM_WATCH_CONTENT=/run/media/feng/Data/CalebProject/scratch/queue/current.txt
 # the queue lives on a removable volume: if the mount drops, every other meter still looks healthy
 AVM_WATCH_MOUNTS=/run/media/feng/Data
+# job STATE, not just runner liveness: a crashed run announces itself with a .failed marker,
+# and an empty queue is a warning ("silence from a queue is not success"), never a green light
+AVM_WATCH_MARKERS=/run/media/feng/Data/CalebProject/scratch/queue/*.failed
+AVM_WATCH_NONEMPTY=/run/media/feng/Data/CalebProject/scratch/queue/queue.txt
 ```
+
+What the chips mean on Miami's card, in the order a failure would show up:
+`*.failed` red with a count → a run crashed (hover for the newest file name);
+`queue.txt: empty` amber → nothing left to run, expected only at the end of a
+batch; `current.txt: (between jobs)` with the GPU at 0% → idle; a job name with
+GPU at 0–5% for more than a few minutes → data-loader-bound, not healthy;
+`runner.heartbeat` red → the runner itself is dead. All of these count toward
+the header's **alerts** figure.
 
 Install (from a copy of `agent/` on Miami; agree timing with whoever owns the
 running jobs first — the unit runs at `Nice=10` and only *reads* `nvidia-smi`).

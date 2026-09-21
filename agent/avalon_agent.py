@@ -18,6 +18,9 @@ Configuration (env vars override the config file; file is KEY=VALUE lines):
     AVM_WATCH_TCP       comma list of host:port to check
     AVM_WATCH_MOUNTS    comma list of paths that must be mount points (removable/network volumes)
     AVM_WATCH_CONTENT   comma list of small text files whose first line is shown (e.g. a "current job" file)
+    AVM_WATCH_MARKERS   comma list of globs that must match NOTHING (e.g. a queue's *.failed marker files)
+    AVM_WATCH_NONEMPTY  comma list of files that should have at least one non-blank line (e.g. queue.txt);
+                        an empty one raises a warning chip - silence from a queue is not success
     AVM_LHM_URL         http://localhost:8085/data.json  (LibreHardwareMonitor on Windows)
     AVM_LOG_LEVEL       info
 
@@ -72,6 +75,8 @@ DEFAULTS = {
     "AVM_WATCH_TCP": "",
     "AVM_WATCH_MOUNTS": "",
     "AVM_WATCH_CONTENT": "",
+    "AVM_WATCH_MARKERS": "",
+    "AVM_WATCH_NONEMPTY": "",
     "AVM_LHM_URL": "",
     "AVM_LOG_LEVEL": "info",
 }
@@ -760,6 +765,30 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
             checks.append({"name": name, "kind": "content", "ok": True, "detail": line[:160] or "(empty)", "value": round(age, 1)})
         except OSError as e:
             checks.append({"name": name, "kind": "content", "ok": False, "detail": "unreadable: %s" % e.strerror})
+    for pattern in _csv(cfg["AVM_WATCH_MARKERS"]):
+        import glob as _glob
+        try:
+            matches = sorted(_glob.glob(os.path.expanduser(pattern)), key=lambda f: -os.stat(f).st_mtime)
+        except OSError:
+            matches = []
+        label = os.path.basename(pattern) or pattern
+        if matches:
+            newest = matches[0]
+            age = time.time() - os.stat(newest).st_mtime
+            names = ", ".join(os.path.basename(m) for m in matches[:3]) + (" ..." if len(matches) > 3 else "")
+            checks.append({"name": label, "kind": "marker", "ok": False, "value": float(len(matches)),
+                           "detail": "%d file%s: %s (newest %s ago)" % (len(matches), "s" if len(matches) != 1 else "", names, _fmt_age(age))})
+        else:
+            checks.append({"name": label, "kind": "marker", "ok": True, "value": 0.0, "detail": "none"})
+    for path in _csv(cfg["AVM_WATCH_NONEMPTY"]):
+        name = os.path.basename(path) or path
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                n = sum(1 for line in f if line.strip() and not line.lstrip().startswith("#"))
+            checks.append({"name": name, "kind": "queue", "ok": n > 0, "value": float(n),
+                           "detail": ("%d pending" % n) if n else "EMPTY - nothing queued"})
+        except OSError as e:
+            checks.append({"name": name, "kind": "queue", "ok": False, "detail": "unreadable: %s" % e.strerror})
     for item in _csv(cfg["AVM_WATCH_TCP"]):
         host, _, port = item.rpartition(":")
         t0 = time.monotonic()
@@ -771,6 +800,17 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
         except (OSError, ValueError) as e:
             checks.append({"name": item, "kind": "tcp", "ok": False, "detail": str(e)[:80]})
     return checks
+
+
+def _fmt_age(sec: float) -> str:
+    sec = int(sec)
+    if sec < 90:
+        return "%ds" % sec
+    if sec < 5400:
+        return "%dm" % (sec // 60)
+    if sec < 172800:
+        return "%dh" % (sec // 3600)
+    return "%dd" % (sec // 86400)
 
 
 def collect_battery() -> Optional[Dict[str, Any]]:

@@ -215,7 +215,12 @@ function updateCard(card, host) {
       checks.append(h("span", { class: "chip", title: `${c.name} · updated ${fmt.ago(c.value)}` }, h("b", {}, c.name + ": "), c.detail));
       continue;
     }
-    checks.append(h("span", { class: "chip " + (c.ok ? "ok" : "bad"), title: c.detail || "", html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(c.name) }));
+    if (c.kind === "queue") {
+      checks.append(h("span", { class: "chip " + (c.ok ? "ok" : "warn"), title: c.detail || "", html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(c.ok ? `${c.name}: ${c.value} pending` : `${c.name}: empty`) }));
+      continue;
+    }
+    const label = c.kind === "marker" && !c.ok ? `${c.value} ${c.name}` : c.name;
+    checks.append(h("span", { class: "chip " + (c.ok ? "ok" : "bad"), title: c.detail || "", html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(label) }));
   }
   if (s.memory?.committed != null && s.memory?.commit_limit) {
     const cp = (100 * s.memory.committed) / s.memory.commit_limit;
@@ -227,16 +232,22 @@ const $$m = (card) => ({ cpu: $('[data-m="cpu"]', card), mem: $('[data-m="mem"]'
 
 function drawCardSpark(card, name) {
   const c = $('[data-f="spark"]', card);
-  if (c) drawSparkline(c, state.spark.get(name) || [], cssVar("--m-cpu"), { yMax: 100, span: 900 });
+  if (c) drawSparkline(c, state.spark.get(name) || [], cssVar("--m-cpu"), { yMax: 100, span: RANGE_SEC[state.range] });
 }
 
+const sparkLoading = new Set();
 async function loadSpark(name) {
+  if (sparkLoading.has(name)) return;
+  sparkLoading.add(name);
   try {
-    const d = await api(`/api/v1/hosts/${encodeURIComponent(name)}/series?metrics=cpu&range=15m&points=180`);
+    const range = state.range;
+    const d = await api(`/api/v1/hosts/${encodeURIComponent(name)}/series?metrics=cpu&range=${range}&points=240`);
+    if (range !== state.range) return;  // range changed while loading
     state.spark.set(name, d.ts.map((t, i) => [t, d.cpu[i]]));
     const card = $(`.host-card[data-host="${CSS.escape(name)}"]`);
     if (card) drawCardSpark(card, name);
   } catch (e) { /* non-fatal */ }
+  finally { sparkLoading.delete(name); }
 }
 
 function renderFleet() {
@@ -364,7 +375,7 @@ function updateDetail(host) {
   if ((s.processes || []).length) tb.append(table("Top processes", ["PID", "Name", "User", "r:CPU", "r:Memory"], s.processes.map((p) => h("tr", {},
     h("td", { class: "num muted" }, p.pid), h("td", {}, p.name), h("td", { class: "muted" }, p.user || ""), h("td", { class: "r num" }, fmt.pct(p.cpu_percent, 1)), h("td", { class: "r num" }, `${fmt.bytes(p.mem_rss, 0)} · ${fmt.pct(p.mem_percent, 1)}`)))));
   if ((s.checks || []).length) tb.append(table("Checks", ["Check", "Kind", "State", "Detail"], s.checks.map((c) => h("tr", {},
-    h("td", {}, c.name), h("td", { class: "muted" }, c.kind), h("td", {}, h("span", { class: "chip " + (c.ok ? "ok" : "bad"), html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + (c.ok ? "ok" : "failing") })), h("td", { class: "muted" }, c.detail || "")))));
+    h("td", {}, c.name), h("td", { class: "muted" }, c.kind), h("td", {}, h("span", { class: "chip " + (c.ok ? "ok" : c.kind === "queue" ? "warn" : "bad"), html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + (c.ok ? "ok" : c.kind === "queue" ? "warning" : "failing") })), h("td", { class: "muted" }, c.detail || "")))));
   if ((s.network?.interfaces || []).length) tb.append(table("Network interfaces", ["Interface", "r:Receive", "r:Transmit", "r:Link"], s.network.interfaces.map((i) => h("tr", {},
     h("td", {}, i.name), h("td", { class: "r num" }, fmt.bps(i.rx_bps)), h("td", { class: "r num" }, fmt.bps(i.tx_bps)), h("td", { class: "r num muted" }, i.speed_mbps ? i.speed_mbps + " Mb/s" : (i.up ? "up" : "down"))))));
   if ((s.temps || []).length) tb.append(table("Sensors", ["Sensor", "r:Temp", "r:High", "r:Critical"], s.temps.map((x) => h("tr", {},
@@ -397,7 +408,7 @@ function onHostUpdate(host) {
   state.hosts.set(host.name, host);
   if (host.summary?.ts && host.status === "online" && host.summary.cpu?.percent != null && (!prev || prev.summary?.ts !== host.summary.ts)) {
     const arr = state.spark.get(host.name) || [];
-    if (!arr.length || arr[arr.length - 1][0] < host.summary.ts) { arr.push([host.summary.ts, host.summary.cpu.percent]); while (arr.length && arr[0][0] < host.summary.ts - 900) arr.shift(); }
+    if (!arr.length || arr[arr.length - 1][0] < host.summary.ts) { arr.push([host.summary.ts, host.summary.cpu.percent]); while (arr.length && arr[0][0] < host.summary.ts - RANGE_SEC[state.range]) arr.shift(); }
     state.spark.set(host.name, arr);
   }
   renderFleetStats();
@@ -445,6 +456,7 @@ function setRange(r) {
   try { localStorage.setItem("avm-range", r); } catch (_) { /* ignore */ }
   renderTopbar();
   if (state.view === "detail") loadDetailSeries();
+  else if (state.view === "fleet") { state.spark.clear(); renderFleet(); }
 }
 
 function redrawAll() {

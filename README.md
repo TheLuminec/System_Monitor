@@ -108,6 +108,8 @@ AVM_WATCH_FILES=/srv/queue/heartbeat:120   # file touched within N seconds?
 AVM_WATCH_TCP=127.0.0.1:11434       # port open?
 AVM_WATCH_MOUNTS=/run/media/feng/Data          # volume still mounted?
 AVM_WATCH_CONTENT=/srv/queue/current.txt       # show a file's first line (e.g. the running job)
+AVM_WATCH_MARKERS=/srv/queue/*.failed          # globs that must match nothing (crash markers)
+AVM_WATCH_NONEMPTY=/srv/queue/queue.txt        # warn when a queue file is empty
 AVM_LHM_URL=http://localhost:8085/data.json  # Windows: LibreHardwareMonitor for temps / AMD-Intel GPUs
 ```
 
