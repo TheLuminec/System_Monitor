@@ -18,11 +18,22 @@ Configuration (env vars override the config file; file is KEY=VALUE lines):
     AVM_WATCH_TCP       comma list of host:port to check
     AVM_WATCH_MOUNTS    comma list of paths that must be mount points (removable/network volumes)
     AVM_WATCH_CONTENT   comma list of small text files whose first line is shown (e.g. a "current job" file)
-    AVM_WATCH_MARKERS   comma list of globs that must match NOTHING (e.g. a queue's *.failed marker files)
+    AVM_WATCH_MARKERS   comma list of globs that must match NOTHING (e.g. a queue's *.failed marker files);
+                        `glob::regex` instead counts only files whose content matches the regex as failures
+                        (e.g. ~/markers/*.done::rc=(?!0\b)|oom_kill=(?!0\b)); no commas inside the regex
+    AVM_WATCH_UNITS     comma list of systemd units to show the state of: [system:|user:|user@NAME:]name-or-glob
+    AVM_WATCH_JOBS      like AVM_WATCH_UNITS, but an active match means "a job is running" - the hub uses it
+                        for its GPU-stall rule (job active but GPU idle)
+    AVM_MEM_AVAILABLE_WARN_GB  amber chip when MemAvailable drops below this many GB
     AVM_WATCH_NONEMPTY  comma list of files that should have at least one non-blank line (e.g. queue.txt);
                         an empty one raises a warning chip - silence from a queue is not success
     AVM_LHM_URL         http://localhost:8085/data.json  (LibreHardwareMonitor on Windows)
     AVM_LOG_LEVEL       info
+
+The hub may override the AVM_WATCH_* / AVM_PROCESSES / AVM_TAGS / AVM_MEM_AVAILABLE_WARN_GB
+settings remotely (set from the dashboard); they arrive in the reply to each push and
+take effect on the next sample. A "respawn" command in the reply makes the agent re-exec
+itself (picking up an updated script and config file).
 
 Usage:
     avalon_agent.py --config /etc/avalon-agent/agent.conf
@@ -53,7 +64,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -77,6 +88,9 @@ DEFAULTS = {
     "AVM_WATCH_CONTENT": "",
     "AVM_WATCH_MARKERS": "",
     "AVM_WATCH_NONEMPTY": "",
+    "AVM_WATCH_UNITS": "",
+    "AVM_WATCH_JOBS": "",
+    "AVM_MEM_AVAILABLE_WARN_GB": "",
     "AVM_LHM_URL": "",
     "AVM_LOG_LEVEL": "info",
 }
@@ -765,12 +779,28 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
             checks.append({"name": name, "kind": "content", "ok": True, "detail": line[:160] or "(empty)", "value": round(age, 1)})
         except OSError as e:
             checks.append({"name": name, "kind": "content", "ok": False, "detail": "unreadable: %s" % e.strerror})
-    for pattern in _csv(cfg["AVM_WATCH_MARKERS"]):
+    for item in _csv(cfg["AVM_WATCH_MARKERS"]):
         import glob as _glob
+        pattern, _, regex = item.partition("::")
         try:
             matches = sorted(_glob.glob(os.path.expanduser(pattern)), key=lambda f: -os.stat(f).st_mtime)
         except OSError:
             matches = []
+        if regex:
+            try:
+                rx = re.compile(regex)
+            except re.error as e:
+                checks.append({"name": os.path.basename(pattern), "kind": "marker", "ok": False, "detail": "bad regex: %s" % e})
+                continue
+            failed = []
+            for f in matches[:200]:
+                try:
+                    with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                        if rx.search(fh.read(4096)):
+                            failed.append(f)
+                except OSError:
+                    continue
+            matches = failed
         label = os.path.basename(pattern) or pattern
         if matches:
             newest = matches[0]
@@ -780,12 +810,20 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
                            "detail": "%d file%s: %s (newest %s ago)" % (len(matches), "s" if len(matches) != 1 else "", names, _fmt_age(age))})
         else:
             checks.append({"name": label, "kind": "marker", "ok": True, "value": 0.0, "detail": "none"})
+    for kind, key in (("unit", "AVM_WATCH_UNITS"), ("job", "AVM_WATCH_JOBS")):
+        for item in _csv(cfg[key]):
+            checks.append(_systemd_check(item, kind))
+    warn_gb = _num(cfg["AVM_MEM_AVAILABLE_WARN_GB"])
+    if warn_gb:
+        avail = psutil.virtual_memory().available
+        checks.append({"name": "mem available", "kind": "memory", "ok": avail >= warn_gb * 1024 ** 3, "level": "warning",
+                       "value": round(avail / 1024 ** 3, 2), "detail": "%.1f GB available (warn below %g GB)" % (avail / 1024 ** 3, warn_gb)})
     for path in _csv(cfg["AVM_WATCH_NONEMPTY"]):
         name = os.path.basename(path) or path
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 n = sum(1 for line in f if line.strip() and not line.lstrip().startswith("#"))
-            checks.append({"name": name, "kind": "queue", "ok": n > 0, "value": float(n),
+            checks.append({"name": name, "kind": "queue", "ok": n > 0, "value": float(n), "level": "warning",
                            "detail": ("%d pending" % n) if n else "EMPTY - nothing queued"})
         except OSError as e:
             checks.append({"name": name, "kind": "queue", "ok": False, "detail": "unreadable: %s" % e.strerror})
@@ -800,6 +838,47 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
         except (OSError, ValueError) as e:
             checks.append({"name": item, "kind": "tcp", "ok": False, "detail": str(e)[:80]})
     return checks
+
+
+def _systemd_check(item: str, kind: str) -> Dict[str, Any]:
+    """State of systemd unit(s): item = "[system:|user:|user@NAME:]name-or-glob"."""
+    scope, _, pattern = item.rpartition(":")
+    if not pattern:
+        scope, pattern = "", item
+    if not scope:
+        scope = "system" if os.geteuid() == 0 else "user"
+    base = ["systemctl", "--no-pager", "--plain", "--no-legend"]
+    if scope == "system":
+        pass
+    elif scope == "user":
+        base.append("--user")
+    elif scope.startswith("user@"):
+        base += ["--user", "-M", scope[5:] + "@"]
+    else:
+        return {"name": pattern, "kind": kind, "ok": False, "detail": "bad scope %r" % scope}
+    name = pattern
+    out = _run(base + ["list-units", "--all", "--state=active,failed,activating", pattern], timeout=5)
+    if out is None:
+        return {"name": name, "kind": kind, "ok": False, "detail": "systemctl unavailable"}
+    active, failed = [], []
+    for line in out.splitlines():
+        cols = line.split()
+        if len(cols) < 4:
+            continue
+        unit, state = cols[0], cols[2]
+        (failed if state == "failed" else active).append(unit)
+    enabled = ""
+    if not any(ch in pattern for ch in "*?["):
+        en = _run(base + ["is-enabled", pattern], timeout=5)
+        enabled = (en or "").strip().splitlines()[0] if (en or "").strip() else ""
+    if failed:
+        detail = "FAILED: " + ", ".join(failed[:3])
+    elif active:
+        detail = "active: " + ", ".join(u.replace(".scope", "").replace(".service", "") for u in active[:3]) + (" ..." if len(active) > 3 else "")
+    else:
+        detail = "inactive" + (" (%s)" % enabled if enabled else "")
+    return {"name": name, "kind": kind, "ok": not failed, "value": float(len(active)), "detail": detail,
+            "level": "info" if kind == "job" else ""}
 
 
 def _fmt_age(sec: float) -> str:
@@ -866,7 +945,57 @@ def push(cfg: Dict[str, str], sample: Dict[str, Any], timeout: float = 10.0) -> 
         "User-Agent": "avalon-agent/" + AGENT_VERSION,
     })
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        r.read()
+        raw = r.read()
+    try:
+        return json.loads(raw.decode("utf-8")) if raw else {}
+    except ValueError:
+        return {}
+
+
+REMOTE_KEYS = (
+    "AVM_WATCH_PROCESSES", "AVM_WATCH_FILES", "AVM_WATCH_TCP", "AVM_WATCH_MOUNTS", "AVM_WATCH_CONTENT",
+    "AVM_WATCH_MARKERS", "AVM_WATCH_NONEMPTY", "AVM_WATCH_UNITS", "AVM_WATCH_JOBS",
+    "AVM_MEM_AVAILABLE_WARN_GB", "AVM_PROCESSES", "AVM_TAGS",
+)
+
+
+class RemoteConfig:
+    """Hub-pushed settings layered over the local config file."""
+
+    def __init__(self, base: Dict[str, str]):
+        self.base = dict(base)
+        self.rev: Optional[int] = None
+        self.overrides: Dict[str, str] = {}
+
+    def apply(self, reply: Dict[str, Any]) -> bool:
+        cfg = reply.get("config")
+        if not isinstance(cfg, dict):
+            if self.rev is not None:  # hub cleared the remote settings
+                self.rev, self.overrides = None, {}
+                return True
+            return False
+        rev = cfg.get("rev")
+        if rev == self.rev:
+            return False
+        self.rev = rev
+        self.overrides = {k: str(v) for k, v in (cfg.get("settings") or {}).items() if k in REMOTE_KEYS}
+        return True
+
+    def effective(self) -> Dict[str, str]:
+        out = dict(self.base)
+        out.update(self.overrides)
+        return out
+
+
+def respawn() -> None:
+    """Replace this process with a fresh copy of itself (new script/config, same supervisor)."""
+    log.info("respawning on hub request")
+    sys.stdout.flush(); sys.stderr.flush()
+    args = [sys.executable] + sys.argv
+    if IS_WINDOWS:
+        # execv on Windows starts a new process and exits this one; quote to survive spaces in paths.
+        args = ['"%s"' % a if " " in a else a for a in args]
+    os.execv(sys.executable, args)
 
 
 def main(argv=None) -> int:
@@ -919,6 +1048,7 @@ def main(argv=None) -> int:
 
     log.info("avalon-agent %s on %s -> %s every %.0fs", AGENT_VERSION, host_info(cfg)["hostname"], cfg["AVM_SERVER_URL"], interval)
     psutil.cpu_percent(interval=None, percpu=True)  # prime
+    remote = RemoteConfig(cfg)
     failures = 0
     next_t = time.monotonic() + 1.0
     while not stop["flag"]:
@@ -930,11 +1060,19 @@ def main(argv=None) -> int:
         if next_t < time.monotonic():  # we fell behind (sleep/suspend) - resync
             next_t = time.monotonic() + interval
         try:
-            sample = collect_sample(cfg, interval)
-            push(cfg, sample)
+            eff = remote.effective()
+            if remote.overrides and "AVM_TAGS" in remote.overrides:
+                _HOST_STATIC.clear()  # tags are part of the cached host info
+            sample = collect_sample(eff, interval)
+            sample["config_rev"] = remote.rev if remote.rev is not None else 0
+            reply = push(cfg, sample)
             if failures:
                 log.info("hub reachable again")
             failures = 0
+            if remote.apply(reply):
+                log.info("applied remote settings rev %s: %s", remote.rev, ", ".join(sorted(remote.overrides)) or "(cleared)")
+            if reply.get("command") == "respawn":
+                respawn()
         except urllib.error.HTTPError as e:
             failures += 1
             if failures in (1, 10) or failures % 100 == 0:

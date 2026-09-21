@@ -18,13 +18,22 @@ from . import __version__
 from .auth import AuthError, Authorizer, Identity
 from .config import settings
 from .db import METRICS, Database, HostRow
-from .models import Sample
+from .models import Check, Sample
+from .rules import GpuStallRule
 
 logging.basicConfig(level=settings.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("avalon")
 
 STATIC_DIR = Path(__file__).parent / "static"
 RANGES = {"15m": 900, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+
+# Agent settings the dashboard may set remotely (pushed to the agent in every ingest reply).
+REMOTE_KEYS = (
+    "AVM_WATCH_PROCESSES", "AVM_WATCH_FILES", "AVM_WATCH_TCP", "AVM_WATCH_MOUNTS", "AVM_WATCH_CONTENT",
+    "AVM_WATCH_MARKERS", "AVM_WATCH_NONEMPTY", "AVM_WATCH_UNITS", "AVM_WATCH_JOBS",
+    "AVM_MEM_AVAILABLE_WARN_GB", "AVM_PROCESSES", "AVM_TAGS",
+)
+AGENT_COMMANDS = ("respawn",)
 
 
 # ------------------------------------------------------------------ live hub
@@ -52,6 +61,7 @@ class LiveHub:
 db = Database(settings.db_path)
 authz = Authorizer(settings)
 hub = LiveHub()
+gpu_stall = GpuStallRule(minutes=settings.gpu_stall_minutes, percent=settings.gpu_stall_percent)
 
 
 # --------------------------------------------------------------- serializers
@@ -98,7 +108,7 @@ def _summary_of(sample: Optional[dict]) -> dict[str, Any]:
         "temp_max": max((t.get("current") or 0) for t in temps) if temps else None,
         "battery": sample.get("battery"),
         "checks": checks,
-        "checks_failing": sum(1 for c in checks if not c.get("ok")),
+        "checks_failing": sum(1 for c in checks if not c.get("ok") and c.get("level") != "info"),
         "top_process": max(sample.get("processes", []), key=lambda p: p.get("cpu_percent") or 0, default=None),
     }
 
@@ -115,9 +125,13 @@ def host_public(h: HostRow, full: bool = False) -> dict[str, Any]:
         "age_sec": (now - h.last_seen) if h.last_seen else None,
         "notes": h.notes,
         "summary": _summary_of(h.last_sample),
+        "check_rev": h.check_rev,
+        "agent_rev": (h.last_sample or {}).get("config_rev"),
     }
     if full:
         out["sample"] = h.last_sample
+        out["check_config"] = h.check_config or {}
+        out["pending_cmd"] = h.pending_cmd
     return out
 
 
@@ -229,12 +243,26 @@ async def ingest(request: Request):
     if abs(sample.ts - now) > 120:
         sample.ts = now
 
+    # Hub-side derived alerts (need history the agent doesn't have).
+    history = await run_in_threadpool(db.latest_points, host.id, "gpu_util", sample.ts - gpu_stall.window_sec)
+    verdict = gpu_stall.evaluate(host.id, sample, history)
+    if verdict is not None:
+        sample.checks.append(Check(**verdict))
+
     await run_in_threadpool(db.record_sample, host, sample, ip)
     updated = await run_in_threadpool(db.host_by_name, host.name)
+    reply: dict[str, Any] = {"ok": True, "server_time": now}
     if updated:
         hub.online[updated.id] = True
         await hub.broadcast({"type": "host", "host": host_public(updated)})
-    return {"ok": True, "server_time": now}
+        # Remote config + commands ride the reply so agents need no inbound port.
+        if updated.check_config is not None:
+            reply["config"] = {"rev": updated.check_rev, "settings": updated.check_config}
+        cmd = await run_in_threadpool(db.pop_command, updated.id)
+        if cmd:
+            reply["command"] = cmd
+            log.info("sent command %r to %s", cmd, updated.name)
+    return reply
 
 
 # -------------------------------------------------------------- dashboard API
@@ -288,6 +316,52 @@ async def get_series(
     )
     data.update({"host": h.name, "start": start, "end": end, "range": range})
     return data
+
+
+def require_same_origin(request: Request) -> None:
+    """CSRF guard for state-changing calls: browsers can't add this header cross-origin without CORS."""
+    if request.headers.get("x-requested-with") != "avalon-monitor":
+        raise HTTPException(403, "missing X-Requested-With header")
+
+
+@app.get("/api/v1/hosts/{name}/checks")
+async def get_checks(name: str, ident: Identity = Depends(require_viewer)):
+    h = await run_in_threadpool(db.host_by_name, name)
+    if not h:
+        raise HTTPException(404, "no such host")
+    return {"host": h.name, "rev": h.check_rev, "settings": h.check_config or {}, "keys": REMOTE_KEYS,
+            "agent_rev": (h.last_sample or {}).get("config_rev")}
+
+
+@app.put("/api/v1/hosts/{name}/checks")
+async def put_checks(name: str, request: Request, ident: Identity = Depends(require_viewer)):
+    require_same_origin(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "expected an object of AVM_* settings")
+    bad = [k for k in body if k not in REMOTE_KEYS]
+    if bad:
+        raise HTTPException(422, f"not remotely settable: {', '.join(bad)}")
+    settings_out = {k: str(v).strip() for k, v in body.items() if v is not None}
+    try:
+        rev = await run_in_threadpool(db.set_check_config, name, settings_out)
+    except KeyError:
+        raise HTTPException(404, "no such host")
+    log.info("%s updated checks for %s (rev %d)", ident.subject, name, rev)
+    return {"ok": True, "rev": rev, "settings": settings_out}
+
+
+@app.post("/api/v1/hosts/{name}/command/{cmd}")
+async def post_command(name: str, cmd: str, request: Request, ident: Identity = Depends(require_viewer)):
+    require_same_origin(request)
+    if cmd not in AGENT_COMMANDS:
+        raise HTTPException(400, f"command must be one of {', '.join(AGENT_COMMANDS)}")
+    try:
+        await run_in_threadpool(db.set_command, name, cmd)
+    except KeyError:
+        raise HTTPException(404, "no such host")
+    log.info("%s queued %r for %s", ident.subject, cmd, name)
+    return {"ok": True, "queued": cmd, "note": "delivered with the agent's next push"}
 
 
 @app.get("/api/v1/stats")

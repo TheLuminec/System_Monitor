@@ -215,12 +215,20 @@ function updateCard(card, host) {
       checks.append(h("span", { class: "chip", title: `${c.name} · updated ${fmt.ago(c.value)}` }, h("b", {}, c.name + ": "), c.detail));
       continue;
     }
-    if (c.kind === "queue") {
-      checks.append(h("span", { class: "chip " + (c.ok ? "ok" : "warn"), title: c.detail || "", html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(c.ok ? `${c.name}: ${c.value} pending` : `${c.name}: empty`) }));
+    if (c.kind === "job") {
+      // active job scopes are informational: show what's running, stay quiet otherwise
+      if ((c.value || 0) > 0) checks.append(h("span", { class: "chip", title: c.detail || "" }, h("b", {}, "job: "), c.detail.replace(/^active: /, "")));
+      else if (!c.ok) checks.append(h("span", { class: "chip bad", title: c.detail || "", html: ICON.bad.replace("<svg", '<svg width="11" height="11"') + esc(c.name) }));
       continue;
     }
-    const label = c.kind === "marker" && !c.ok ? `${c.value} ${c.name}` : c.name;
-    checks.append(h("span", { class: "chip " + (c.ok ? "ok" : "bad"), title: c.detail || "", html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(label) }));
+    if (c.kind === "rule" && c.ok) continue;  // hub rules only surface when they fire
+    let label = c.name;
+    if (c.kind === "queue") label = c.ok ? `${c.name}: ${c.value} pending` : `${c.name}: empty`;
+    else if (c.kind === "marker" && !c.ok) label = `${c.value} ${c.name}`;
+    else if (c.kind === "unit") label = `${c.name.replace(/\.(service|scope|timer)$/, "")}: ${(c.detail || "").split(":")[0].split(" ")[0].toLowerCase()}`;
+    else if (c.kind === "memory" && !c.ok) label = `${c.value} GB free`;
+    const cls = c.ok ? (c.kind === "unit" && !(c.value > 0) ? "" : "ok") : (c.level === "warning" ? "warn" : "bad");
+    checks.append(h("span", { class: "chip " + cls, title: c.detail || "", html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(label) }));
   }
   if (s.memory?.committed != null && s.memory?.commit_limit) {
     const cp = (100 * s.memory.committed) / s.memory.commit_limit;
@@ -288,6 +296,8 @@ async function renderDetail(name) {
     h("button", { class: "back", onclick: () => (location.hash = "#/") , html: ICON.back + " Fleet" }),
     h("div", { class: "detail-title" }, h("span", { class: "status-dot " + host.status, "data-f": "dot" }), host.display_name),
     h("div", { class: "detail-meta", "data-f": "meta" }),
+    h("div", { class: "spacer" }),
+    h("button", { class: "btn", title: "Ask the agent to re-exec itself on its next push (picks up a new script/config)", onclick: () => sendCommand(host.name, "respawn") }, "Respawn agent"),
   );
   const kpis = h("div", { class: "kpis", "data-f": "kpis" });
   const charts = h("div", { class: "charts" });
@@ -305,10 +315,85 @@ async function renderDetail(name) {
   const coresCard = h("div", { class: "card chart-card", style: "min-height: 0" }, h("h3", {}, "Per-core load"), cores);
 
   const tables = h("div", { class: "tables", "data-f": "tables" });
-  app.append(head, kpis, charts, coresCard, tables);
-  state.detail = { name: host.name, charts: chartObjs, els: { head, kpis, cores, tables } };
+  const editor = h("div", { class: "card table-card editor", "data-f": "editor" });
+  app.append(head, kpis, charts, coresCard, tables, editor);
+  state.detail = { name: host.name, charts: chartObjs, els: { head, kpis, cores, tables, editor } };
   updateDetail(host);
+  renderEditor(host);
   await loadDetailSeries();
+}
+
+// ---------------------------------------------------------- checks editor
+const CHECK_KINDS = [
+  { key: "AVM_WATCH_PROCESSES", label: "process running", hint: "name or command-line substring, e.g. nginx" },
+  { key: "AVM_WATCH_FILES", label: "file fresh", hint: "path:max-age-seconds, e.g. /srv/heartbeat:120" },
+  { key: "AVM_WATCH_TCP", label: "tcp port open", hint: "host:port, e.g. 127.0.0.1:11434" },
+  { key: "AVM_WATCH_MOUNTS", label: "volume mounted", hint: "mount point, e.g. /mnt/data" },
+  { key: "AVM_WATCH_CONTENT", label: "show file line", hint: "small text file, e.g. /srv/queue/current.txt" },
+  { key: "AVM_WATCH_MARKERS", label: "no marker files", hint: "glob, or glob::regex for content match" },
+  { key: "AVM_WATCH_NONEMPTY", label: "queue not empty", hint: "file that should have pending lines" },
+  { key: "AVM_WATCH_UNITS", label: "systemd unit", hint: "[system:|user:]unit, e.g. user:xrsec-queue.service" },
+  { key: "AVM_WATCH_JOBS", label: "job scope active", hint: "[user:]glob, e.g. user:xrsec-*.scope" },
+];
+const CHECK_SINGLE = [
+  { key: "AVM_MEM_AVAILABLE_WARN_GB", label: "Warn when free memory below (GB)", hint: "e.g. 8" },
+  { key: "AVM_PROCESSES", label: "Top processes reported", hint: "8" },
+  { key: "AVM_TAGS", label: "Tags", hint: "comma-separated chips" },
+];
+const hdrs = () => ({ "Content-Type": "application/json", "X-Requested-With": "avalon-monitor" });
+
+async function sendCommand(name, cmd) {
+  try {
+    const r = await api(`/api/v1/hosts/${encodeURIComponent(name)}/command/${cmd}`, { method: "POST", headers: hdrs() });
+    toast(`${cmd} queued for ${name} - ${r.note}`);
+  } catch (e) { toast(`Failed: ${e.message}`, true); }
+}
+
+function renderEditor(host) {
+  const d = state.detail; if (!d || !d.els.editor) return;
+  const el = d.els.editor; el.innerHTML = "";
+  const cfg = host.check_config || {};
+  const rows = [];
+  for (const k of CHECK_KINDS) for (const v of (cfg[k.key] || "").split(",").map((x) => x.trim()).filter(Boolean)) rows.push({ key: k.key, value: v });
+  const agentRev = host.agent_rev, hubRev = host.check_rev || 0;
+  const status = agentRev == null
+    ? (host.status === "online" ? "agent predates remote checks - upgrade it to 1.1.0 (copy avalon_agent.py, then respawn)" : "")
+    : agentRev === hubRev ? `agent is running revision ${hubRev}` : `revision ${hubRev} saved - agent still on ${agentRev}, applies on its next push`;
+  const list = h("div", { class: "editor-rows" });
+  const rowEl = (r) => {
+    const sel = h("select", {}, ...CHECK_KINDS.map((k) => h("option", { value: k.key, selected: k.key === r.key ? "" : null }, k.label)));
+    const inp = h("input", { type: "text", value: r.value, placeholder: CHECK_KINDS.find((k) => k.key === r.key)?.hint || "", spellcheck: "false" });
+    sel.onchange = () => { r.key = sel.value; inp.placeholder = CHECK_KINDS.find((k) => k.key === r.key)?.hint || ""; };
+    inp.oninput = () => (r.value = inp.value);
+    const row = h("div", { class: "editor-row" }, sel, inp, h("button", { class: "iconbtn small", title: "remove", onclick: () => { rows.splice(rows.indexOf(r), 1); row.remove(); } }, "×"));
+    return row;
+  };
+  for (const r of rows) list.append(rowEl(r));
+  const singles = h("div", { class: "editor-singles" }, ...CHECK_SINGLE.map((k) => {
+    const inp = h("input", { type: "text", value: cfg[k.key] ?? "", placeholder: k.hint, "data-key": k.key, spellcheck: "false" });
+    return h("label", {}, h("span", {}, k.label), inp);
+  }));
+  const save = async () => {
+    const out = {};
+    for (const r of rows) if (r.value.trim()) out[r.key] = (out[r.key] ? out[r.key] + "," : "") + r.value.trim();
+    for (const inp of singles.querySelectorAll("input")) if (inp.value.trim()) out[inp.dataset.key] = inp.value.trim();
+    try {
+      const r = await api(`/api/v1/hosts/${encodeURIComponent(host.name)}/checks`, { method: "PUT", headers: hdrs(), body: JSON.stringify(out) });
+      toast(`Saved revision ${r.rev}; the agent applies it on its next push`);
+      const full = await api(`/api/v1/hosts/${encodeURIComponent(host.name)}`); state.hosts.set(full.name, full); renderEditor(full);
+    } catch (e) { toast(`Save failed: ${e.message}`, true); }
+  };
+  el.append(
+    h("h3", {}, "Checks", h("span", { class: "muted editor-status" }, status)),
+    h("p", { class: "muted editor-help" }, "Settings saved here are pushed to the agent with its next report and override the same keys in its agent.conf. One target per row; the agent runs the check every interval."),
+    list,
+    h("div", { class: "editor-actions" },
+      h("button", { class: "btn", onclick: () => { const r = { key: "AVM_WATCH_PROCESSES", value: "" }; rows.push(r); list.append(rowEl(r)); list.lastChild.querySelector("input").focus(); } }, "+ Add check"),
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn primary", onclick: save }, "Save to agent"),
+    ),
+    singles,
+  );
 }
 
 async function loadDetailSeries() {
@@ -375,7 +460,7 @@ function updateDetail(host) {
   if ((s.processes || []).length) tb.append(table("Top processes", ["PID", "Name", "User", "r:CPU", "r:Memory"], s.processes.map((p) => h("tr", {},
     h("td", { class: "num muted" }, p.pid), h("td", {}, p.name), h("td", { class: "muted" }, p.user || ""), h("td", { class: "r num" }, fmt.pct(p.cpu_percent, 1)), h("td", { class: "r num" }, `${fmt.bytes(p.mem_rss, 0)} · ${fmt.pct(p.mem_percent, 1)}`)))));
   if ((s.checks || []).length) tb.append(table("Checks", ["Check", "Kind", "State", "Detail"], s.checks.map((c) => h("tr", {},
-    h("td", {}, c.name), h("td", { class: "muted" }, c.kind), h("td", {}, h("span", { class: "chip " + (c.ok ? "ok" : c.kind === "queue" ? "warn" : "bad"), html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + (c.ok ? "ok" : c.kind === "queue" ? "warning" : "failing") })), h("td", { class: "muted" }, c.detail || "")))));
+    h("td", {}, c.name), h("td", { class: "muted" }, c.kind), h("td", {}, h("span", { class: "chip " + (c.ok ? (c.level === "info" ? "" : "ok") : c.level === "warning" ? "warn" : "bad"), html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + (c.ok ? (c.level === "info" ? "info" : "ok") : c.level === "warning" ? "warning" : "failing") })), h("td", { class: "muted" }, c.detail || "")))));
   if ((s.network?.interfaces || []).length) tb.append(table("Network interfaces", ["Interface", "r:Receive", "r:Transmit", "r:Link"], s.network.interfaces.map((i) => h("tr", {},
     h("td", {}, i.name), h("td", { class: "r num" }, fmt.bps(i.rx_bps)), h("td", { class: "r num" }, fmt.bps(i.tx_bps)), h("td", { class: "r num muted" }, i.speed_mbps ? i.speed_mbps + " Mb/s" : (i.up ? "up" : "down"))))));
   if ((s.temps || []).length) tb.append(table("Sensors", ["Sensor", "r:Temp", "r:High", "r:Critical"], s.temps.map((x) => h("tr", {},
@@ -417,7 +502,10 @@ function onHostUpdate(host) {
     if (card) updateCard(card, host); else renderFleet();
   } else if (state.view === "detail" && state.detail?.name === host.name) {
     if (host.summary?.ts !== prev?.summary?.ts) {
-      api(`/api/v1/hosts/${encodeURIComponent(host.name)}`).then((full) => { state.hosts.set(full.name, full); updateDetail(full); }).catch(() => {});
+      api(`/api/v1/hosts/${encodeURIComponent(host.name)}`).then((full) => {
+        state.hosts.set(full.name, full); updateDetail(full);
+        if ((prev?.agent_rev ?? null) !== (full.agent_rev ?? null) && !document.activeElement?.closest?.(".editor")) renderEditor(full);
+      }).catch(() => {});
       appendLive(host);
     } else updateDetail({ ...(state.hosts.get(host.name)), status: host.status, age_sec: host.age_sec });
   }

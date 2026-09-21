@@ -74,6 +74,12 @@ class Settings:
     offline_after_sec: int = 30
     max_payload_bytes: int = 512 * 1024
 
+    # Derived-alert rules (hub-side). GPU stall: a host reports an active job
+    # (a "job" check with value > 0) for at least `gpu_stall_minutes` while its
+    # GPU utilisation never exceeds `gpu_stall_percent` -> red "gpu stalled" check.
+    gpu_stall_minutes: int = 10
+    gpu_stall_percent: float = 5.0
+
     # Public URL (informational; used in /api/v1/config for the UI)
     public_url: str = ""
 
@@ -99,6 +105,8 @@ def load_settings() -> Settings:
     s.retention_1m_days = int(env.get("AVM_RETENTION_1M_DAYS", s.retention_1m_days))
     s.offline_after_sec = int(env.get("AVM_OFFLINE_AFTER_SEC", s.offline_after_sec))
     s.max_payload_bytes = int(env.get("AVM_MAX_PAYLOAD_BYTES", s.max_payload_bytes))
+    s.gpu_stall_minutes = int(env.get("AVM_RULE_GPU_STALL_MINUTES", s.gpu_stall_minutes))
+    s.gpu_stall_percent = float(env.get("AVM_RULE_GPU_STALL_PERCENT", s.gpu_stall_percent))
     s.public_url = env.get("AVM_PUBLIC_URL", "")
     return s
 

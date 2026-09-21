@@ -7,6 +7,8 @@
     manage.py disable NAME | enable NAME
     manage.py remove NAME
     manage.py stats
+    manage.py checks NAME [--set AVM_WATCH_PROCESSES=nginx,sshd ...] [--clear]
+    manage.py respawn NAME|all        # agent re-execs itself on its next push
 
 Uses the same AVM_* environment (or .env) as the server, so run it with the
 server's environment file, e.g.:
@@ -52,6 +54,11 @@ def main(argv=None) -> int:
     sub.add_parser("stats", help="database statistics")
     for c in ("rotate-token", "disable", "enable", "remove"):
         sub.add_parser(c).add_argument("name")
+    p = sub.add_parser("checks", help="show or set a host's remote check settings")
+    p.add_argument("name")
+    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    p.add_argument("--clear", action="store_true", help="remove all remote settings (agent falls back to its file)")
+    sub.add_parser("respawn", help="ask an agent (or all) to re-exec itself").add_argument("name")
 
     args = ap.parse_args(argv)
     db = Database(settings.db_path)
@@ -82,6 +89,32 @@ def main(argv=None) -> int:
         elif args.cmd == "remove":
             db.delete_host(args.name)
             print(f"removed {args.name} and its history")
+        elif args.cmd == "checks":
+            from avalon_monitor.main import REMOTE_KEYS
+            host = db.host_by_name(args.name)
+            if not host:
+                raise KeyError(args.name)
+            cfg = dict(host.check_config or {})
+            if args.clear:
+                cfg = {}
+            for item in args.set:
+                k, _, v = item.partition("=")
+                if k not in REMOTE_KEYS:
+                    print(f"error: {k} is not remotely settable ({', '.join(REMOTE_KEYS)})", file=sys.stderr)
+                    return 1
+                cfg[k] = v.strip()
+            if args.set or args.clear:
+                rev = db.set_check_config(args.name, cfg)
+                print(f"saved revision {rev}; the agent applies it on its next push")
+            for k, v in cfg.items():
+                print(f"{k}={v}")
+            if not cfg:
+                print("(no remote settings; agent uses its local agent.conf)")
+        elif args.cmd == "respawn":
+            targets = [h.name for h in db.list_hosts()] if args.name == "all" else [args.name]
+            for n in targets:
+                db.set_command(n, "respawn")
+                print(f"queued respawn for {n}")
         elif args.cmd == "stats":
             for k, v in db.stats().items():
                 print(f"{k:<14} {v}")

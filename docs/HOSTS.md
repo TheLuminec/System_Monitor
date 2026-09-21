@@ -12,7 +12,16 @@ Ready-to-use `agent.conf` contents for the current fleet. Tokens come from
 > new venv entirely, use the distro interpreter with `apt install python3-psutil`
 > and edit `ExecStart=` in `avalon-agent.service` to `/usr/bin/python3`.
 
-## Miami (`feng-MS-7B51`, Ubuntu, RTX 4060 Ti) — `/etc/avalon-agent/agent.conf`
+## Miami (`feng-MS-7B51`, Ubuntu, RTX 4060 Ti) — `~/.config/avalon-agent/agent.conf`
+
+Since 2026-09-21 Miami no longer uses the queue runner (`xrsec-queue.service`
+is stopped and disabled after a 100%-RAM incident). Jobs are launched one at a
+time by `gated_launch.sh` inside a `systemd --user` scope `xrsec-<job>.scope`
+with a hard `MemoryMax`, and each writes `~/xrsec_markers/<job>.done`
+containing `rc=… oom_kill=… peak_mb=…` on exit. The config below watches
+*that* design; the old runner heartbeat / `current.txt` lines would only show
+red forever. (These same checks can be set from the dashboard's host page
+instead of the file — the hub pushes them to the agent.)
 
 ```ini
 AVM_SERVER_URL=http://avalon:8787
@@ -22,31 +31,34 @@ AVM_INTERVAL=5
 AVM_PROCESSES=8
 AVM_TAGS=sm_89 via PTX compat (build arch list stops at 8.6/9.0; device is 8.9)
 
-# queue runner (XRSEC_QUEUE_ROOT). 120 s is the runner's own staleness threshold,
-# so the chip and the runner's self-check agree.
-AVM_WATCH_PROCESSES=queue_runner.sh
-AVM_WATCH_FILES=/run/media/feng/Data/CalebProject/scratch/queue/runner.heartbeat:120
-AVM_WATCH_CONTENT=/run/media/feng/Data/CalebProject/scratch/queue/current.txt
-# the queue lives on a removable volume: if the mount drops, every other meter still looks healthy
+# what is running: active xrsec-*.scope units show as a "job: <name>" chip and
+# feed the hub's GPU-stall rule (job active >=10 min with GPU never above 5% -> red "gpu stalled")
+AVM_WATCH_JOBS=user:xrsec-*.scope
+# job failure signal: a .done marker with a non-zero rc or oom_kill -> red chip with a count
+AVM_WATCH_MARKERS=/home/feng/xrsec_markers/*.done::rc=(?!0\b)|oom_kill=(?!0\b)
+# RAM pressure: MemAvailable is the number that matters (RSS lies); amber below 8 GB
+AVM_MEM_AVAILABLE_WARN_GB=8
+# the datasets live on a removable volume
 AVM_WATCH_MOUNTS=/run/media/feng/Data
-# job STATE, not just runner liveness: a crashed run announces itself with a .failed marker,
-# and an empty queue is a warning ("silence from a queue is not success"), never a green light
-AVM_WATCH_MARKERS=/run/media/feng/Data/CalebProject/scratch/queue/*.failed
-AVM_WATCH_NONEMPTY=/run/media/feng/Data/CalebProject/scratch/queue/queue.txt
+# the retired queue runner: shows "xrsec-queue: inactive" (grey); red only if the unit is failed
+AVM_WATCH_UNITS=user:xrsec-queue.service
 ```
 
-What the chips mean on Miami's card, in the order a failure would show up:
-`*.failed` red with a count → a run crashed (hover for the newest file name);
-`queue.txt: empty` amber → nothing left to run, expected only at the end of a
-batch; `current.txt: (between jobs)` with the GPU at 0% → idle; a job name with
-GPU at 0–5% for more than a few minutes → data-loader-bound, not healthy;
-`runner.heartbeat` red → the runner itself is dead. All of these count toward
-the header's **alerts** figure.
+Notes:
+* `user:` scopes query the login user's manager, which is why the **rootless
+  install** below is the right one here (a root/system-unit agent would need
+  `user@feng:` prefixes and a recent systemd to reach it).
+* `rc=137 oom_kill=1` in a marker means the memory cap did its job — the chip
+  is still red because the *job* failed, which is the thing to notice.
+* If `xrsec-queue.service` is ever re-enabled, it needs
+  `RequiresMountsFor=/run/media/feng/Data` in the unit (it raced the mount at
+  boot on 2026-09-20). The agent can't check unit file contents; the chip only
+  tells you it is active again.
 
 Install (from a copy of `agent/` on Miami; agree timing with whoever owns the
 running jobs first — the unit runs at `Nice=10` and only *reads* `nvidia-smi`).
 
-**Recommended for Miami — rootless, matching how its queue runner already runs**
+**Recommended for Miami — rootless, matching how its jobs already run**
 (`systemd --user` with linger). No sudo, nothing system-wide, venv under
 `~/.local/share/avalon-agent`, config at `~/.config/avalon-agent/agent.conf`:
 
@@ -54,7 +66,7 @@ running jobs first — the unit runs at `Nice=10` and only *reads* `nvidia-smi`)
 ./install/install-linux.sh --user --server http://avalon:8787 --token avm_… --name miami
 nano ~/.config/avalon-agent/agent.conf     # paste the block above
 systemctl --user restart avalon-agent
-# linger is already enabled on Miami for the queue runner; elsewhere: sudo loginctl enable-linger $USER
+# linger is already enabled on Miami; elsewhere: sudo loginctl enable-linger $USER
 ```
 
 Running as the login user is enough: disk usage, sensors, `nvidia-smi`, and

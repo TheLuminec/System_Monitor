@@ -110,11 +110,18 @@ AVM_WATCH_MOUNTS=/run/media/feng/Data          # volume still mounted?
 AVM_WATCH_CONTENT=/srv/queue/current.txt       # show a file's first line (e.g. the running job)
 AVM_WATCH_MARKERS=/srv/queue/*.failed          # globs that must match nothing (crash markers)
 AVM_WATCH_NONEMPTY=/srv/queue/queue.txt        # warn when a queue file is empty
+AVM_WATCH_MARKERS=~/markers/*.done::rc=(?!0\b)  # ...or only files whose content matches a regex
+AVM_WATCH_UNITS=user:xrsec-queue.service       # systemd unit state (system: | user: | user@NAME:)
+AVM_WATCH_JOBS=user:xrsec-*.scope              # active scopes = "a job is running" (drives the GPU-stall rule)
+AVM_MEM_AVAILABLE_WARN_GB=8                    # amber when MemAvailable drops below this
 AVM_LHM_URL=http://localhost:8085/data.json  # Windows: LibreHardwareMonitor for temps / AMD-Intel GPUs
 ```
 
-Checks show up as green/red chips on the fleet card and count toward the
-"alerts" figure in the header — handy for "is the queue runner still alive"
+Checks show up as green/red (or amber for warnings) chips on the fleet card
+and count toward the "alerts" figure in the header. The hub adds one derived
+check of its own: **gpu stalled** fires when a host has had a job scope active
+for `AVM_RULE_GPU_STALL_MINUTES` (10) while GPU utilisation never exceeded
+`AVM_RULE_GPU_STALL_PERCENT` (5) — the "healthy-looking 30× slowdown" case — handy for "is the queue runner still alive"
 style questions that raw CPU/GPU numbers don't answer.
 
 GPU sources, in order: `nvidia-smi` (Linux & Windows), amdgpu `sysfs`

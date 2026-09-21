@@ -44,7 +44,10 @@ CREATE TABLE IF NOT EXISTS hosts (
     last_seen     REAL,
     last_ip       TEXT,
     last_sample   TEXT,
-    notes         TEXT
+    notes         TEXT,
+    check_config  TEXT,
+    check_rev     INTEGER NOT NULL DEFAULT 0,
+    pending_cmd   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS samples (
@@ -121,15 +124,22 @@ class HostRow:
     last_ip: Optional[str]
     last_sample: Optional[dict]
     notes: Optional[str]
+    check_config: Optional[dict] = None
+    check_rev: int = 0
+    pending_cmd: Optional[str] = None
 
     @classmethod
     def from_row(cls, r: sqlite3.Row) -> "HostRow":
+        keys = r.keys()
         return cls(
             id=r["id"], name=r["name"], display_name=r["display_name"],
             enabled=bool(r["enabled"]), created_at=r["created_at"],
             last_seen=r["last_seen"], last_ip=r["last_ip"],
             last_sample=json.loads(r["last_sample"]) if r["last_sample"] else None,
             notes=r["notes"],
+            check_config=json.loads(r["check_config"]) if "check_config" in keys and r["check_config"] else None,
+            check_rev=r["check_rev"] if "check_rev" in keys else 0,
+            pending_cmd=r["pending_cmd"] if "pending_cmd" in keys else None,
         )
 
 
@@ -142,6 +152,14 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first release (SQLite has no IF NOT EXISTS for columns)."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(hosts)")}
+        for col, ddl in (("check_config", "TEXT"), ("check_rev", "INTEGER NOT NULL DEFAULT 0"), ("pending_cmd", "TEXT")):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE hosts ADD COLUMN {col} {ddl}")
 
     def close(self) -> None:
         with self._lock:
@@ -198,6 +216,32 @@ class Database:
         with self._lock:
             rows = self._conn.execute("SELECT * FROM hosts ORDER BY name").fetchall()
         return [HostRow.from_row(r) for r in rows]
+
+    # ------------------------------------------------------- remote config
+    def set_check_config(self, name: str, config: dict) -> int:
+        """Store the agent's remote check settings; returns the new revision."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE hosts SET check_config=?, check_rev=check_rev+1 WHERE name=?",
+                (json.dumps(config, separators=(",", ":")), name),
+            )
+            if cur.rowcount == 0:
+                raise KeyError(name)
+            return self._conn.execute("SELECT check_rev FROM hosts WHERE name=?", (name,)).fetchone()["check_rev"]
+
+    def set_command(self, name: str, cmd: Optional[str]) -> None:
+        with self._lock:
+            cur = self._conn.execute("UPDATE hosts SET pending_cmd=? WHERE name=?", (cmd, name))
+            if cur.rowcount == 0:
+                raise KeyError(name)
+
+    def pop_command(self, host_id: int) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute("SELECT pending_cmd FROM hosts WHERE id=?", (host_id,)).fetchone()
+            if row and row["pending_cmd"]:
+                self._conn.execute("UPDATE hosts SET pending_cmd=NULL WHERE id=?", (host_id,))
+                return row["pending_cmd"]
+        return None
 
     # -------------------------------------------------------------- samples
     def record_sample(self, host: HostRow, sample: Sample, ip: str | None) -> dict[str, Optional[float]]:

@@ -123,11 +123,13 @@ class Check(BaseModel):
     ok: bool
     detail: str = ""
     value: Optional[float] = None   # e.g. heartbeat age in seconds
+    level: str = ""                 # "" (failure is red) | "warning" (amber) | "info" (never alerts)
 
 
 class Sample(BaseModel):
     ts: float
     interval: Optional[float] = None
+    config_rev: Optional[int] = None    # revision of hub-pushed check config the agent is running (None: unsupported)
     host: HostInfo
     cpu: CpuMetrics = Field(default_factory=CpuMetrics)
     memory: MemoryMetrics = Field(default_factory=MemoryMetrics)
