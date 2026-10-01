@@ -13,7 +13,9 @@ from every machine, live on one page.
   independently verifies the Access token on every request.
 
 ![Fleet view](docs/screenshots/fleet.png)
-![Host detail](docs/screenshots/detail.png)
+![Host detail](docs/screenshots/host.png)
+![Tasks](docs/screenshots/tasks.png)
+![Agents](docs/screenshots/agents.png)
 
 ```
 ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
@@ -39,9 +41,48 @@ from every machine, live on one page.
 | `server/manage.py` | enroll / list / disable / remove hosts, rotate tokens |
 | `agent/avalon_agent.py` | the agent (only dependency: `psutil`) |
 | `agent/install/` | `install-linux.sh` (root or `--user`) + systemd unit, `install-windows.ps1` (Scheduled Task) |
-| `deploy/` | hub systemd unit, `install-server.sh`, cloudflared ingress snippet |
+| `agent/avm.py` | the `avm` task CLI (installed beside the agent, kept current by auto-update) |
+| `deploy/` | hub systemd unit, `install-server.sh`, `upgrade.sh`, cloudflared ingress snippet |
 | `docs/CLOUDFLARE.md` | step-by-step tunnel + Access setup |
 | `docs/HOSTS.md` | ready-to-paste `agent.conf` per machine (Miami, DESKTOP-C, AVALON, Pi) |
+
+## What's on the dashboard
+
+| Tab | What it shows |
+|-----|---------------|
+| **Fleet** | one card per machine (CPU/mem/disk/GPU meters, sparkline, checks, running tasks); click for the full host page with charts, tables and the checks editor. Drag cards by their handle to reorder; on a host page, **Customize** lets you drag panels around and hide the ones you don't need — per host or for all hosts. Layouts are saved to your user on the hub, so they follow you across browsers. |
+| **Tasks** | everything reported through the `avm` command: live status, elapsed time, heartbeat, exit code, last output lines. Failed → red, stalled (no heartbeat) → amber, host gone → lost. |
+| **Agents** | Claude Code sessions on each machine (from `~/.claude/projects`: what each was started with, what it last said, how long ago) and a prompt console: pick a permission mode, a working directory, optionally a session to continue, and send. Output streams back live; follow-ups resume the same session. |
+| **Alerts** | one list of what needs attention: offline hosts, failing checks, the GPU-stall rule, agent update errors, failed/stalled/lost tasks, failed prompts. Clicking goes to the source. |
+
+### `avm` — one command when you set something off
+
+Installed on every machine next to the agent (`/usr/local/bin/avm`, `~/.local/bin/avm`
+for rootless installs, `C:\ProgramData\AvalonAgent\avm.cmd` on Windows):
+
+```bash
+avm run "seed 3 training" -- python train.py --seed 3   # wraps a command: output tail, heartbeat, exit code
+avm watch "nightly backup" --pid 4242                   # follow an already-running process
+avm task start "data prep" --expect 300                 # manual lifecycle -> prints TASK_ID
+avm task beat ID --progress 0.4 --log "epoch 3"
+avm task done ID        |   avm task fail ID --rc 1 --note "why"
+avm task list
+```
+
+Claude sessions launched from the Agents tab are told (via system prompt) to wrap
+long-running work in `avm run`, so their training runs show up as tasks.
+
+### Prompting Claude from the dashboard — what it can do
+
+A prompt becomes a job queued for that host; the agent runs `claude -p` **as the
+user the agent runs as**, in the chosen directory, and streams the session back.
+Permission modes: *Plan / read-only* (default), *Accept edits*, or *Full access*
+(`--dangerously-skip-permissions`; asks for confirmation and is logged with your
+identity). This is remote code execution on your fleet gated only by Cloudflare
+Access / the tailnet — keep the Access policy tight. Prompting needs the agent to
+run as a user with a Claude login: the rootless `--user` install on Linux, or
+`install-windows.ps1 -AsCurrentUser` on Windows. Set `AVM_CLAUDE=false` in an
+agent's config to opt a machine out entirely.
 
 ## 1. Install the hub on AVALON
 
@@ -130,7 +171,14 @@ LibreHardwareMonitor (Windows). Because a job can be data-loader-bound while the
 GPU idles, the host page shows per-process CPU right beside GPU utilisation,
 and the fleet card shows the busiest process.
 
-### Upgrading later — agents update themselves
+### Upgrading
+
+```bash
+git pull && sudo ./deploy/upgrade.sh                    # hub; other agents self-update within one interval
+git pull && sudo ./deploy/upgrade.sh --rootless-agent   # ...and move AVALON's own agent to a rootless install
+```
+
+### Agents update themselves
 
 Agents (1.2+) compare the SHA-256 of their own script with the one the hub
 serves in every report reply. When you upgrade the hub
@@ -165,6 +213,10 @@ through the tunnel, so the order of those steps doesn't matter.
 | `GET`  | `/hosts/{name}/series?metrics=cpu,mem&range=6h&points=600` | bucketed history (`15m…30d`) |
 | `WS`   | `/live` | snapshot on connect, then a `host` message per sample / status change |
 | `GET`  | `/config`, `/stats`, `/healthz` | |
+| `POST` | `/tasks`, `/tasks/{id}/beat`, `/tasks/{id}/finish` | task lifecycle (agent token; what `avm` calls) |
+| `GET`  | `/tasks`, `/tasks/{id}` | tasks for the dashboard |
+| `POST` | `/claude/jobs` · `GET /claude/jobs/{id}` · `POST …/cancel` | queue / inspect / cancel a prompt |
+| `GET`/`PUT` | `/prefs` | per-user layout preferences |
 
 Metrics: `cpu load1 cpu_temp mem swap disk_read disk_write net_rx net_tx gpu_util gpu_mem gpu_temp temp_max disk_used`.
 

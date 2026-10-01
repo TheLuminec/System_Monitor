@@ -69,7 +69,80 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- Tracked tasks (training runs, services, anything reported through the `avm` CLI).
+CREATE TABLE IF NOT EXISTS tasks (
+    id          INTEGER PRIMARY KEY,
+    host_id     INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    status      TEXT NOT NULL,            -- running | done | failed | stalled | lost
+    source      TEXT NOT NULL DEFAULT '', -- run | task | watch
+    started     REAL NOT NULL,
+    ended       REAL,
+    updated     REAL NOT NULL,
+    heartbeat   REAL NOT NULL,
+    expect_beat REAL,                     -- seconds; NULL = no stall detection
+    progress    REAL,
+    rc          INTEGER,
+    command     TEXT,
+    cwd         TEXT,
+    pid         INTEGER,
+    user        TEXT,
+    log         TEXT NOT NULL DEFAULT '',
+    meta        TEXT,
+    note        TEXT
+);
+CREATE INDEX IF NOT EXISTS tasks_host_status ON tasks(host_id, status);
+CREATE INDEX IF NOT EXISTS tasks_started ON tasks(started);
+
+-- Claude Code sessions launched from the dashboard.
+CREATE TABLE IF NOT EXISTS claude_jobs (
+    id              INTEGER PRIMARY KEY,
+    host_id         INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+    status          TEXT NOT NULL,        -- queued | running | done | failed | cancelled
+    prompt          TEXT NOT NULL,
+    cwd             TEXT,
+    mode            TEXT NOT NULL,        -- plan | acceptEdits | full
+    model           TEXT,
+    resume_session  TEXT,
+    session_id      TEXT,
+    created         REAL NOT NULL,
+    started         REAL,
+    ended           REAL,
+    created_by      TEXT,
+    result          TEXT,
+    cost_usd        REAL,
+    duration_ms     INTEGER,
+    num_turns       INTEGER,
+    error           TEXT,
+    cancel          INTEGER NOT NULL DEFAULT 0,
+    title           TEXT
+);
+CREATE INDEX IF NOT EXISTS claude_jobs_host ON claude_jobs(host_id, status);
+
+CREATE TABLE IF NOT EXISTS claude_events (
+    job_id  INTEGER NOT NULL REFERENCES claude_jobs(id) ON DELETE CASCADE,
+    seq     INTEGER NOT NULL,
+    ts      REAL NOT NULL,
+    data    TEXT NOT NULL,
+    PRIMARY KEY (job_id, seq)
+) WITHOUT ROWID;
+
+-- Per-user dashboard preferences (layout, hidden panels, card order).
+CREATE TABLE IF NOT EXISTS prefs (
+    user    TEXT PRIMARY KEY,
+    data    TEXT NOT NULL,
+    updated REAL NOT NULL
+);
 """
+
+TASK_LOG_LINES = 200
+TASK_STATES = ("running", "done", "failed", "stalled", "lost")
+JOB_STATES = ("queued", "running", "done", "failed", "cancelled")
+
+
+def _row(r: sqlite3.Row) -> dict:
+    return dict(r) if r is not None else None
 
 
 def hash_token(token: str) -> str:
@@ -335,10 +408,199 @@ class Database:
             b = self._conn.execute("DELETE FROM samples_1m WHERE ts < ?", (now - rollup_days * 86400,)).rowcount
         return a, b
 
+    # ---------------------------------------------------------------- tasks
+    def task_create(self, host_id: int, name: str, source: str, expect_beat: Optional[float], command: str | None,
+                    cwd: str | None, pid: int | None, user: str | None, meta: dict | None) -> dict:
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO tasks(host_id, name, status, source, started, updated, heartbeat, expect_beat, command, cwd, pid, user, meta)"
+                " VALUES (?,?,'running',?,?,?,?,?,?,?,?,?,?)",
+                (host_id, name[:200], source, now, now, now, expect_beat, command, cwd, pid, user,
+                 json.dumps(meta) if meta else None),
+            )
+            return _row(self._conn.execute("SELECT * FROM tasks WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def task_get(self, task_id: int) -> Optional[dict]:
+        with self._lock:
+            return _row(self._conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+
+    def task_update(self, task_id: int, host_id: int | None = None, *, status: str | None = None, progress: float | None = None,
+                    rc: int | None = None, log_lines: list[str] | None = None, note: str | None = None, beat: bool = True,
+                    pid: int | None = None) -> Optional[dict]:
+        """Apply a heartbeat / log / finish update. host_id (when given) must match - agents can only touch their own tasks."""
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None or (host_id is not None and row["host_id"] != host_id):
+                return None
+            sets, vals = ["updated=?"], [now]
+            if beat:
+                sets.append("heartbeat=?"); vals.append(now)
+            if status:
+                sets.append("status=?"); vals.append(status)
+                if status in ("done", "failed"):
+                    sets.append("ended=?"); vals.append(now)
+            elif beat and row["status"] == "stalled":
+                sets.append("status='running'")
+            if progress is not None:
+                sets.append("progress=?"); vals.append(max(0.0, min(1.0, float(progress))))
+            if rc is not None:
+                sets.append("rc=?"); vals.append(int(rc))
+            if pid is not None:
+                sets.append("pid=?"); vals.append(int(pid))
+            if note is not None:
+                sets.append("note=?"); vals.append(note[:2000])
+            if log_lines:
+                merged = (row["log"].splitlines() + [l[:500] for l in log_lines])[-TASK_LOG_LINES:]
+                sets.append("log=?"); vals.append("\n".join(merged))
+            vals.append(task_id)
+            self._conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", vals)
+            return _row(self._conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+
+    def task_list(self, host_id: int | None = None, status: str | None = None, limit: int = 200, with_log: bool = False) -> list[dict]:
+        cols = "*" if with_log else "id, host_id, name, status, source, started, ended, updated, heartbeat, expect_beat, progress, rc, command, cwd, pid, user, meta, note"
+        where, vals = [], []
+        if host_id is not None:
+            where.append("host_id=?"); vals.append(host_id)
+        if status:
+            where.append("status=?"); vals.append(status)
+        sql = f"SELECT {cols} FROM tasks" + (" WHERE " + " AND ".join(where) if where else "") + \
+              " ORDER BY (status IN ('running','stalled')) DESC, started DESC LIMIT ?"
+        vals.append(limit)
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(sql, vals).fetchall()]
+
+    def task_delete(self, task_id: int) -> bool:
+        with self._lock:
+            return self._conn.execute("DELETE FROM tasks WHERE id=?", (task_id,)).rowcount > 0
+
+    def task_mark_stalled(self, now: float | None = None) -> list[dict]:
+        """Running tasks whose heartbeat is older than 1.5x their expectation -> stalled. Returns changed rows."""
+        now = now or time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM tasks WHERE status='running' AND expect_beat IS NOT NULL AND heartbeat < ? - expect_beat * 1.5", (now,)
+            ).fetchall()
+            ids = [r["id"] for r in rows]
+            if ids:
+                self._conn.execute(f"UPDATE tasks SET status='stalled', updated=? WHERE id IN ({','.join('?' * len(ids))})", [now, *ids])
+            return [dict(self._conn.execute("SELECT * FROM tasks WHERE id=?", (i,)).fetchone()) for i in ids]
+
+    def task_mark_lost(self, host_id: int, now: float | None = None) -> list[dict]:
+        """A host went offline: its running/stalled tasks can no longer report."""
+        now = now or time.time()
+        with self._lock:
+            rows = self._conn.execute("SELECT id FROM tasks WHERE host_id=? AND status IN ('running','stalled')", (host_id,)).fetchall()
+            ids = [r["id"] for r in rows]
+            if ids:
+                self._conn.execute(f"UPDATE tasks SET status='lost', updated=? WHERE id IN ({','.join('?' * len(ids))})", [now, *ids])
+            return [dict(self._conn.execute("SELECT * FROM tasks WHERE id=?", (i,)).fetchone()) for i in ids]
+
+    def task_prune(self, days: int, now: float | None = None) -> int:
+        now = now or time.time()
+        with self._lock:
+            return self._conn.execute("DELETE FROM tasks WHERE status IN ('done','failed','lost') AND updated < ?", (now - days * 86400,)).rowcount
+
+    # ---------------------------------------------------------- claude jobs
+    def job_create(self, host_id: int, prompt: str, cwd: str | None, mode: str, model: str | None,
+                   resume_session: str | None, created_by: str | None) -> dict:
+        now = time.time()
+        title = prompt.strip().splitlines()[0][:80] if prompt.strip() else "(empty)"
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO claude_jobs(host_id, status, prompt, cwd, mode, model, resume_session, created, created_by, title)"
+                " VALUES (?,'queued',?,?,?,?,?,?,?,?)",
+                (host_id, prompt, cwd, mode, model, resume_session, now, created_by, title),
+            )
+            return _row(self._conn.execute("SELECT * FROM claude_jobs WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def job_get(self, job_id: int) -> Optional[dict]:
+        with self._lock:
+            return _row(self._conn.execute("SELECT * FROM claude_jobs WHERE id=?", (job_id,)).fetchone())
+
+    def job_list(self, host_id: int | None = None, limit: int = 100) -> list[dict]:
+        sql = "SELECT * FROM claude_jobs" + (" WHERE host_id=?" if host_id is not None else "") + \
+              " ORDER BY (status IN ('queued','running')) DESC, created DESC LIMIT ?"
+        vals = ([host_id] if host_id is not None else []) + [limit]
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(sql, vals).fetchall()]
+
+    def jobs_pending_for(self, host_id: int) -> tuple[list[dict], list[int]]:
+        """(queued jobs to hand to the agent, ids of running jobs with cancel requested)."""
+        with self._lock:
+            queued = [dict(r) for r in self._conn.execute(
+                "SELECT id, prompt, cwd, mode, model, resume_session FROM claude_jobs WHERE host_id=? AND status='queued' ORDER BY id", (host_id,)).fetchall()]
+            cancel = [r["id"] for r in self._conn.execute(
+                "SELECT id FROM claude_jobs WHERE host_id=? AND status IN ('queued','running') AND cancel=1", (host_id,)).fetchall()]
+            return queued, cancel
+
+    def job_update(self, job_id: int, host_id: int | None = None, **fields) -> Optional[dict]:
+        allowed = {"status", "started", "ended", "session_id", "result", "cost_usd", "duration_ms", "num_turns", "error", "cancel", "title"}
+        sets, vals = [], []
+        for k, v in fields.items():
+            if k in allowed:
+                sets.append(f"{k}=?"); vals.append(v)
+        if not sets:
+            return self.job_get(job_id)
+        with self._lock:
+            row = self._conn.execute("SELECT host_id FROM claude_jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or (host_id is not None and row["host_id"] != host_id):
+                return None
+            vals.append(job_id)
+            self._conn.execute(f"UPDATE claude_jobs SET {', '.join(sets)} WHERE id=?", vals)
+            return _row(self._conn.execute("SELECT * FROM claude_jobs WHERE id=?", (job_id,)).fetchone())
+
+    def job_add_events(self, job_id: int, host_id: int, events: list[dict]) -> list[tuple[int, dict]]:
+        """Append events; returns [(seq, event)] as stored."""
+        now = time.time()
+        out = []
+        with self._lock:
+            row = self._conn.execute("SELECT host_id FROM claude_jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["host_id"] != host_id:
+                return out
+            seq = self._conn.execute("SELECT COALESCE(MAX(seq), 0) FROM claude_events WHERE job_id=?", (job_id,)).fetchone()[0]
+            self._conn.execute("BEGIN")
+            try:
+                for ev in events:
+                    seq += 1
+                    self._conn.execute("INSERT INTO claude_events(job_id, seq, ts, data) VALUES (?,?,?,?)",
+                                       (job_id, seq, now, json.dumps(ev, separators=(",", ":"))))
+                    out.append((seq, ev))
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return out
+
+    def job_events(self, job_id: int, after: int = 0, limit: int = 5000) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT seq, ts, data FROM claude_events WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?",
+                                      (job_id, after, limit)).fetchall()
+        return [{"seq": r["seq"], "ts": r["ts"], **json.loads(r["data"])} for r in rows]
+
+    def job_prune(self, days: int, now: float | None = None) -> int:
+        now = now or time.time()
+        with self._lock:
+            return self._conn.execute("DELETE FROM claude_jobs WHERE status IN ('done','failed','cancelled') AND created < ?", (now - days * 86400,)).rowcount
+
+    # ---------------------------------------------------------------- prefs
+    def prefs_get(self, user: str) -> dict:
+        with self._lock:
+            row = self._conn.execute("SELECT data FROM prefs WHERE user=?", (user,)).fetchone()
+        return json.loads(row["data"]) if row else {}
+
+    def prefs_set(self, user: str, data: dict) -> None:
+        with self._lock:
+            self._conn.execute("INSERT OR REPLACE INTO prefs(user, data, updated) VALUES (?,?,?)",
+                               (user, json.dumps(data, separators=(",", ":")), time.time()))
+
     def stats(self) -> dict[str, Any]:
         with self._lock:
             raw = self._conn.execute("SELECT COUNT(*) AS n FROM samples").fetchone()["n"]
             r1m = self._conn.execute("SELECT COUNT(*) AS n FROM samples_1m").fetchone()["n"]
             hosts = self._conn.execute("SELECT COUNT(*) AS n FROM hosts").fetchone()["n"]
+            tasks = self._conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+            jobs = self._conn.execute("SELECT COUNT(*) AS n FROM claude_jobs").fetchone()["n"]
         size = Path(self.path).stat().st_size if Path(self.path).exists() else 0
-        return {"hosts": hosts, "raw_rows": raw, "rollup_rows": r1m, "db_bytes": size}
+        return {"hosts": hosts, "raw_rows": raw, "rollup_rows": r1m, "tasks": tasks, "claude_jobs": jobs, "db_bytes": size}

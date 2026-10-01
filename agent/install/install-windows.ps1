@@ -6,6 +6,7 @@
   # In an elevated PowerShell, from the copied agent\ folder:
   Set-ExecutionPolicy -Scope Process Bypass
   .\install\install-windows.ps1 -Server http://avalon:8787 -Token avm_xxx [-Name desktop-c] [-Interval 5]
+  .\install\install-windows.ps1 -Server ... -Token ... -AsCurrentUser   # run as you at logon, so Claude prompts work
 
   .\install\install-windows.ps1 -Uninstall
 
@@ -21,7 +22,8 @@ param(
   [string]$Name = "",
   [int]$Interval = 5,
   [switch]$Uninstall,
-  [switch]$Upgrade
+  [switch]$Upgrade,
+  [switch]$AsCurrentUser   # run the agent as the logged-in user at logon (needed for Claude Code prompting)
 )
 $ErrorActionPreference = "Stop"
 $TaskName = "AvalonMonitorAgent"
@@ -56,6 +58,7 @@ Write-Host "==> using $py"
 
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
 Copy-Item (Join-Path $SrcDir "avalon_agent.py") (Join-Path $AppDir "avalon_agent.py") -Force
+if (Test-Path (Join-Path $SrcDir "avm.py")) { Copy-Item (Join-Path $SrcDir "avm.py") (Join-Path $AppDir "avm.py") -Force }
 
 $venv = Join-Path $AppDir "venv"
 if (-not (Test-Path (Join-Path $venv "Scripts\python.exe"))) {
@@ -81,12 +84,25 @@ Write-Host "==> checking connectivity"
 & $vpy (Join-Path $AppDir "avalon_agent.py") --config $conf --check
 if ($LASTEXITCODE -ne 0) { Write-Warning "hub check failed - the task will keep retrying once the config is fixed." }
 
+# avm command: C:\ProgramData\AvalonAgent\avm.cmd, on the machine PATH
+$avmCmd = Join-Path $AppDir "avm.cmd"
+Set-Content -Path $avmCmd -Value "@echo off`r`nset AVM_CONFIG=$conf`r`n`"$vpy`" `"$AppDir\avm.py`" %*" -Encoding ASCII
+$machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+if ($machinePath -notlike "*$AppDir*") { [Environment]::SetEnvironmentVariable("Path", "$machinePath;$AppDir", "Machine"); Write-Host "==> added $AppDir to the system PATH (open a new terminal to use 'avm')" }
+if ($AsCurrentUser) { icacls $conf /grant:r "$($env:USERNAME):R" | Out-Null }
+
 Write-Host "==> registering scheduled task $TaskName"
 $action = New-ScheduledTaskAction -Execute $vpyw -Argument "`"$AppDir\avalon_agent.py`" --config `"$conf`"" -WorkingDirectory $AppDir
-$trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
   -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
-$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+if ($AsCurrentUser) {
+  # Runs in the user's session so `claude` finds the user's login; starts at logon rather than boot.
+  $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+  $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+} else {
+  $trigger = New-ScheduledTaskTrigger -AtStartup
+  $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+}
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
   Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
 } else {

@@ -143,3 +143,4 @@ class Sample(BaseModel):
     processes: list[ProcessInfo] = Field(default_factory=list)
     battery: Optional[Battery] = None
     checks: list[Check] = Field(default_factory=list)
+    claude: Optional[dict] = None       # Claude Code availability, recent sessions, running job (agent 1.3+)

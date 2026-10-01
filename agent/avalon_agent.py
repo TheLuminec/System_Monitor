@@ -29,6 +29,9 @@ Configuration (env vars override the config file; file is KEY=VALUE lines):
                         an empty one raises a warning chip - silence from a queue is not success
     AVM_LHM_URL         http://localhost:8085/data.json  (LibreHardwareMonitor on Windows)
     AVM_AUTO_UPDATE     true    replace this script with the hub's copy when its hash changes, then respawn
+    AVM_CLAUDE          true    report Claude Code sessions on this machine and run prompts sent from the dashboard
+    AVM_CLAUDE_BIN      path to the `claude` CLI (default: found on PATH)
+    AVM_CLAUDE_HOME     directory holding .claude/ (default: this user's home)
     AVM_LOG_LEVEL       info
 
 The hub may override the AVM_WATCH_* / AVM_PROCESSES / AVM_TAGS / AVM_MEM_AVAILABLE_WARN_GB
@@ -44,6 +47,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import hashlib
 import json
 import logging
@@ -55,6 +59,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -66,7 +71,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.3.0"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -95,6 +100,9 @@ DEFAULTS = {
     "AVM_MEM_AVAILABLE_WARN_GB": "",
     "AVM_LHM_URL": "",
     "AVM_AUTO_UPDATE": "true",
+    "AVM_CLAUDE": "true",
+    "AVM_CLAUDE_BIN": "",
+    "AVM_CLAUDE_HOME": "",
     "AVM_LOG_LEVEL": "info",
 }
 
@@ -209,6 +217,7 @@ if IS_LINUX:
         pass
 
 _HOST_STATIC: Dict[str, Any] = {}
+_CLAUDE: Optional["ClaudeRunner"] = None
 
 
 def host_info(cfg: Dict[str, str]) -> Dict[str, Any]:
@@ -884,6 +893,347 @@ def _systemd_check(item: str, kind: str) -> Dict[str, Any]:
             "level": "info" if kind == "job" else ""}
 
 
+# ------------------------------------------------------------- claude code
+class ClaudeRunner:
+    """Runs dashboard-submitted prompts through `claude -p` and streams events back to the hub."""
+
+    MAX_EVENTS_PER_POST = 200
+
+    def __init__(self, cfg: Dict[str, str]):
+        self.cfg = cfg
+        self.bin = cfg["AVM_CLAUDE_BIN"] or shutil.which("claude") or (shutil.which("claude.cmd") if IS_WINDOWS else None)
+        self.home = cfg["AVM_CLAUDE_HOME"] or os.path.expanduser("~")
+        self.version: Optional[str] = None
+        self.lock = threading.Lock()
+        self.current: Optional[Dict[str, Any]] = None   # {"id", "proc", "started", "title"}
+        self.queue: List[Dict[str, Any]] = []
+        self.seen: set = set()
+        self.cancel_ids: set = set()
+        self._version_checked = 0.0
+
+    # ---- discovery
+    def check_version(self) -> Optional[str]:
+        """`claude --version`, run once in the background so a hung CLI can never stall sampling."""
+        if self.bin and self.version is None and time.monotonic() - self._version_checked > 300:
+            self._version_checked = time.monotonic()
+
+            def probe() -> None:
+                out = _run([self.bin, "--version"], timeout=20)
+                if out:
+                    self.version = out.strip().split()[0]
+
+            threading.Thread(target=probe, daemon=True, name="claude-version").start()
+        return self.version
+
+    def sessions(self, limit: int = 20, within_sec: float = 86400) -> List[Dict[str, Any]]:
+        """Recent Claude Code sessions from ~/.claude/projects/<slug>/<session>.jsonl (what, where, when)."""
+        root = os.path.join(self.home, ".claude", "projects")
+        if not os.path.isdir(root):
+            return []
+        now = time.time()
+        files = []
+        try:
+            for slug in os.listdir(root):
+                d = os.path.join(root, slug)
+                if not os.path.isdir(d):
+                    continue
+                for fn in os.listdir(d):
+                    if fn.endswith(".jsonl"):
+                        fp = os.path.join(d, fn)
+                        try:
+                            m = os.stat(fp).st_mtime
+                        except OSError:
+                            continue
+                        if now - m <= within_sec:
+                            files.append((m, fp, slug, fn[:-6]))
+        except OSError:
+            return []
+        files.sort(reverse=True)
+        out = []
+        for mtime, fp, slug, sid in files[:limit]:
+            info = self._session_summary(fp)
+            info.update({"session_id": sid, "project": slug, "last_activity": mtime, "active": now - mtime < 120,
+                         "dashboard_job": sid in self.seen})
+            out.append(info)
+        return out
+
+    @staticmethod
+    def _session_summary(fp: str) -> Dict[str, Any]:
+        """Read the first few and last ~64 KB of a transcript: cwd, first prompt, last user/assistant snippets."""
+        cwd = ""; first_prompt = ""; last_user = ""; last_assistant = ""; last_ts = None; first_ts = None; version = ""
+        branch = ""
+
+        def text_of(msg) -> str:
+            c = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):
+                parts = [x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text"]
+                return " ".join(parts)
+            return ""
+
+        try:
+            size = os.path.getsize(fp)
+            with open(fp, "rb") as f:
+                head = f.read(64 * 1024).decode("utf-8", "replace").splitlines()
+                tail_lines = head
+                if size > 64 * 1024:
+                    f.seek(max(0, size - 64 * 1024))
+                    tail_lines = f.read().decode("utf-8", "replace").splitlines()[1:]
+        except OSError:
+            return {"cwd": "", "first_prompt": "", "last_user": "", "last_assistant": ""}
+        for line in head[:40]:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            cwd = cwd or d.get("cwd", "")
+            version = version or d.get("version", "")
+            branch = branch or d.get("gitBranch", "")
+            first_ts = first_ts or d.get("timestamp")
+            if d.get("type") == "user" and not first_prompt:
+                t = text_of(d.get("message", {}))
+                if t and not t.startswith("<"):
+                    first_prompt = t.strip()[:200]
+        for line in reversed(tail_lines[-400:]):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if last_ts is None and d.get("timestamp"):
+                last_ts = d["timestamp"]
+            cwd = cwd or d.get("cwd", "")
+            if d.get("type") == "assistant" and not last_assistant:
+                last_assistant = text_of(d.get("message", {})).strip()[:240]
+            elif d.get("type") == "user" and not last_user:
+                t = text_of(d.get("message", {})).strip()
+                if t and not t.startswith("<"):
+                    last_user = t[:240]
+            if last_user and last_assistant:
+                break
+        return {"cwd": cwd, "first_prompt": first_prompt, "last_user": last_user, "last_assistant": last_assistant,
+                "first_ts": first_ts, "last_ts": last_ts, "claude_version": version, "git_branch": branch}
+
+    @staticmethod
+    def processes() -> List[Dict[str, Any]]:
+        out = []
+        me = os.getpid()
+        for p in psutil.process_iter(["pid", "name", "cmdline", "create_time", "username"]):
+            try:
+                name = (p.info["name"] or "").lower()
+                cmd = p.info["cmdline"] or []
+                joined = " ".join(cmd).lower()
+                if p.info["pid"] == me:
+                    continue
+                is_claude = name in ("claude", "claude.exe") or (len(cmd) > 1 and os.path.basename(cmd[0]).lower() in ("node", "node.exe", "bun") and "claude" in os.path.basename(cmd[1]).lower()) \
+                    or (name.startswith("node") and "/.local/bin/claude" in joined) or os.path.basename(cmd[0] if cmd else "").lower() == "claude"
+                if not is_claude:
+                    continue
+                with p.oneshot():
+                    out.append({"pid": p.info["pid"], "user": (p.info["username"] or "").split("\\")[-1][:32],
+                                "cwd": _safe(p.cwd, default="") or "", "started": p.info["create_time"],
+                                "cpu_percent": round(p.cpu_percent(interval=None), 1), "mem_rss": p.memory_info().rss,
+                                "args": " ".join(a for a in cmd[1:] if not a.startswith("--") )[:80]})
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return out[:30]
+
+    def report(self) -> Dict[str, Any]:
+        with self.lock:
+            cur = self.current
+            running = {"id": cur["id"], "title": cur["title"], "started": cur["started"]} if cur else None
+            queued = [q["id"] for q in self.queue]
+        return {"available": bool(self.bin), "bin": self.bin, "version": self.check_version(), "user": _whoami(), "home": self.home,
+                "sessions": _safe(self.sessions, default=[]), "processes": _safe(self.processes, default=[]),
+                "running_job": running, "queued_jobs": queued}
+
+    # ---- job execution
+    def accept(self, jobs: List[Dict[str, Any]], cancel: List[int]) -> None:
+        with self.lock:
+            for j in jobs:
+                if j["id"] not in self.seen:
+                    self.seen.add(j["id"])
+                    self.queue.append(j)
+            for cid in cancel:
+                self.cancel_ids.add(cid)
+                self.queue = [q for q in self.queue if q["id"] != cid]
+            if self.current and self.current["id"] in self.cancel_ids:
+                self._kill(self.current)
+        self._pump()
+
+    def _pump(self) -> None:
+        with self.lock:
+            if self.current or not self.queue:
+                return
+            job = self.queue.pop(0)
+            self.current = {"id": job["id"], "proc": None, "started": time.time(), "title": job["prompt"].strip().splitlines()[0][:80]}
+        th = threading.Thread(target=self._run_job, args=(job,), daemon=True, name="claude-job-%s" % job["id"])
+        th.start()
+
+    @staticmethod
+    def _kill(cur: Dict[str, Any]) -> None:
+        proc = cur.get("proc")
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def _post(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        url = self.cfg["AVM_SERVER_URL"].rstrip("/") + "/api/v1" + path
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers={
+            "Content-Type": "application/json", "Authorization": "Bearer " + self.cfg["AVM_TOKEN"], "User-Agent": "avalon-agent/" + AGENT_VERSION})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read().decode("utf-8") or "{}")
+        except Exception as e:
+            log.warning("claude job post %s failed: %s", path, e)
+            return {}
+
+    def _run_job(self, job: Dict[str, Any]) -> None:
+        jid = job["id"]
+        if jid in self.cancel_ids:
+            self._post("/claude/jobs/%d/finish" % jid, {"status": "cancelled"})
+            self._done()
+            return
+        if not self.bin:
+            self._post("/claude/jobs/%d/finish" % jid, {"status": "failed", "error": "claude CLI not found on this host"})
+            self._done()
+            return
+        cwd = job.get("cwd") or self.home
+        if not os.path.isdir(cwd):
+            self._post("/claude/jobs/%d/finish" % jid, {"status": "failed", "error": "cwd does not exist: %s" % cwd})
+            self._done()
+            return
+        args = [self.bin, "-p", job["prompt"], "--output-format", "stream-json", "--verbose"]
+        mode = job.get("mode") or "plan"
+        if mode == "full":
+            args.append("--dangerously-skip-permissions")
+        else:
+            args += ["--permission-mode", mode]
+        if job.get("model"):
+            args += ["--model", job["model"]]
+        if job.get("resume_session"):
+            args += ["--resume", job["resume_session"]]
+        args += ["--append-system-prompt",
+                 "You were started from the Avalon Monitor dashboard on host %s. When you launch anything long-running "
+                 "(training, builds, services), wrap it as `avm run \"<name>\" -- <command>` so it is tracked; `avm --help` for details."
+                 % socket.gethostname()]
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}  # never inherit a parent Claude session
+        env["AVM_CLAUDE_JOB"] = str(jid)
+        try:
+            proc = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
+                                    **({"creationflags": 0x08000000} if IS_WINDOWS else {}))
+        except OSError as e:
+            self._post("/claude/jobs/%d/finish" % jid, {"status": "failed", "error": "cannot start claude: %s" % e})
+            self._done()
+            return
+        with self.lock:
+            if self.current and self.current["id"] == jid:
+                self.current["proc"] = proc
+        self._post("/claude/jobs/%d/start" % jid, {})
+        log.info("claude job #%d started (mode=%s, cwd=%s)", jid, mode, cwd)
+
+        stderr_tail: deque = deque(maxlen=30)
+
+        def drain_err() -> None:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                stderr_tail.append(line.rstrip())
+
+        threading.Thread(target=drain_err, daemon=True).start()
+        batch: List[Dict[str, Any]] = []
+        last_flush = time.monotonic()
+        final: Dict[str, Any] = {}
+        session_id = None
+        cancelled = False
+
+        def flush() -> None:
+            nonlocal batch, last_flush, cancelled
+            if not batch:
+                return
+            r = self._post("/claude/jobs/%d/events" % jid, {"events": batch[: self.MAX_EVENTS_PER_POST]})
+            batch = batch[self.MAX_EVENTS_PER_POST:]
+            last_flush = time.monotonic()
+            if r.get("cancel"):
+                cancelled = True
+                self._kill({"proc": proc})
+
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                ev = {"type": "raw", "text": line[:2000]}
+            if ev.get("type") == "system" and ev.get("session_id"):
+                session_id = ev["session_id"]
+            if ev.get("type") == "result":
+                final = ev
+            batch.append(_compact_event(ev))
+            if time.monotonic() - last_flush > 1.0 or len(batch) >= 50:
+                flush()
+            if jid in self.cancel_ids and not cancelled:
+                cancelled = True
+                self._kill({"proc": proc})
+        rc = proc.wait()
+        flush()
+        if jid in self.cancel_ids:
+            cancelled = True
+        status = "cancelled" if cancelled else ("done" if rc == 0 and not final.get("is_error") else "failed")
+        err = None
+        if status == "failed":
+            err = (final.get("result") if final.get("is_error") else None) or ("\n".join(stderr_tail)[-800:] or "exit code %s" % rc)
+        self._post("/claude/jobs/%d/finish" % jid, {
+            "status": status, "session_id": final.get("session_id") or session_id, "result": (final.get("result") or "")[:20000] or None,
+            "cost_usd": final.get("total_cost_usd"), "duration_ms": final.get("duration_ms"), "num_turns": final.get("num_turns"), "error": err})
+        log.info("claude job #%d %s (rc=%s)", jid, status, rc)
+        self._done()
+
+    def _done(self) -> None:
+        with self.lock:
+            self.current = None
+        self._pump()
+
+
+def _compact_event(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """Trim bulky fields so the hub stores what the UI needs (text, tool names/inputs, results)."""
+    t = ev.get("type")
+    if t == "assistant" or t == "user":
+        msg = ev.get("message") or {}
+        content = msg.get("content")
+        parts = []
+        if isinstance(content, str):
+            parts.append({"type": "text", "text": content[:8000]})
+        elif isinstance(content, list):
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                ct = c.get("type")
+                if ct == "text":
+                    parts.append({"type": "text", "text": (c.get("text") or "")[:8000]})
+                elif ct == "tool_use":
+                    inp = c.get("input")
+                    parts.append({"type": "tool_use", "name": c.get("name"), "input": json.dumps(inp)[:1500] if inp is not None else ""})
+                elif ct == "tool_result":
+                    rc = c.get("content")
+                    text = rc if isinstance(rc, str) else " ".join(x.get("text", "") for x in rc if isinstance(x, dict)) if isinstance(rc, list) else ""
+                    parts.append({"type": "tool_result", "text": text[:2000], "is_error": bool(c.get("is_error"))})
+                elif ct == "thinking":
+                    parts.append({"type": "thinking", "text": (c.get("thinking") or "")[:600]})
+        return {"type": t, "parts": parts, "model": msg.get("model")}
+    if t == "system":
+        return {"type": "system", "subtype": ev.get("subtype"), "session_id": ev.get("session_id"), "model": ev.get("model"),
+                "cwd": ev.get("cwd"), "tools": len(ev.get("tools") or []), "permissionMode": ev.get("permissionMode")}
+    if t == "result":
+        return {k: ev.get(k) for k in ("type", "subtype", "is_error", "duration_ms", "num_turns", "total_cost_usd", "session_id") if k in ev} | \
+               {"result": (ev.get("result") or "")[:8000]}
+    return {"type": t or "raw", "text": json.dumps(ev)[:1500]}
+
+
 def _fmt_age(sec: float) -> str:
     sec = int(sec)
     if sec < 90:
@@ -935,6 +1285,7 @@ def collect_sample(cfg: Dict[str, str], interval: float) -> Dict[str, Any]:
         "processes": _safe(collect_processes, int(cfg["AVM_PROCESSES"] or 0), default=[]),
         "battery": _safe(collect_battery),
         "checks": _safe(collect_checks, cfg, default=[]),
+        "claude": _safe(_CLAUDE.report) if _CLAUDE else None,
     }
 
 
@@ -1061,8 +1412,34 @@ def self_update(cfg: Dict[str, str], info: Dict[str, Any]) -> bool:
             pass
         return _update_failed("cannot replace %s: %s (running as %s)" % (_SELF_PATH, e, _whoami()))
     _UPDATE_STATE["error"] = None
+    _refresh_companion(cfg, "avm.py")
     log.info("self-update: installed agent %s (%s), respawning", info.get("version", "?"), got[:12])
     return True
+
+
+def _refresh_companion(cfg: Dict[str, str], name: str) -> None:
+    """Best-effort: keep avm.py (the task CLI) next to this script in step with the hub."""
+    url = cfg["AVM_SERVER_URL"].rstrip("/") + "/api/v1/agent/file/" + name
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + cfg["AVM_TOKEN"], "User-Agent": "avalon-agent/" + AGENT_VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = r.read()
+            want = r.headers.get("X-File-Sha256", "")
+        if want and hashlib.sha256(data).hexdigest() != want:
+            return
+        compile(data, name, "exec")
+        dest = os.path.join(os.path.dirname(_SELF_PATH), name)
+        tmp = dest + ".new"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        try:
+            os.chmod(tmp, 0o755)
+        except OSError:
+            pass
+        os.replace(tmp, dest)
+        log.info("self-update: refreshed %s", name)
+    except Exception as e:
+        log.warning("self-update: could not refresh %s: %s", name, e)
 
 
 def _whoami() -> str:
@@ -1090,12 +1467,15 @@ def main(argv=None) -> int:
     ap.add_argument("--once", action="store_true", help="collect one sample, print JSON, exit")
     ap.add_argument("--check", action="store_true", help="verify hub connectivity and token, exit")
     args = ap.parse_args(argv)
+    global _CLAUDE
 
     cfg = load_config(args.config)
     logging.basicConfig(level=cfg["AVM_LOG_LEVEL"].upper(), format="%(asctime)s %(levelname)s %(message)s")
     interval = max(1.0, float(cfg["AVM_INTERVAL"] or 5))
 
     if args.once:
+        if cfg["AVM_CLAUDE"].strip().lower() in ("1", "true", "yes", "on"):
+            _CLAUDE = ClaudeRunner(cfg)
         psutil.cpu_percent(interval=None, percpu=True)
         collect_processes(1)
         time.sleep(1.0)
@@ -1135,6 +1515,9 @@ def main(argv=None) -> int:
     log.info("avalon-agent %s on %s -> %s every %.0fs", AGENT_VERSION, host_info(cfg)["hostname"], cfg["AVM_SERVER_URL"], interval)
     psutil.cpu_percent(interval=None, percpu=True)  # prime
     remote = RemoteConfig(cfg)
+    if cfg["AVM_CLAUDE"].strip().lower() in ("1", "true", "yes", "on"):
+        _CLAUDE = ClaudeRunner(cfg)
+        log.info("claude code: %s", _CLAUDE.bin or "not found on PATH (sessions will still be listed)")
     failures = 0
     next_t = time.monotonic() + 1.0
     while not stop["flag"]:
@@ -1159,8 +1542,13 @@ def main(argv=None) -> int:
             failures = 0
             if remote.apply(reply):
                 log.info("applied remote settings rev %s: %s", remote.rev, ", ".join(sorted(remote.overrides)) or "(cleared)")
+            if _CLAUDE and (reply.get("claude_jobs") or reply.get("claude_cancel")):
+                _CLAUDE.accept(reply.get("claude_jobs") or [], reply.get("claude_cancel") or [])
             if reply.get("command") == "respawn":
-                respawn()
+                if _CLAUDE and _CLAUDE.current:
+                    log.info("respawn deferred: a claude job is running")
+                else:
+                    respawn()
             if isinstance(reply.get("agent"), dict):
                 try:
                     if self_update(cfg, reply["agent"]):

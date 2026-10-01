@@ -5,7 +5,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,13 +20,11 @@ from .auth import AuthError, Authorizer, Identity
 from .config import settings
 from .db import METRICS, Database, HostRow
 from .models import Check, Sample
-from .rules import GpuStallRule
 
 logging.basicConfig(level=settings.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("avalon")
 
 STATIC_DIR = Path(__file__).parent / "static"
-AGENT_SCRIPT = Path(settings.agent_script) if settings.agent_script else Path(__file__).resolve().parents[2] / "agent" / "avalon_agent.py"
 RANGES = {"15m": 900, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 
 # Agent settings the dashboard may set remotely (pushed to the agent in every ingest reply).
@@ -39,64 +36,9 @@ REMOTE_KEYS = (
 AGENT_COMMANDS = ("respawn",)
 
 
-# ------------------------------------------------------------------ live hub
-class LiveHub:
-    """Fan-out of host updates to connected dashboard WebSockets."""
-
-    def __init__(self) -> None:
-        self.clients: set[WebSocket] = set()
-        self.online: dict[int, bool] = {}
-
-    async def broadcast(self, message: dict) -> None:
-        if not self.clients:
-            return
-        data = json.dumps(message, separators=(",", ":"))
-        dead = []
-        for ws in list(self.clients):
-            try:
-                await ws.send_text(data)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.clients.discard(ws)
-
-
-class AgentBundle:
-    """The agent script the hub hands out, re-read when the file changes."""
-
-    def __init__(self, path: Path):
-        self.path = path
-        self._mtime = -1.0
-        self.data = b""
-        self.sha256 = ""
-        self.version = ""
-        self.refresh()
-
-    def refresh(self) -> None:
-        try:
-            st = self.path.stat()
-        except OSError:
-            self.data, self.sha256, self.version, self._mtime = b"", "", "", -1.0
-            return
-        if st.st_mtime == self._mtime:
-            return
-        self.data = self.path.read_bytes()
-        self.sha256 = hashlib.sha256(self.data).hexdigest()
-        m = re.search(rb'^AGENT_VERSION\s*=\s*"([^"]+)"', self.data, re.M)
-        self.version = m.group(1).decode() if m else "?"
-        self._mtime = st.st_mtime
-        log.info("serving agent %s (%s) from %s", self.version, self.sha256[:12], self.path)
-
-    @property
-    def available(self) -> bool:
-        return bool(self.data)
-
-
-db = Database(settings.db_path)
-authz = Authorizer(settings)
-hub = LiveHub()
-agent_bundle = AgentBundle(AGENT_SCRIPT)
-gpu_stall = GpuStallRule(minutes=settings.gpu_stall_minutes, percent=settings.gpu_stall_percent)
+from .core import (AGENT_SCRIPT, AgentBundle, LiveHub, agent_bundle, authz, client_ip, db, gpu_stall, hub,  # noqa: F401
+                   require_agent, require_same_origin, require_viewer)
+from .routes_ops import router as ops_router, task_public
 
 
 # --------------------------------------------------------------- serializers
@@ -148,6 +90,15 @@ def _summary_of(sample: Optional[dict]) -> dict[str, Any]:
     }
 
 
+def _claude_summary(c: Optional[dict]) -> Optional[dict]:
+    if not c:
+        return None
+    sessions = c.get("sessions") or []
+    return {"available": c.get("available"), "version": c.get("version"), "user": c.get("user"),
+            "sessions": len(sessions), "active": sum(1 for x in sessions if x.get("active")),
+            "processes": len(c.get("processes") or []), "running_job": c.get("running_job")}
+
+
 def host_public(h: HostRow, full: bool = False) -> dict[str, Any]:
     now = time.time()
     out = {
@@ -167,6 +118,7 @@ def host_public(h: HostRow, full: bool = False) -> dict[str, Any]:
         "agent_outdated": bool(agent_bundle.available and (h.last_sample or {}).get("agent_sha256")
                                and (h.last_sample or {}).get("agent_sha256") != agent_bundle.sha256),
         "agent_update_error": (h.last_sample or {}).get("agent_update_error"),
+        "claude": _claude_summary((h.last_sample or {}).get("claude")),
     }
     if full:
         out["sample"] = h.last_sample
@@ -176,17 +128,6 @@ def host_public(h: HostRow, full: bool = False) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------ auth helpers
-def client_ip(request: Request) -> str:
-    return request.client.host if request.client else "0.0.0.0"
-
-
-def require_viewer(request: Request) -> Identity:
-    try:
-        return authz.viewer(request.headers, request.cookies, client_ip(request))
-    except AuthError as e:
-        raise HTTPException(e.status, e.detail)
-
-
 # ------------------------------------------------------- background tasks
 async def maintenance_loop() -> None:
     last_prune = 0.0
@@ -195,6 +136,8 @@ async def maintenance_loop() -> None:
             await run_in_threadpool(db.rollup)
             if time.time() - last_prune > 3600:
                 a, b = await run_in_threadpool(db.prune, settings.retention_raw_hours, settings.retention_1m_days)
+                await run_in_threadpool(db.task_prune, settings.retention_tasks_days)
+                await run_in_threadpool(db.job_prune, settings.retention_tasks_days)
                 last_prune = time.time()
                 if a or b:
                     log.info("pruned %d raw rows, %d rollup rows", a, b)
@@ -215,6 +158,12 @@ async def presence_loop() -> None:
                 if prev is not None and prev != online:
                     log.info("host %s is now %s", h.name, "online" if online else "OFFLINE")
                     await hub.broadcast({"type": "host", "host": host_public(h)})
+                    if not online:
+                        for t in await run_in_threadpool(db.task_mark_lost, h.id):
+                            await hub.broadcast({"type": "task", "task": task_public(t)})
+            for t in await run_in_threadpool(db.task_mark_stalled):
+                log.warning("task #%d '%s' stalled (no heartbeat)", t["id"], t["name"])
+                await hub.broadcast({"type": "task", "task": task_public(t)})
         except Exception:
             log.exception("presence check failed")
         await asyncio.sleep(5)
@@ -309,26 +258,35 @@ async def ingest(request: Request):
     if agent_bundle.available:
         reply["agent"] = {"version": agent_bundle.version, "sha256": agent_bundle.sha256,
                           "auto_update": settings.agent_auto_update}
+    queued, cancel = await run_in_threadpool(db.jobs_pending_for, host.id)
+    if queued:
+        reply["claude_jobs"] = queued
+    if cancel:
+        reply["claude_cancel"] = cancel
     return reply
 
 
 @app.get("/api/v1/agent/script")
 async def agent_script(request: Request):
     """The current agent script, for self-update. Same access rules as ingest."""
-    ip = client_ip(request)
-    try:
-        authz.ingest_allowed(request.headers, ip)
-    except AuthError as e:
-        raise HTTPException(e.status, e.detail)
-    auth = request.headers.get("authorization", "")
-    host = await run_in_threadpool(db.host_by_token, auth[7:].strip()) if auth.lower().startswith("bearer ") else None
-    if host is None or not host.enabled:
-        raise HTTPException(401, "unknown or disabled token")
+    await require_agent(request)
     agent_bundle.refresh()
     if not agent_bundle.available:
         raise HTTPException(404, "hub has no agent script to serve")
     return Response(agent_bundle.data, media_type="text/x-python",
                     headers={"X-Agent-Version": agent_bundle.version, "X-Agent-Sha256": agent_bundle.sha256})
+
+
+@app.get("/api/v1/agent/file/{name}")
+async def agent_file(name: str, request: Request):
+    """Companion files for self-update (currently avm.py). Same access rules as ingest."""
+    await require_agent(request)
+    if name not in ("avm.py",):
+        raise HTTPException(404, "unknown file")
+    data = agent_bundle.sibling(name)
+    if data is None:
+        raise HTTPException(404, "hub has no such file")
+    return Response(data, media_type="text/x-python", headers={"X-File-Sha256": hashlib.sha256(data).hexdigest()})
 
 
 @app.get("/api/v1/agent")
@@ -395,12 +353,6 @@ async def get_series(
     )
     data.update({"host": h.name, "start": start, "end": end, "range": range})
     return data
-
-
-def require_same_origin(request: Request) -> None:
-    """CSRF guard for state-changing calls: browsers can't add this header cross-origin without CORS."""
-    if request.headers.get("x-requested-with") != "avalon-monitor":
-        raise HTTPException(403, "missing X-Requested-With header")
 
 
 @app.get("/api/v1/hosts/{name}/checks")
@@ -492,6 +444,7 @@ async def index(request: Request):
     return Response(html, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
+app.include_router(ops_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 

@@ -72,6 +72,7 @@ class Settings:
     retention_raw_hours: int = 24 * 7
     retention_1m_days: int = 90
     offline_after_sec: int = 30
+    retention_tasks_days: int = 60
     max_payload_bytes: int = 512 * 1024
 
     # Derived-alert rules (hub-side). GPU stall: a host reports an active job
@@ -109,6 +110,7 @@ def load_settings() -> Settings:
     s.retention_raw_hours = int(env.get("AVM_RETENTION_RAW_HOURS", s.retention_raw_hours))
     s.retention_1m_days = int(env.get("AVM_RETENTION_1M_DAYS", s.retention_1m_days))
     s.offline_after_sec = int(env.get("AVM_OFFLINE_AFTER_SEC", s.offline_after_sec))
+    s.retention_tasks_days = int(env.get("AVM_RETENTION_TASKS_DAYS", s.retention_tasks_days))
     s.max_payload_bytes = int(env.get("AVM_MAX_PAYLOAD_BYTES", s.max_payload_bytes))
     s.gpu_stall_minutes = int(env.get("AVM_RULE_GPU_STALL_MINUTES", s.gpu_stall_minutes))
     s.gpu_stall_percent = float(env.get("AVM_RULE_GPU_STALL_PERCENT", s.gpu_stall_percent))

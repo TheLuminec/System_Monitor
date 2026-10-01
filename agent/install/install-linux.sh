@@ -50,6 +50,7 @@ command -v python3 >/dev/null || { echo "python3 is required (apt install python
 echo "==> installing to $APP_DIR"
 mkdir -p "$APP_DIR" "$ETC_DIR"
 cp "$SRC_DIR/avalon_agent.py" "$APP_DIR/avalon_agent.py"
+cp "$SRC_DIR/avm.py" "$APP_DIR/avm.py" 2>/dev/null || true
 
 if [[ ! -x "$APP_DIR/venv/bin/python" ]]; then
   if python3 -m venv "$APP_DIR/venv" 2>/dev/null; then :; else
@@ -76,6 +77,19 @@ echo "==> checking connectivity"
 if ! "$APP_DIR/venv/bin/python" "$APP_DIR/avalon_agent.py" --config "$ETC_DIR/agent.conf" --check; then
   echo "    (the service will keep retrying; fix $ETC_DIR/agent.conf and restart it)"
 fi
+
+echo "==> avm command"
+if [[ $USER_MODE -eq 1 ]]; then BIN_DIR="$HOME/.local/bin"; else BIN_DIR=/usr/local/bin; fi
+mkdir -p "$BIN_DIR"
+cat > "$BIN_DIR/avm" <<WRAP
+#!/usr/bin/env bash
+# avm - track tasks on the Avalon Monitor dashboard (see avm --help)
+export AVM_CONFIG="\${AVM_CONFIG:-$ETC_DIR/agent.conf}"
+exec "$APP_DIR/venv/bin/python" "$APP_DIR/avm.py" "\$@"
+WRAP
+chmod +x "$BIN_DIR/avm"
+[[ $USER_MODE -eq 1 ]] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]] && echo "    note: add ~/.local/bin to your PATH to use 'avm' directly"
+if [[ $USER_MODE -eq 0 ]]; then chmod 644 "$ETC_DIR/agent.conf" 2>/dev/null; chgrp "$(id -gn "${SUDO_USER:-root}")" "$ETC_DIR/agent.conf" 2>/dev/null || true; chmod 640 "$ETC_DIR/agent.conf"; fi
 
 echo "==> systemd ($SYSTEMCTL)"
 mkdir -p "$UNIT_DIR"

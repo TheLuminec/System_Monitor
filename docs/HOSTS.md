@@ -45,6 +45,9 @@ AVM_WATCH_UNITS=user:xrsec-queue.service
 ```
 
 Notes:
+* Claude prompting from the Agents tab runs `claude -p` as the agent's user, so
+  the rootless install is required for it on Miami (feng's Claude login). Add
+  `AVM_CLAUDE=false` to opt the machine out.
 * `user:` scopes query the login user's manager, which is why the **rootless
   install** below is the right one here (a root/system-unit agent would need
   `user@feng:` prefixes and a recent systemd to reach it).

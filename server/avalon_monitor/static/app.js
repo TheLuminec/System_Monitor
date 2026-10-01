@@ -1,111 +1,64 @@
-// Avalon Monitor dashboard. Zero-build ES module: fleet view, host detail, live WebSocket.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.2.0";
+// Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
+import { TimeChart, drawSparkline } from "./charts.js?v=1.3.0";
+import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate } from "./core.js?v=1.3.0";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs } from "./views.js?v=1.3.0";
 
-// ------------------------------------------------------------------ utils
-const $ = (sel, root = document) => root.querySelector(sel);
-const h = (tag, attrs = {}, ...children) => {
-  const el = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (k === "class") el.className = v;
-    else if (k === "html") el.innerHTML = v;
-    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
-    else if (v != null) el.setAttribute(k, v);
+// ------------------------------------------------------------------ shell
+const NAV = [
+  { id: "fleet", hash: "#/", label: "Fleet", icon: ICON.fleet },
+  { id: "tasks", hash: "#/tasks", label: "Tasks", icon: ICON.tasks },
+  { id: "agents", hash: "#/agents", label: "Agents", icon: ICON.agents },
+  { id: "alerts", hash: "#/alerts", label: "Alerts", icon: ICON.alerts },
+];
+
+function renderNav() {
+  const nav = $("#nav"); nav.innerHTML = "";
+  const cur = currentSection();
+  const hosts = [...state.hosts.values()];
+  const offline = hosts.filter((x) => x.status === "offline").length;
+  const runningTasks = [...state.tasks.values()].filter((t) => t.status === "running").length;
+  const badTasks = [...state.tasks.values()].filter((t) => t.status === "failed" || t.status === "stalled").length;
+  const runningJobs = [...state.jobs.values()].filter((j) => j.status === "running" || j.status === "queued").length;
+  const alerts = computeAlerts();
+  const crit = alerts.filter((a) => a.level === "crit").length;
+  const badge = { fleet: offline ? [offline, "hot"] : null, tasks: badTasks ? [badTasks, "hot"] : runningTasks ? [runningTasks, ""] : null,
+                  agents: runningJobs ? [runningJobs, ""] : null, alerts: alerts.length ? [alerts.length, crit ? "hot" : "warm"] : null };
+  for (const n of NAV) {
+    const a = h("a", { href: n.hash, class: cur === n.id ? "active" : "", html: n.icon + esc(n.label) });
+    const b = badge[n.id];
+    if (b) a.append(h("span", { class: "badge " + b[1] }, String(b[0])));
+    a.onclick = () => $("#sidebar").classList.remove("open");
+    nav.append(a);
   }
-  for (const c of children.flat()) if (c != null) el.append(c.nodeType ? c : document.createTextNode(String(c)));
-  return el;
-};
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-
-export const fmt = {
-  pct: (v, d = 0) => (v == null ? "—" : v.toFixed(d) + "%"),
-  bytes: (b, d = 1) => {
-    if (b == null) return "—";
-    const u = ["B", "KB", "MB", "GB", "TB", "PB"]; let i = 0; let v = b;
-    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
-    return (i === 0 ? v.toFixed(0) : v.toFixed(v >= 100 ? 0 : i >= 4 ? Math.max(d, 1) : d)) + " " + u[i];
-  },
-  bps: (b) => {
-    if (b == null) return "—";
-    const u = ["B/s", "KB/s", "MB/s", "GB/s"]; let i = 0; let v = b;
-    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
-    return (i === 0 ? v.toFixed(0) : v.toFixed(v >= 100 ? 0 : 1)) + " " + u[i];
-  },
-  temp: (t) => (t == null ? "—" : Math.round(t) + "°C"),
-  watts: (w) => (w == null ? "—" : Math.round(w) + " W"),
-  dur: (s) => {
-    if (s == null) return "—";
-    s = Math.floor(s);
-    const d = Math.floor(s / 86400), hh = Math.floor((s % 86400) / 3600), mm = Math.floor((s % 3600) / 60);
-    if (d > 0) return `${d}d ${hh}h`;
-    if (hh > 0) return `${hh}h ${mm}m`;
-    return `${mm}m ${s % 60}s`;
-  },
-  ago: (age) => {
-    if (age == null) return "never";
-    if (age < 5) return "just now";
-    if (age < 90) return `${Math.round(age)}s ago`;
-    if (age < 5400) return `${Math.round(age / 60)}m ago`;
-    if (age < 172800) return `${Math.round(age / 3600)}h ago`;
-    return `${Math.round(age / 86400)}d ago`;
-  },
-  load: (l) => (l ? l.map((x) => x.toFixed(2)).join(" · ") : "—"),
-};
-
-const ICON = {
-  cpu: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg>',
-  down: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12l7 7 7-7"/></svg>',
-  up: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>',
-  disk: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/></svg>',
-  temp: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 14.8V5a2 2 0 0 0-4 0v9.8a4 4 0 1 0 4 0z"/></svg>',
-  bolt: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/></svg>',
-  ok: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5 13l4 4L19 7"/></svg>',
-  bad: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
-  back: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 6l-6 6 6 6"/></svg>',
-};
-
-function levelFor(p, warn = 80, crit = 92) { return p == null ? "" : p >= crit ? "crit" : p >= warn ? "warn" : ""; }
-function osLabel(host) { return host?.os_version || host?.os || "unknown"; }
-
-// ------------------------------------------------------------------ state
-const state = {
-  config: null, hosts: new Map(), range: "1h", view: null, ws: null, live: false,
-  spark: new Map(),  // host name -> [[ts, cpu]]
-  detail: null,      // { name, charts: {}, ... }
-};
-const RANGE_ORDER = ["15m", "1h", "6h", "24h", "7d", "30d"];
-
-async function api(path, opts) {
-  const r = await fetch(path, opts);
-  if (!r.ok) {
-    let msg = r.statusText;
-    try { msg = (await r.json()).detail || msg; } catch (_) { /* ignore */ }
-    throw new Error(`${r.status} ${msg}`);
-  }
-  return r.json();
 }
-
-let toastTimer;
-function toast(msg, err = false) {
-  const t = $("#toast"); t.textContent = msg; t.className = "toast show" + (err ? " err" : "");
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => (t.className = "toast"), 4000);
+function currentSection() {
+  const hsh = location.hash;
+  if (hsh.startsWith("#/tasks")) return "tasks";
+  if (hsh.startsWith("#/agents")) return "agents";
+  if (hsh.startsWith("#/alerts")) return "alerts";
+  return "fleet";
 }
+document.addEventListener("avm-badges", renderNav);
 
-// ---------------------------------------------------------------- topbar
 function renderTopbar() {
   const seg = $("#range-seg"); seg.innerHTML = "";
-  for (const r of RANGE_ORDER) {
-    seg.append(h("button", { "aria-pressed": String(r === state.range), onclick: () => setRange(r) }, r));
-  }
+  for (const r of RANGE_ORDER) seg.append(h("button", { "aria-pressed": String(r === state.range), onclick: () => setRange(r) }, r));
+  const sec = currentSection();
+  seg.style.display = sec === "fleet" ? "" : "none";
+  $("#fleet-stats").style.display = sec === "fleet" ? "" : "none";
   $("#theme-btn").onclick = () => {
     const cur = document.documentElement.dataset.theme === "light" ? "dark" : "light";
     document.documentElement.dataset.theme = cur;
     try { localStorage.setItem("avm-theme", cur); } catch (_) { /* ignore */ }
     redrawAll();
   };
+  $("#menu-btn").innerHTML = ICON.menu;
+  $("#menu-btn").onclick = () => $("#sidebar").classList.toggle("open");
   if (state.config) {
     const u = state.config.user;
     $("#user").textContent = u.method === "access" ? u.subject : "tailnet · direct";
+    $("#version").textContent = `hub ${state.config.version} · agent ${state.config.agent_version || "?"}`;
   }
 }
 
@@ -118,17 +71,17 @@ function renderFleetStats() {
   const memTot = online.reduce((a, x) => a + (x.summary?.memory?.total || 0), 0);
   const gpus = online.flatMap((x) => x.summary?.gpus || []);
   const gpuUtil = gpus.map((g) => g.util_percent).filter((v) => v != null);
-  const failing = hosts.reduce((a, x) => a + (x.summary?.checks_failing || 0), 0) + hosts.filter((x) => x.status === "offline").length;
-  const stat = (b, s) => h("div", { class: "stat" }, h("b", { class: "num" }, b), h("span", {}, s));
+  const alerts = computeAlerts().length;
+  const stat = (b, s, go) => h("div", { class: "stat", onclick: go ? () => navigate(go) : null, style: go ? "cursor:pointer" : "" }, h("b", { class: "num" }, b), h("span", {}, s));
   const el = $("#fleet-stats"); el.innerHTML = "";
   el.append(
     stat(`${online.length} / ${hosts.length}`, "online"),
     stat(fmt.pct(avgCpu), "avg cpu"),
     stat(memTot ? `${fmt.bytes(memUsed, 0)} / ${fmt.bytes(memTot, 0)}` : "—", "memory"),
     stat(gpuUtil.length ? fmt.pct(gpuUtil.reduce((a, b) => a + b, 0) / gpuUtil.length) : "—", `${gpus.length} gpu${gpus.length === 1 ? "" : "s"}`),
-    stat(String(failing), failing ? "alerts" : "alerts"),
+    stat(String(alerts), "alerts", "#/alerts"),
   );
-  el.lastChild.querySelector("b").style.color = failing ? cssVar("--s-crit") : "";
+  el.lastChild.querySelector("b").style.color = alerts ? cssVar("--s-crit") : "";
 }
 
 // ------------------------------------------------------------------ fleet
@@ -144,7 +97,7 @@ function meter(label, cls, value, sub, pct, na = false) {
 
 function hostCard(host) {
   const s = host.summary || {};
-  const card = h("div", { class: `card host-card ${host.status}`, "data-host": host.name, onclick: () => (location.hash = "#/host/" + encodeURIComponent(host.name)) });
+  const card = h("div", { class: `card host-card ${host.status}`, "data-host": host.name, "data-id": host.name, onclick: (e) => { if (!e.target.closest(".drag-handle")) navigate("#/host/" + encodeURIComponent(host.name)); } });
   const gpu = s.gpus?.[0];
   card.append(
     h("div", { class: "host-head" },
@@ -153,12 +106,13 @@ function hostCard(host) {
         h("div", { class: "host-name" }, host.display_name),
         h("div", { class: "host-sub" }, h("span", { "data-f": "os" }, osLabel(s.host)), h("span", { "data-f": "arch" }, s.host?.arch || ""))),
       h("div", { class: "right" }, h("div", { "data-f": "seen" }, ""), h("div", { "data-f": "uptime" }, "")),
+      h("span", { class: "drag-handle", title: "drag to reorder", html: ICON.grip }),
     ),
     h("div", { class: "meters" },
       meter("CPU", "cpu", "", "", null),
       meter("Memory", "mem", "", "", null),
       meter("Disk", "disk", "", "", null),
-      meter(gpu ? "GPU" : "GPU", "gpu", "", "", null, !gpu),
+      meter("GPU", "gpu", "", "", null, !gpu),
     ),
     h("canvas", { class: "spark", "data-f": "spark" }),
     h("div", { class: "host-foot", "data-f": "foot" }),
@@ -187,15 +141,14 @@ function updateCard(card, host) {
   $('[data-f="seen"]', card).style.color = host.status === "offline" ? cssVar("--s-crit") : "";
   $('[data-f="uptime"]', card).textContent = s.host?.uptime_sec != null ? "up " + fmt.dur(s.host.uptime_sec) : "";
 
-  const m = $$m(card);
+  const m = { cpu: $('[data-m="cpu"]', card), mem: $('[data-m="mem"]', card), disk: $('[data-m="disk"]', card), gpu: $('[data-m="gpu"]', card) };
   setMeter(m.cpu, fmt.pct(s.cpu?.percent), s.cpu?.load ? "load " + s.cpu.load[0].toFixed(2) : (s.cpu?.cores ? s.cpu.cores + " cores" : ""), s.cpu?.percent);
   setMeter(m.mem, fmt.pct(s.memory?.percent), s.memory?.total ? `${fmt.bytes(s.memory.used, 1)} of ${fmt.bytes(s.memory.total, 0)}` : "", s.memory?.percent);
   const dpct = s.disk?.percent ?? s.disk?.max_percent;
   setMeter(m.disk, fmt.pct(dpct), s.disk?.total ? `${fmt.bytes(s.disk.total - s.disk.used, 0)} free` : "", dpct, dpct == null);
   const g = s.gpus?.[0];
   if (g) {
-    const extra = g.mem_percent != null ? `vram ${fmt.pct(g.mem_percent)}` : "";
-    setMeter(m.gpu, fmt.pct(g.util_percent), extra, g.util_percent);
+    setMeter(m.gpu, fmt.pct(g.util_percent), g.mem_percent != null ? `vram ${fmt.pct(g.mem_percent)}` : "", g.util_percent);
     $(".lbl span", m.gpu).textContent = s.gpus.length > 1 ? `GPU ×${s.gpus.length}` : "GPU";
   } else setMeter(m.gpu, "—", "no gpu", null, true);
 
@@ -208,20 +161,19 @@ function updateCard(card, host) {
   if (g?.temp_c != null) foot.append(kv(ICON.bolt, `${fmt.temp(g.temp_c)}${g.power_w != null ? " · " + fmt.watts(g.power_w) : ""}`, "gpu temperature · power"));
   if (s.battery?.percent != null) foot.append(kv(ICON.bolt, `${Math.round(s.battery.percent)}%${s.battery.plugged ? " ⚡" : ""}`, "battery"));
   if (s.top_process?.name && (s.top_process.cpu_percent || 0) >= 1) foot.append(kv(ICON.cpu, `${s.top_process.name} ${fmt.pct(s.top_process.cpu_percent)}`, "busiest process"));
+  const running = [...state.tasks.values()].filter((x) => x.host === host.name && x.status === "running");
+  if (running.length) foot.append(kv(ICON.tasks.replace("<svg", '<svg width="13" height="13"'), running.length === 1 ? running[0].name : `${running.length} tasks running`, "running tasks"));
+  if (host.claude?.running_job) foot.append(kv(ICON.agents.replace("<svg", '<svg width="13" height="13"'), host.claude.running_job.title, "claude is working on this"));
 
   const checks = $('[data-f="checks"]', card); checks.innerHTML = "";
   for (const c of s.checks || []) {
-    if (c.kind === "content" && c.ok) {
-      checks.append(h("span", { class: "chip", title: `${c.name} · updated ${fmt.ago(c.value)}` }, h("b", {}, c.name + ": "), c.detail));
-      continue;
-    }
+    if (c.kind === "content" && c.ok) { checks.append(h("span", { class: "chip", title: `${c.name} · updated ${fmt.ago(c.value)}` }, h("b", {}, c.name + ": "), c.detail)); continue; }
     if (c.kind === "job") {
-      // active job scopes are informational: show what's running, stay quiet otherwise
       if ((c.value || 0) > 0) checks.append(h("span", { class: "chip", title: c.detail || "" }, h("b", {}, "job: "), c.detail.replace(/^active: /, "")));
       else if (!c.ok) checks.append(h("span", { class: "chip bad", title: c.detail || "", html: ICON.bad.replace("<svg", '<svg width="11" height="11"') + esc(c.name) }));
       continue;
     }
-    if (c.kind === "rule" && c.ok) continue;  // hub rules only surface when they fire
+    if (c.kind === "rule" && c.ok) continue;
     let label = c.name;
     if (c.kind === "queue") label = c.ok ? `${c.name}: ${c.value} pending` : `${c.name}: empty`;
     else if (c.kind === "marker" && !c.ok) label = `${c.value} ${c.name}`;
@@ -230,6 +182,8 @@ function updateCard(card, host) {
     const cls = c.ok ? (c.kind === "unit" && !(c.value > 0) ? "" : "ok") : (c.level === "warning" ? "warn" : "bad");
     checks.append(h("span", { class: "chip " + cls, title: c.detail || "", html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(label) }));
   }
+  const failed = [...state.tasks.values()].filter((x) => x.host === host.name && (x.status === "failed" || x.status === "stalled"));
+  for (const x of failed.slice(0, 3)) checks.append(h("span", { class: "chip " + (x.status === "failed" ? "bad" : "warn"), title: x.note || "", onclick: (e) => { e.stopPropagation(); navigate("#/tasks"); } }, `task ${x.status}: ${x.name}`));
   if (host.agent_update_error) checks.append(h("span", { class: "chip bad", title: host.agent_update_error }, "agent update failed"));
   else if (host.agent_outdated && host.status === "online") checks.append(h("span", { class: "chip warn", title: `running agent ${host.agent_version || "?"}; the hub serves a newer script and the agent updates itself on its next report` }, "agent updating"));
   if (s.memory?.committed != null && s.memory?.commit_limit) {
@@ -238,7 +192,6 @@ function updateCard(card, host) {
   }
   drawCardSpark(card, host.name);
 }
-const $$m = (card) => ({ cpu: $('[data-m="cpu"]', card), mem: $('[data-m="mem"]', card), disk: $('[data-m="disk"]', card), gpu: $('[data-m="gpu"]', card) });
 
 function drawCardSpark(card, name) {
   const c = $('[data-f="spark"]', card);
@@ -252,7 +205,7 @@ async function loadSpark(name) {
   try {
     const range = state.range;
     const d = await api(`/api/v1/hosts/${encodeURIComponent(name)}/series?metrics=cpu&range=${range}&points=240`);
-    if (range !== state.range) return;  // range changed while loading
+    if (range !== state.range) return;
     state.spark.set(name, d.ts.map((t, i) => [t, d.cpu[i]]));
     const card = $(`.host-card[data-host="${CSS.escape(name)}"]`);
     if (card) drawCardSpark(card, name);
@@ -260,29 +213,36 @@ async function loadSpark(name) {
   finally { sparkLoading.delete(name); }
 }
 
+function orderedHosts() {
+  const order = state.prefs.fleetOrder || [];
+  const idx = (n) => { const i = order.indexOf(n); return i < 0 ? 1e9 : i; };
+  return [...state.hosts.values()].sort((a, b) => idx(a.name) - idx(b.name) || (a.status === "online" ? 0 : 1) - (b.status === "online" ? 0 : 1) || a.display_name.localeCompare(b.display_name));
+}
+
 function renderFleet() {
   const app = $("#app"); app.innerHTML = "";
   const grid = h("div", { class: "fleet" });
-  const hosts = [...state.hosts.values()].sort((a, b) => (a.status === "online" ? 0 : 1) - (b.status === "online" ? 0 : 1) || a.display_name.localeCompare(b.display_name));
-  if (!hosts.length) {
-    grid.append(h("div", { class: "empty" }, h("div", { html: "No hosts enrolled yet.<br>On AVALON run <code>manage.py add-host &lt;name&gt;</code>, then start the agent on that machine with the printed token." })));
-  }
+  const hosts = orderedHosts();
+  if (!hosts.length) grid.append(h("div", { class: "empty" }, h("div", { html: "No hosts enrolled yet.<br>On AVALON run <code>avalon-monitor-manage add-host &lt;name&gt;</code>, then install the agent on that machine with the printed token." })));
   for (const host of hosts) grid.append(hostCard(host));
   app.append(grid);
+  makeSortable(grid, { item: ".host-card", handle: ".drag-handle", onReorder: (ids) => { state.prefs.fleetOrder = ids; savePrefs(); } });
   state.view = "fleet";
+  loadTasks().then(() => { for (const host of hosts) { const c = $(`.host-card[data-host="${CSS.escape(host.name)}"]`); if (c) updateCard(c, host); } }).catch(() => {});
   for (const host of hosts) if (!state.spark.has(host.name)) loadSpark(host.name); else drawCardSpark($(`.host-card[data-host="${CSS.escape(host.name)}"]`), host.name);
 }
 
 // ----------------------------------------------------------------- detail
 const CHARTS = [
-  { id: "cpu", title: "CPU", yMax: 100, format: (v) => Math.round(v) + "%", series: [{ key: "cpu", label: "CPU", color: "--m-cpu" }, { key: "load1", label: "load (1m)", color: "--c-orange", hidden: true }] },
+  { id: "cpu", title: "CPU", yMax: 100, format: (v) => Math.round(v) + "%", series: [{ key: "cpu", label: "CPU", color: "--m-cpu" }] },
   { id: "mem", title: "Memory", yMax: 100, format: (v) => Math.round(v) + "%", series: [{ key: "mem", label: "RAM", color: "--m-mem" }, { key: "swap", label: "swap", color: "--c-orange" }] },
   { id: "gpu", title: "GPU", yMax: 100, format: (v) => Math.round(v) + "%", series: [{ key: "gpu_util", label: "utilisation", color: "--m-gpu" }, { key: "gpu_mem", label: "VRAM", color: "--c-orange" }], needs: "gpu" },
   { id: "net", title: "Network", yMax: null, bytes: true, format: (v) => fmt.bps(v), series: [{ key: "net_rx", label: "receive", color: "--c-blue" }, { key: "net_tx", label: "transmit", color: "--c-orange" }] },
   { id: "disk", title: "Disk I/O", yMax: null, bytes: true, format: (v) => fmt.bps(v), series: [{ key: "disk_read", label: "read", color: "--c-blue" }, { key: "disk_write", label: "write", color: "--c-orange" }] },
   { id: "temp", title: "Temperature", yMax: null, format: (v) => Math.round(v) + "°C", series: [{ key: "cpu_temp", label: "CPU", color: "--c-blue" }, { key: "gpu_temp", label: "GPU", color: "--c-orange" }, { key: "temp_max", label: "hottest sensor", color: "--c-aqua" }] },
 ];
-const RANGE_SEC = { "15m": 900, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "30d": 2592000 };
+const PANELS = [...CHARTS.map((c) => ({ id: c.id, title: c.title })), { id: "cores", title: "Per-core load" }, { id: "storage", title: "Storage" }, { id: "gpus", title: "GPUs" }, { id: "procs", title: "Top processes" },
+  { id: "checks", title: "Checks" }, { id: "net-if", title: "Network interfaces" }, { id: "sensors", title: "Sensors" }, { id: "hostinfo", title: "Host" }, { id: "editor", title: "Checks editor" }];
 
 async function renderDetail(name) {
   const app = $("#app"); app.innerHTML = "";
@@ -293,33 +253,73 @@ async function renderDetail(name) {
   state.hosts.set(host.name, host);
   const s = host.sample || {};
   const hasGpu = (s.gpus || []).length > 0;
+  const layout = hostLayout(host.name);
+  const hidden = new Set(layout.hidden || []);
 
+  const customizeBtn = h("button", { class: "btn" + (state.customizing ? " active" : ""), onclick: () => { state.customizing = !state.customizing; app.classList.toggle("customizing", state.customizing); customizeBtn.classList.toggle("active", state.customizing); renderHiddenBar(); } }, "Customize");
   const head = h("div", { class: "detail-head" },
-    h("button", { class: "back", onclick: () => (location.hash = "#/") , html: ICON.back + " Fleet" }),
+    h("button", { class: "back", onclick: () => navigate("#/"), html: ICON.back + " Fleet" }),
     h("div", { class: "detail-title" }, h("span", { class: "status-dot " + host.status, "data-f": "dot" }), host.display_name),
     h("div", { class: "detail-meta", "data-f": "meta" }),
-    h("div", { class: "spacer" }),
-    h("button", { class: "btn", title: "Ask the agent to re-exec itself on its next push (picks up a new script/config)", onclick: () => sendCommand(host.name, "respawn") }, "Respawn agent"),
+    h("div", { class: "actions" },
+      h("button", { class: "btn", onclick: () => navigate("#/agents/" + encodeURIComponent(host.name)) }, "Prompt Claude"),
+      customizeBtn,
+      h("button", { class: "btn", title: "Ask the agent to re-exec itself on its next push (picks up a new script/config)", onclick: () => sendCommand(host.name, "respawn") }, "Respawn agent")),
   );
+  const hiddenBar = h("div", { class: "hidden-panels" });
   const kpis = h("div", { class: "kpis", "data-f": "kpis" });
-  const charts = h("div", { class: "charts" });
+  const charts = h("div", { class: "charts", "data-f": "charts" });
   const chartObjs = {};
+  const panelEls = {};
+  const panelCard = (id, title, body, cls = "card chart-card") => {
+    const el = h("div", { class: cls, "data-id": id }, h("h3", {}, h("span", { class: "drag-handle", html: ICON.grip }), title, h("span", { class: "spacer" }), h("button", { class: "hide-btn", title: "hide panel", onclick: () => hidePanel(id) }, "×")), body);
+    panelEls[id] = el;
+    return el;
+  };
   for (const c of CHARTS) {
     if (c.needs === "gpu" && !hasGpu) continue;
     const series = c.series.filter((x) => !x.hidden);
     const legend = series.length > 1 ? h("span", { class: "legend" }, ...series.map((x) => h("span", { html: `<i style="--c: var(${x.color})"></i>${esc(x.label)}` }))) : null;
     const box = h("div", { class: "chart" });
-    charts.append(h("div", { class: "card chart-card" }, h("h3", {}, c.title, legend), box));
+    const el = panelCard(c.id, c.title, box);
+    if (legend) el.querySelector(".spacer").replaceWith(legend, h("span", { class: "spacer", style: "flex:0" }));
+    charts.append(el);
     chartObjs[c.id] = { def: c, chart: new TimeChart(box, { yMax: c.yMax, bytes: !!c.bytes, format: c.format, window: RANGE_SEC[state.range] }) };
   }
-  // per-core panel
   const cores = h("div", { class: "cores", "data-f": "cores" });
-  const coresCard = h("div", { class: "card chart-card", style: "min-height: 0" }, h("h3", {}, "Per-core load"), cores);
+  charts.append(panelCard("cores", "Per-core load", cores, "card chart-card cores-card"));
 
   const tables = h("div", { class: "tables", "data-f": "tables" });
-  const editor = h("div", { class: "card table-card editor", "data-f": "editor" });
-  app.append(head, kpis, charts, coresCard, tables, editor);
-  state.detail = { name: host.name, charts: chartObjs, els: { head, kpis, cores, tables, editor } };
+  for (const id of ["storage", "gpus", "procs", "checks", "net-if", "sensors", "hostinfo"]) tables.append(panelCard(id, PANELS.find((p) => p.id === id).title, h("div", { "data-f": "body" }), "card table-card"));
+  const editor = panelCard("editor", "Checks editor", h("div", { "data-f": "body" }), "card table-card editor");
+  tables.append(editor);
+
+  app.append(head, hiddenBar, kpis, charts, tables);
+  app.classList.toggle("customizing", state.customizing);
+  state.detail = { name: host.name, charts: chartObjs, els: { head, kpis, cores, tables, charts, editor: editor.querySelector('[data-f="body"]'), hiddenBar }, panels: panelEls, hidden };
+
+  // apply saved order + hidden
+  const applyOrder = (container) => {
+    const order = layout.order || [];
+    const items = [...container.children];
+    items.sort((a, b) => { const ia = order.indexOf(a.dataset.id), ib = order.indexOf(b.dataset.id); return (ia < 0 ? 1e9 : ia) - (ib < 0 ? 1e9 : ib); });
+    for (const it of items) container.append(it);
+  };
+  applyOrder(charts); applyOrder(tables);
+  for (const [id, el] of Object.entries(panelEls)) el.classList.toggle("hidden", hidden.has(id));
+  const persist = () => setHostLayout(host.name, { order: [...charts.children, ...tables.children].map((x) => x.dataset.id), hidden: [...hidden] });
+  makeSortable(charts, { item: ".chart-card", handle: ".drag-handle", onReorder: persist });
+  makeSortable(tables, { item: ".table-card", handle: ".drag-handle", onReorder: persist });
+  function hidePanel(id) { hidden.add(id); panelEls[id].classList.add("hidden"); persist(); renderHiddenBar(); }
+  function renderHiddenBar() {
+    hiddenBar.innerHTML = "";
+    if (!state.customizing && !hidden.size) return;
+    if (hidden.size) hiddenBar.append(h("span", {}, "hidden:"), ...[...hidden].map((id) => h("span", { class: "chip", title: "click to show", onclick: () => { hidden.delete(id); panelEls[id]?.classList.remove("hidden"); persist(); renderHiddenBar(); } }, "+ " + (PANELS.find((p) => p.id === id)?.title || id))));
+    if (state.customizing) hiddenBar.append(h("span", { class: "spacer" }),
+      h("button", { class: "btn small", onclick: () => { setHostLayout("*", hostLayout(host.name)); toast("Layout applied to all hosts"); } }, "Use this layout for all hosts"),
+      h("button", { class: "btn small", onclick: () => { delete state.prefs.hostLayout[host.name]; savePrefs(); renderDetail(host.name); } }, "Reset"));
+  }
+  renderHiddenBar();
   updateDetail(host);
   renderEditor(host);
   await loadDetailSeries();
@@ -342,11 +342,10 @@ const CHECK_SINGLE = [
   { key: "AVM_PROCESSES", label: "Top processes reported", hint: "8" },
   { key: "AVM_TAGS", label: "Tags", hint: "comma-separated chips" },
 ];
-const hdrs = () => ({ "Content-Type": "application/json", "X-Requested-With": "avalon-monitor" });
 
 async function sendCommand(name, cmd) {
   try {
-    const r = await api(`/api/v1/hosts/${encodeURIComponent(name)}/command/${cmd}`, { method: "POST", headers: hdrs() });
+    const r = await post(`/api/v1/hosts/${encodeURIComponent(name)}/command/${cmd}`, {});
     toast(`${cmd} queued for ${name} - ${r.note}`);
   } catch (e) { toast(`Failed: ${e.message}`, true); }
 }
@@ -359,7 +358,7 @@ function renderEditor(host) {
   for (const k of CHECK_KINDS) for (const v of (cfg[k.key] || "").split(",").map((x) => x.trim()).filter(Boolean)) rows.push({ key: k.key, value: v });
   const agentRev = host.agent_rev, hubRev = host.check_rev || 0;
   const status = agentRev == null
-    ? (host.status === "online" ? "agent predates remote checks (1.1+) - copy the new avalon_agent.py over once; from 1.2 on, agents update themselves" : "")
+    ? (host.status === "online" ? "agent predates remote checks (1.1+) - it updates itself on its next report once the hub is upgraded" : "")
     : agentRev === hubRev ? `agent is running revision ${hubRev}` : `revision ${hubRev} saved - agent still on ${agentRev}, applies on its next push`;
   const list = h("div", { class: "editor-rows" });
   const rowEl = (r) => {
@@ -371,23 +370,20 @@ function renderEditor(host) {
     return row;
   };
   for (const r of rows) list.append(rowEl(r));
-  const singles = h("div", { class: "editor-singles" }, ...CHECK_SINGLE.map((k) => {
-    const inp = h("input", { type: "text", value: cfg[k.key] ?? "", placeholder: k.hint, "data-key": k.key, spellcheck: "false" });
-    return h("label", {}, h("span", {}, k.label), inp);
-  }));
+  const singles = h("div", { class: "editor-singles" }, ...CHECK_SINGLE.map((k) => h("label", {}, h("span", {}, k.label), h("input", { type: "text", value: cfg[k.key] ?? "", placeholder: k.hint, "data-key": k.key, spellcheck: "false" }))));
   const save = async () => {
     const out = {};
     for (const r of rows) if (r.value.trim()) out[r.key] = (out[r.key] ? out[r.key] + "," : "") + r.value.trim();
     for (const inp of singles.querySelectorAll("input")) if (inp.value.trim()) out[inp.dataset.key] = inp.value.trim();
     try {
-      const r = await api(`/api/v1/hosts/${encodeURIComponent(host.name)}/checks`, { method: "PUT", headers: hdrs(), body: JSON.stringify(out) });
+      const r = await post(`/api/v1/hosts/${encodeURIComponent(host.name)}/checks`, out, "PUT");
       toast(`Saved revision ${r.rev}; the agent applies it on its next push`);
       const full = await api(`/api/v1/hosts/${encodeURIComponent(host.name)}`); state.hosts.set(full.name, full); renderEditor(full);
     } catch (e) { toast(`Save failed: ${e.message}`, true); }
   };
   el.append(
-    h("h3", {}, "Checks", h("span", { class: "muted editor-status" }, status)),
-    h("p", { class: "muted editor-help" }, "Settings saved here are pushed to the agent with its next report and override the same keys in its agent.conf. One target per row; the agent runs the check every interval."),
+    h("div", { class: "muted editor-status", style: "margin-bottom:6px" }, status),
+    h("p", { class: "muted editor-help" }, "Settings saved here are pushed to the agent with its next report and override the same keys in its agent.conf. One target per row."),
     list,
     h("div", { class: "editor-actions" },
       h("button", { class: "btn", onclick: () => { const r = { key: "AVM_WATCH_PROCESSES", value: "" }; rows.push(r); list.append(rowEl(r)); list.lastChild.querySelector("input").focus(); } }, "+ Add check"),
@@ -405,10 +401,7 @@ async function loadDetailSeries() {
     const res = await api(`/api/v1/hosts/${encodeURIComponent(d.name)}/series?metrics=${keys.join(",")}&range=${state.range}&points=700`);
     if (state.detail !== d) return;
     for (const { def, chart } of Object.values(d.charts)) {
-      chart.setSeries(def.series.filter((x) => !x.hidden).map((x) => ({
-        key: x.key, label: x.label, color: cssVar(x.color),
-        data: res.ts.map((t, i) => [t, res[x.key][i]]),
-      })));
+      chart.setSeries(def.series.filter((x) => !x.hidden).map((x) => ({ key: x.key, label: x.label, color: cssVar(x.color), data: res.ts.map((t, i) => [t, res[x.key][i]]) })));
       chart.setWindow(RANGE_SEC[state.range]);
     }
   } catch (e) { toast("Failed to load history: " + e.message, true); }
@@ -432,7 +425,6 @@ function updateDetail(host) {
   }
   for (const t of hi.tags || []) meta.append(chip("#" + t));
 
-  // KPIs
   const k = d.els.kpis; k.innerHTML = "";
   const kpi = (lbl, val, sub) => h("div", { class: "card kpi" }, h("div", { class: "lbl" }, lbl), h("div", { class: "val num", html: val }), h("div", { class: "sub num" }, sub || ""));
   const cpu = s.cpu || {}, mem = s.memory || {}, net = s.network || {}, dio = s.disk_io || {};
@@ -445,37 +437,46 @@ function updateDetail(host) {
   const t = cpu.temp_c ?? sm.temp_max;
   if (t != null) k.append(kpi("CPU temp", fmt.temp(t), sm.temp_max != null ? "hottest " + fmt.temp(sm.temp_max) : ""));
   if (s.battery?.percent != null) k.append(kpi("Battery", Math.round(s.battery.percent) + "%", s.battery.plugged ? "plugged in" : (s.battery.secs_left ? fmt.dur(s.battery.secs_left) + " left" : "on battery")));
+  const running = [...state.tasks.values()].filter((x) => x.host === host.name && x.status === "running");
+  if (running.length) k.append(kpi("Tasks", String(running.length), running.map((x) => x.name).join(", ").slice(0, 60)));
+  if (host.claude?.running_job) k.append(kpi("Claude", "working", host.claude.running_job.title.slice(0, 60)));
 
-  // per-core
   const cores = d.els.cores; cores.innerHTML = "";
-  for (const [i, c] of (cpu.per_core || []).entries()) {
-    cores.append(h("div", { class: "core", title: `core ${i}: ${fmt.pct(c)}` }, h("i", { style: `height:${c}%; opacity:${0.35 + c / 150}` }), h("span", { class: "num" }, i)));
-  }
-  cores.parentElement.classList.toggle("hidden", !(cpu.per_core || []).length);
+  for (const [i, c] of (cpu.per_core || []).entries()) cores.append(h("div", { class: "core", title: `core ${i}: ${fmt.pct(c)}` }, h("i", { style: `height:${c}%; opacity:${0.35 + c / 150}` }), h("span", { class: "num" }, i)));
+  d.panels.cores.classList.toggle("hidden", d.hidden.has("cores") || !(cpu.per_core || []).length);
 
-  // tables
-  const tb = d.els.tables; tb.innerHTML = "";
-  const table = (title, head, rows) => h("div", { class: "card table-card" }, h("h3", {}, title), h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...head.map((x) => h("th", { class: x.startsWith("r:") ? "r" : "" }, x.replace(/^r:/, ""))))), h("tbody", {}, ...rows))));
+  const body = (id) => { const el = d.panels[id].querySelector('[data-f="body"]'); el.innerHTML = ""; return el; };
+  const show = (id, yes) => d.panels[id].classList.toggle("hidden", d.hidden.has(id) || !yes);
+  const table = (head, rows) => h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...head.map((x) => h("th", { class: x.startsWith("r:") ? "r" : "" }, x.replace(/^r:/, ""))))), h("tbody", {}, ...rows)));
   const bar = (p, c = "var(--m-disk)") => h("span", { class: "bar" }, h("i", { style: `width:${p ?? 0}%; background:${levelFor(p) === "crit" ? "var(--s-crit)" : levelFor(p) === "warn" ? "var(--s-warn)" : c}` }));
-  if ((s.disks || []).length) tb.append(table("Storage", ["Mount", "Type", "r:Used", "r:Free", "r:Size", "r:"], s.disks.map((x) => h("tr", {},
+  show("storage", (s.disks || []).length);
+  if ((s.disks || []).length) body("storage").append(table(["Mount", "Type", "r:Used", "r:Free", "r:Size", "r:"], s.disks.map((x) => h("tr", {},
     h("td", { title: x.device }, x.mountpoint), h("td", { class: "muted" }, x.fstype), h("td", { class: "r num" }, fmt.pct(x.percent, 1)), h("td", { class: "r num" }, fmt.bytes(x.free, 0)), h("td", { class: "r num" }, fmt.bytes(x.total, 0)), h("td", { class: "r" }, bar(x.percent))))));
-  if ((s.gpus || []).length) tb.append(table("GPUs", ["GPU", "r:Util", "r:VRAM", "r:Temp", "r:Power", "r:Fan", "r:Clock"], s.gpus.map((g) => h("tr", {},
+  show("gpus", (s.gpus || []).length);
+  if ((s.gpus || []).length) body("gpus").append(table(["GPU", "r:Util", "r:VRAM", "r:Temp", "r:Power", "r:Fan", "r:Clock"], s.gpus.map((g) => h("tr", {},
     h("td", { title: `${g.vendor} via ${g.source}${g.state ? " · " + g.state : ""}` }, `${g.name}${g.state === "suspended" ? " (sleeping)" : ""}`), h("td", { class: "r num" }, fmt.pct(g.util_percent)),
     h("td", { class: "r num" }, g.mem_used != null && g.mem_total ? `${fmt.bytes(g.mem_used, 1)} / ${fmt.bytes(g.mem_total, 0)}` : fmt.pct(g.mem_percent)),
     h("td", { class: "r num" }, fmt.temp(g.temp_c)), h("td", { class: "r num" }, g.power_w != null ? `${Math.round(g.power_w)}${g.power_limit_w ? " / " + Math.round(g.power_limit_w) : ""} W` : "—"),
     h("td", { class: "r num" }, fmt.pct(g.fan_percent)), h("td", { class: "r num" }, g.clock_mhz != null ? Math.round(g.clock_mhz) + " MHz" : "—")))));
-  if ((s.processes || []).length) tb.append(table("Top processes", ["PID", "Name", "User", "r:CPU", "r:Memory"], s.processes.map((p) => h("tr", {},
+  show("procs", (s.processes || []).length);
+  if ((s.processes || []).length) body("procs").append(table(["PID", "Name", "User", "r:CPU", "r:Memory"], s.processes.map((p) => h("tr", {},
     h("td", { class: "num muted" }, p.pid), h("td", {}, p.name), h("td", { class: "muted" }, p.user || ""), h("td", { class: "r num" }, fmt.pct(p.cpu_percent, 1)), h("td", { class: "r num" }, `${fmt.bytes(p.mem_rss, 0)} · ${fmt.pct(p.mem_percent, 1)}`)))));
-  if ((s.checks || []).length) tb.append(table("Checks", ["Check", "Kind", "State", "Detail"], s.checks.map((c) => h("tr", {},
+  show("checks", (s.checks || []).length);
+  if ((s.checks || []).length) body("checks").append(table(["Check", "Kind", "State", "Detail"], s.checks.map((c) => h("tr", {},
     h("td", {}, c.name), h("td", { class: "muted" }, c.kind), h("td", {}, h("span", { class: "chip " + (c.ok ? (c.level === "info" ? "" : "ok") : c.level === "warning" ? "warn" : "bad"), html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + (c.ok ? (c.level === "info" ? "info" : "ok") : c.level === "warning" ? "warning" : "failing") })), h("td", { class: "muted" }, c.detail || "")))));
-  if ((s.network?.interfaces || []).length) tb.append(table("Network interfaces", ["Interface", "r:Receive", "r:Transmit", "r:Link"], s.network.interfaces.map((i) => h("tr", {},
+  show("net-if", (s.network?.interfaces || []).length);
+  if ((s.network?.interfaces || []).length) body("net-if").append(table(["Interface", "r:Receive", "r:Transmit", "r:Link"], s.network.interfaces.map((i) => h("tr", {},
     h("td", {}, i.name), h("td", { class: "r num" }, fmt.bps(i.rx_bps)), h("td", { class: "r num" }, fmt.bps(i.tx_bps)), h("td", { class: "r num muted" }, i.speed_mbps ? i.speed_mbps + " Mb/s" : (i.up ? "up" : "down"))))));
-  if ((s.temps || []).length) tb.append(table("Sensors", ["Sensor", "r:Temp", "r:High", "r:Critical"], s.temps.map((x) => h("tr", {},
+  show("sensors", (s.temps || []).length);
+  if ((s.temps || []).length) body("sensors").append(table(["Sensor", "r:Temp", "r:High", "r:Critical"], s.temps.map((x) => h("tr", {},
     h("td", {}, x.label), h("td", { class: "r num" }, fmt.temp(x.current)), h("td", { class: "r num muted" }, fmt.temp(x.high)), h("td", { class: "r num muted" }, fmt.temp(x.critical))))));
-  tb.append(h("div", { class: "card table-card" }, h("h3", {}, "Host"), h("dl", { class: "kvlist" },
+  show("hostinfo", true);
+  body("hostinfo").append(h("dl", { class: "kvlist" },
     ...[["Hostname", hi.hostname], ["OS", osLabel(hi)], ["Kernel", hi.kernel], ["Platform", hi.platform], ["CPU", hi.cpu_model], ["Cores", hi.cpu_count != null ? `${hi.cpu_count} logical · ${hi.cpu_count_physical ?? "?"} physical` : null],
-      ["Booted", hi.boot_time ? new Date(hi.boot_time * 1000).toLocaleString() : null], ["Agent", hi.agent_version ? "v" + hi.agent_version : null], ["Agent update", host.agent_update_error ? "FAILED: " + host.agent_update_error : null], ["Agent IP", host.last_ip], ["Interval", s.interval ? s.interval + " s" : null], ["Notes", host.notes]]
-      .filter(([, v]) => v).flatMap(([k2, v]) => [h("dt", {}, k2), h("dd", {}, v)]))));
+      ["Booted", hi.boot_time ? new Date(hi.boot_time * 1000).toLocaleString() : null], ["Agent", hi.agent_version ? "v" + hi.agent_version : null], ["Agent update", host.agent_update_error ? "FAILED: " + host.agent_update_error : null], ["Agent IP", host.last_ip], ["Interval", s.interval ? s.interval + " s" : null],
+      ["Claude", s.claude ? (s.claude.available ? `${s.claude.version || "?"} as ${s.claude.user}` : "cli not found") : null], ["Notes", host.notes]]
+      .filter(([, v]) => v).flatMap(([k2, v]) => [h("dt", {}, k2), h("dd", {}, v)])));
+  show("editor", true);
 }
 
 function appendLive(host) {
@@ -487,10 +488,7 @@ function appendLive(host) {
     net_rx: sm.network?.rx_bps, net_tx: sm.network?.tx_bps, disk_read: sm.disk_io?.read_bps, disk_write: sm.disk_io?.write_bps,
     cpu_temp: sm.cpu?.temp_c, gpu_temp: g ? Math.max(...sm.gpus.map((x) => x.temp_c ?? -1)) : null, temp_max: sm.temp_max };
   if (vals.gpu_temp === -1) vals.gpu_temp = null;
-  for (const { chart } of Object.values(d.charts)) {
-    for (const s of chart.series) chart.append(s.key, sm.ts, vals[s.key] ?? null);
-    chart.draw();
-  }
+  for (const { chart } of Object.values(d.charts)) { for (const s of chart.series) chart.append(s.key, sm.ts, vals[s.key] ?? null); chart.draw(); }
 }
 const avg = (a) => { const v = a.filter((x) => x != null); return v.length ? v.reduce((p, c) => p + c, 0) / v.length : null; };
 
@@ -503,7 +501,7 @@ function onHostUpdate(host) {
     if (!arr.length || arr[arr.length - 1][0] < host.summary.ts) { arr.push([host.summary.ts, host.summary.cpu.percent]); while (arr.length && arr[0][0] < host.summary.ts - RANGE_SEC[state.range]) arr.shift(); }
     state.spark.set(host.name, arr);
   }
-  renderFleetStats();
+  renderFleetStats(); renderNav();
   if (state.view === "fleet") {
     const card = $(`.host-card[data-host="${CSS.escape(host.name)}"]`);
     if (card) updateCard(card, host); else renderFleet();
@@ -516,7 +514,10 @@ function onHostUpdate(host) {
       appendLive(host);
     } else updateDetail({ ...(state.hosts.get(host.name)), status: host.status, age_sec: host.age_sec });
   }
+  emit("host", host);
 }
+on("task", (t) => { if (state.view === "fleet") { const card = $(`.host-card[data-host="${CSS.escape(t.host)}"]`); const host = state.hosts.get(t.host); if (card && host) updateCard(card, host); } renderNav(); renderFleetStats(); });
+on("claude_job", () => { renderNav(); });
 
 let wsRetry = 1000;
 function connectWs() {
@@ -527,8 +528,12 @@ function connectWs() {
   ws.onopen = () => { state.live = true; $("#conn").className = "conn live"; wsRetry = 1000; ping = setInterval(() => ws.readyState === 1 && ws.send("ping"), 25000); };
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
-    if (msg.type === "snapshot") { for (const hst of msg.hosts) state.hosts.set(hst.name, hst); renderFleetStats(); if (state.view === "fleet") renderFleet(); }
+    if (msg.type === "snapshot") { for (const hst of msg.hosts) state.hosts.set(hst.name, hst); renderFleetStats(); renderNav(); if (state.view === "fleet") renderFleet(); }
     else if (msg.type === "host") onHostUpdate(msg.host);
+    else if (msg.type === "task") emit("task", msg.task);
+    else if (msg.type === "task_deleted") emit("task_deleted", msg);
+    else if (msg.type === "claude_job") emit("claude_job", msg.job);
+    else if (msg.type === "claude_event") emit("claude_event", msg);
   };
   ws.onclose = (ev) => {
     state.live = false; $("#conn").className = "conn"; clearInterval(ping);
@@ -538,7 +543,6 @@ function connectWs() {
   ws.onerror = () => ws.close();
 }
 
-// age refresh for "seen Xs ago" labels while offline
 setInterval(() => {
   const now = Date.now() / 1000;
   for (const hst of state.hosts.values()) if (hst.last_seen) hst.age_sec = now - hst.last_seen;
@@ -560,9 +564,15 @@ function redrawAll() {
 }
 
 function route() {
-  const m = location.hash.match(/^#\/host\/(.+)$/);
+  const hsh = location.hash || "#/";
   if (state.detail) { for (const { chart } of Object.values(state.detail.charts)) chart.destroy(); state.detail = null; }
-  if (m) renderDetail(decodeURIComponent(m[1]));
+  state.tasksView = null; state.agentsView = null; state.alertsView = null;
+  renderNav(); renderTopbar();
+  let m;
+  if ((m = hsh.match(/^#\/host\/(.+)$/))) renderDetail(decodeURIComponent(m[1]));
+  else if (hsh.startsWith("#/tasks")) { const q = new URLSearchParams(hsh.split("?")[1] || ""); renderTasks({ host: q.get("host"), status: q.get("status") }); }
+  else if ((m = hsh.match(/^#\/agents(?:\/([^?]+))?(?:\?(.*))?$/))) { const q = new URLSearchParams(m[2] || ""); renderAgents({ host: m[1] ? decodeURIComponent(m[1]) : null, job: q.get("job") }); }
+  else if (hsh.startsWith("#/alerts")) renderAlerts();
   else renderFleet();
 }
 
@@ -577,6 +587,8 @@ async function init() {
     $("#app").innerHTML = `<div class="empty">Cannot reach the hub API: ${esc(e.message)}</div>`;
     return;
   }
+  await loadPrefs();
+  Promise.all([loadTasks(), loadJobs()]).then(() => { renderNav(); renderFleetStats(); }).catch(() => {});
   renderTopbar();
   renderFleetStats();
   window.addEventListener("hashchange", route);
