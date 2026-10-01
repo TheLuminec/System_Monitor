@@ -86,6 +86,10 @@ class Settings:
     agent_script: str = ""
     agent_auto_update: bool = True
 
+    # Extra Content-Security-Policy script sources. Cloudflare's Web Analytics (RUM) injects a
+    # beacon + inline snippet into HTML it proxies; allow it here or disable RUM for the hostname.
+    csp_script_extra: str = "https://static.cloudflareinsights.com"
+
     # Public URL (informational; used in /api/v1/config for the UI)
     public_url: str = ""
 
@@ -116,6 +120,7 @@ def load_settings() -> Settings:
     s.gpu_stall_percent = float(env.get("AVM_RULE_GPU_STALL_PERCENT", s.gpu_stall_percent))
     s.agent_script = env.get("AVM_AGENT_SCRIPT", "")
     s.agent_auto_update = _bool(env.get("AVM_AGENT_AUTO_UPDATE"), True)
+    s.csp_script_extra = env.get("AVM_CSP_SCRIPT_EXTRA", s.csp_script_extra).strip()
     s.public_url = env.get("AVM_PUBLIC_URL", "")
     return s
 

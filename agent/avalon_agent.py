@@ -71,7 +71,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "1.3.1"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -901,8 +901,8 @@ class ClaudeRunner:
 
     def __init__(self, cfg: Dict[str, str]):
         self.cfg = cfg
-        self.bin = cfg["AVM_CLAUDE_BIN"] or shutil.which("claude") or (shutil.which("claude.cmd") if IS_WINDOWS else None)
         self.home = cfg["AVM_CLAUDE_HOME"] or os.path.expanduser("~")
+        self.bin = cfg["AVM_CLAUDE_BIN"] or self._find_claude()
         self.version: Optional[str] = None
         self.lock = threading.Lock()
         self.current: Optional[Dict[str, Any]] = None   # {"id", "proc", "started", "title"}
@@ -910,6 +910,24 @@ class ClaudeRunner:
         self.seen: set = set()
         self.cancel_ids: set = set()
         self._version_checked = 0.0
+
+    def _find_claude(self) -> Optional[str]:
+        """PATH first; then the usual install locations (service units often run with a minimal PATH)."""
+        for name in (("claude.cmd", "claude.exe", "claude") if IS_WINDOWS else ("claude",)):
+            p = shutil.which(name)
+            if p:
+                return p
+        home = self.home
+        candidates = [os.path.join(home, ".local", "bin", "claude"), os.path.join(home, ".claude", "local", "claude"),
+                      os.path.join(home, ".npm-global", "bin", "claude"), "/usr/local/bin/claude", "/opt/homebrew/bin/claude",
+                      os.path.join(home, ".volta", "bin", "claude"), os.path.join(home, ".nvm", "current", "bin", "claude")]
+        if IS_WINDOWS:
+            candidates = [os.path.join(home, ".local", "bin", "claude.exe"), os.path.join(os.environ.get("APPDATA", ""), "npm", "claude.cmd"),
+                          os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "claude", "claude.exe")] + candidates
+        for c in candidates:
+            if c and os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+        return None
 
     # ---- discovery
     def check_version(self) -> Optional[str]:
@@ -1121,6 +1139,9 @@ class ClaudeRunner:
                  % socket.gethostname()]
         env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}  # never inherit a parent Claude session
         env["AVM_CLAUDE_JOB"] = str(jid)
+        if not IS_WINDOWS:  # service units start with a minimal PATH; give the session the user's usual tool dirs
+            extra = [os.path.join(self.home, ".local", "bin"), "/usr/local/bin", os.path.dirname(self.bin)]
+            env["PATH"] = os.pathsep.join([d for d in extra if d and os.path.isdir(d)] + [env.get("PATH", "/usr/bin:/bin")])
         try:
             proc = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
@@ -1412,6 +1433,7 @@ def self_update(cfg: Dict[str, str], info: Dict[str, Any]) -> bool:
             pass
         return _update_failed("cannot replace %s: %s (running as %s)" % (_SELF_PATH, e, _whoami()))
     _UPDATE_STATE["error"] = None
+    _SELF_SHA["value"] = got
     _refresh_companion(cfg, "avm.py")
     log.info("self-update: installed agent %s (%s), respawning", info.get("version", "?"), got[:12])
     return True
@@ -1453,7 +1475,12 @@ def _whoami() -> str:
 def respawn() -> None:
     """Replace this process with a fresh copy of itself (new script/config, same supervisor)."""
     log.info("respawning on hub request")
-    sys.stdout.flush(); sys.stderr.flush()
+    for stream in (sys.stdout, sys.stderr):  # None under pythonw.exe (Windows scheduled task)
+        try:
+            if stream:
+                stream.flush()
+        except Exception:
+            pass
     args = [sys.executable] + sys.argv
     if IS_WINDOWS:
         # execv on Windows starts a new process and exits this one; quote to survive spaces in paths.
@@ -1554,7 +1581,7 @@ def main(argv=None) -> int:
                     if self_update(cfg, reply["agent"]):
                         respawn()
                 except Exception as e:  # never let an update problem stop reporting
-                    _update_failed("unexpected error: %r" % e)
+                    _update_failed("installed, but respawn failed: %r - restart the agent service/task to load it" % e)
         except urllib.error.HTTPError as e:
             failures += 1
             if failures in (1, 10) or failures % 100 == 0:

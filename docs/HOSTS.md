@@ -83,6 +83,21 @@ sudo nano /etc/avalon-agent/agent.conf
 sudo systemctl restart avalon-agent
 ```
 
+### Windows agents and self-update (1.2.x → 1.3+)
+
+Agents older than 1.3.1 running under `pythonw.exe` (the scheduled task) write
+the new script to disk but fail to re-exec it (`'NoneType' object has no
+attribute 'flush'` shows on the host card). The on-disk copy *is* already
+current, so one restart loads it — either the next reboot (the task starts at
+boot) or, in an elevated PowerShell:
+
+```powershell
+Restart-ScheduledTask AvalonMonitorAgent   # or: Stop-ScheduledTask ...; Start-ScheduledTask ...
+```
+
+Do this after the hub serves 1.3.1 or later, so the restarted agent is one
+that can respawn on its own from then on.
+
 ## DESKTOP-C (Windows 11, RTX 5060 Ti) — `C:\ProgramData\AvalonAgent\agent.conf`
 
 ```ini

@@ -99,6 +99,24 @@ plus the presence of Cloudflare's own headers.
   `avalon-monitor-manage rotate-token <name>`; disable a lost laptop with
   `avalon-monitor-manage disable <name>`.
 
+## Cloudflare Web Analytics and the Content-Security-Policy
+
+If Web Analytics (RUM) is on for the zone, Cloudflare injects
+`static.cloudflareinsights.com/beacon.min.js` plus a small inline snippet into
+every HTML page it proxies. The hub ships a strict CSP (`script-src 'self'`),
+so the browser console shows two blocked-script errors — harmless (only the
+beacon is blocked; the dashboard works), but noisy. Pick one:
+
+* **Disable analytics for this hostname** (recommended — there is nothing to
+  measure on a private dashboard): Cloudflare dashboard → **Web Analytics** →
+  the site → *Manage site* → disable automatic setup, or a **Configuration Rule**
+  for `monitor.avalontech.xyz` with *Disable Real User Monitoring*. Then set
+  `AVM_CSP_SCRIPT_EXTRA=` (empty) in `monitor.env` to keep the CSP strict.
+* **Keep analytics**: the default `AVM_CSP_SCRIPT_EXTRA=https://static.cloudflareinsights.com`
+  lets the beacon load. The inline snippet still trips the CSP once per page
+  load; silence it by appending its hash from the console message, e.g.
+  `AVM_CSP_SCRIPT_EXTRA=https://static.cloudflareinsights.com 'sha256-…'`.
+
 ## Troubleshooting
 
 * **`invalid Cloudflare Access token`** in the journal: the AUD tag doesn't

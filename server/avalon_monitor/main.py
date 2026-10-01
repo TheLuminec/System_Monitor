@@ -194,7 +194,8 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
-        "script-src 'self'; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'none'",
+        f"script-src 'self' {settings.csp_script_extra}; connect-src 'self' ws: wss: {settings.csp_script_extra}; "
+        "frame-ancestors 'none'; base-uri 'none'",
     )
     if request.url.path == "/" or request.url.path.endswith(".html"):
         response.headers["Cache-Control"] = "no-store"
