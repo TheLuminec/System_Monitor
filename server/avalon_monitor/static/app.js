@@ -1,8 +1,8 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.3.0";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.4.0";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
-         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate } from "./core.js?v=1.3.0";
-import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs } from "./views.js?v=1.3.0";
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate } from "./core.js?v=1.4.0";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, taskAlerting, ackTasks } from "./views.js?v=1.4.0";
 
 // ------------------------------------------------------------------ shell
 const NAV = [
@@ -18,7 +18,7 @@ function renderNav() {
   const hosts = [...state.hosts.values()];
   const offline = hosts.filter((x) => x.status === "offline").length;
   const runningTasks = [...state.tasks.values()].filter((t) => t.status === "running").length;
-  const badTasks = [...state.tasks.values()].filter((t) => t.status === "failed" || t.status === "stalled").length;
+  const badTasks = [...state.tasks.values()].filter((t) => taskAlerting(t)).length;
   const runningJobs = [...state.jobs.values()].filter((j) => j.status === "running" || j.status === "queued").length;
   const alerts = computeAlerts();
   const crit = alerts.filter((a) => a.level === "crit").length;
@@ -182,8 +182,8 @@ function updateCard(card, host) {
     const cls = c.ok ? (c.kind === "unit" && !(c.value > 0) ? "" : "ok") : (c.level === "warning" ? "warn" : "bad");
     checks.append(h("span", { class: "chip " + cls, title: c.detail || "", html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(label) }));
   }
-  const failed = [...state.tasks.values()].filter((x) => x.host === host.name && (x.status === "failed" || x.status === "stalled"));
-  for (const x of failed.slice(0, 3)) checks.append(h("span", { class: "chip " + (x.status === "failed" ? "bad" : "warn"), title: x.note || "", onclick: (e) => { e.stopPropagation(); navigate("#/tasks"); } }, `task ${x.status}: ${x.name}`));
+  const failed = [...state.tasks.values()].filter((x) => x.host === host.name && taskAlerting(x));
+  for (const x of failed.slice(0, 3)) checks.append(h("span", { class: "chip " + (x.status === "failed" ? "bad" : "warn"), title: (x.note ? x.note + " · " : "") + "click to open (acknowledges the alert)", onclick: (e) => { e.stopPropagation(); ackTasks([x.id]); navigate(`#/tasks?open=${x.id}`); } }, `task ${x.status}: ${x.name}`));
   if (host.agent_update_error) checks.append(h("span", { class: "chip bad", title: host.agent_update_error }, "agent update failed"));
   else if (host.agent_outdated && host.status === "online") checks.append(h("span", { class: "chip warn", title: `running agent ${host.agent_version || "?"}; the hub serves a newer script and the agent updates itself on its next report` }, "agent updating"));
   if (s.memory?.committed != null && s.memory?.commit_limit) {
@@ -570,7 +570,7 @@ function route() {
   renderNav(); renderTopbar();
   let m;
   if ((m = hsh.match(/^#\/host\/(.+)$/))) renderDetail(decodeURIComponent(m[1]));
-  else if (hsh.startsWith("#/tasks")) { const q = new URLSearchParams(hsh.split("?")[1] || ""); renderTasks({ host: q.get("host"), status: q.get("status") }); }
+  else if (hsh.startsWith("#/tasks")) { const q = new URLSearchParams(hsh.split("?")[1] || ""); renderTasks({ host: q.get("host"), status: q.get("status"), open: q.get("open") }); }
   else if ((m = hsh.match(/^#\/agents(?:\/([^?]+))?(?:\?(.*))?$/))) { const q = new URLSearchParams(m[2] || ""); renderAgents({ host: m[1] ? decodeURIComponent(m[1]) : null, job: q.get("job") }); }
   else if (hsh.startsWith("#/alerts")) renderAlerts();
   else renderFleet();

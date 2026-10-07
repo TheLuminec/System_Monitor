@@ -146,6 +146,28 @@ async def task_get(task_id: int, ident: Identity = Depends(require_viewer)):
     return task_public(t)
 
 
+class TaskAck(BaseModel):
+    ids: Optional[list[int]] = None      # None = every problem task (optionally on `host`)
+    host: Optional[str] = None
+    undo: bool = False
+
+
+@router.post("/tasks/ack")
+async def tasks_ack(body: TaskAck, request: Request, ident: Identity = Depends(require_viewer)):
+    """Acknowledge failed/stalled/lost tasks so they stop alerting (they stay in the task list)."""
+    require_same_origin(request)
+    host_id = None
+    if body.host:
+        h = await run_in_threadpool(db.host_by_name, body.host)
+        if not h:
+            raise HTTPException(404, "no such host")
+        host_id = h.id
+    rows = await run_in_threadpool(db.task_ack, body.ids, host_id, ident.subject, body.undo)
+    for t in rows:
+        await _emit_task(t)
+    return {"ok": True, "changed": len(rows)}
+
+
 @router.delete("/tasks/{task_id}")
 async def task_delete(task_id: int, request: Request, ident: Identity = Depends(require_viewer)):
     require_same_origin(request)

@@ -1,5 +1,5 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate } from "./core.js?v=1.3.0";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate } from "./core.js?v=1.4.0";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
@@ -8,6 +8,21 @@ export async function loadTasks(force = false) {
   state.tasks.clear();
   for (const t of r.tasks) state.tasks.set(t.id, t);
   state.tasksLoaded = true;
+}
+
+// A failed / stalled / lost task alerts (Alerts tab, sidebar badges, host-card chips) until it is
+// acknowledged on the dashboard, or until config.task_alert_hours after it last changed. It is never deleted.
+export const TASK_PROBLEM = new Set(["failed", "stalled", "lost"]);
+export function taskAlerting(t, now = Date.now() / 1000) {
+  if (!TASK_PROBLEM.has(t.status) || t.acked) return false;
+  const hours = state.config?.task_alert_hours ?? 24;
+  return !(hours > 0) || now - (t.ended || t.updated) < hours * 3600;
+}
+export async function ackTasks(ids, { host, undo = false } = {}) {
+  try {
+    const r = await post("/api/v1/tasks/ack", { ids, host, undo });
+    return r.changed;
+  } catch (e) { toast(e.message, true); return 0; }
 }
 
 const TASK_ORDER = { running: 0, stalled: 1, failed: 2, lost: 3, done: 4 };
@@ -26,7 +41,8 @@ function taskRow(t, open = false) {
     h("span", { class: "dot" }),
     h("div", {},
       h("div", { class: "name" }, t.name),
-      h("div", { class: "sub" }, h("span", {}, t.host), h("span", {}, statusText), t.command ? h("span", { class: "num", title: t.command }, t.command.length > 60 ? t.command.slice(0, 60) + "…" : t.command) : null, t.user ? h("span", {}, t.user) : null, t.note ? h("span", {}, t.note) : null),
+      h("div", { class: "sub" }, h("span", {}, t.host), h("span", {}, statusText), t.command ? h("span", { class: "num", title: t.command }, t.command.length > 60 ? t.command.slice(0, 60) + "…" : t.command) : null, t.user ? h("span", {}, t.user) : null, t.note ? h("span", {}, t.note) : null,
+        TASK_PROBLEM.has(t.status) && !taskAlerting(t) ? h("span", { class: "chip", title: t.acked ? `acknowledged ${fmt.when(t.acked)}${t.acked_by ? " by " + t.acked_by : ""}` : "older than the alert window" }, t.acked ? "acknowledged" : "alert expired") : null),
     ),
     h("div", { class: "right num" }, h("b", { "data-f": "elapsed" }, fmt.dur(elapsed)), t.status === "running" ? `started ${fmt.when(t.started)}` : `${fmt.when(t.ended || t.updated)}`),
   );
@@ -36,7 +52,10 @@ function taskRow(t, open = false) {
   row.onclick = (e) => {
     if (e.target.closest("button, a")) return;
     row.classList.toggle("open");
-    if (row.classList.contains("open")) fillTaskDetail(detail, t.id);
+    if (row.classList.contains("open")) {
+      fillTaskDetail(detail, t.id);
+      if (taskAlerting(t)) ackTasks([t.id]);   // opening a problem task counts as having checked it
+    }
   };
   if (open) fillTaskDetail(detail, t.id);
   return row;
@@ -54,6 +73,11 @@ async function fillTaskDetail(el, id) {
   el.append(h("div", { style: "margin-top:10px" }, h("div", { class: "muted", style: "font-size:11px;margin-bottom:4px" }, "last output lines"), log));
   log.scrollTop = log.scrollHeight;
   const actions = h("div", { class: "actions" });
+  if (TASK_PROBLEM.has(t.status)) {
+    actions.append(t.acked
+      ? h("button", { class: "btn small", title: "Make this task alert again", onclick: () => ackTasks([t.id], { undo: true }) }, "Restore alert")
+      : h("button", { class: "btn small", title: "Stop alerting on this task (it stays in the list)", onclick: () => ackTasks([t.id]) }, "Acknowledge"));
+  }
   if (t.status !== "running") actions.append(h("button", { class: "btn small danger", onclick: async () => { try { await post(`/api/v1/tasks/${t.id}`, undefined, "DELETE"); } catch (e) { toast(e.message, true); } } }, "Delete"));
   if (t.status === "running" || t.status === "stalled") actions.append(h("span", { class: "muted", style: "font-size:12px" }, "live · updates as the task reports"));
   el.append(actions);
@@ -74,16 +98,18 @@ export async function renderTasks(params = {}) {
     const running = rows.filter((t) => t.status === "running").length;
     counts.textContent = `${running} running · ${rows.length} shown`;
     if (!rows.length) list.append(h("div", { class: "empty" }, "No tasks yet. Start one with the avm command below."));
-    for (const t of rows) list.append(taskRow(t));
+    for (const t of rows) list.append(taskRow(t, t.id === openId));
   };
+  const openId = params.open ? Number(params.open) : null;
   redraw();
+  if (openId) setTimeout(() => list.querySelector(`.task[data-id="${openId}"]`)?.scrollIntoView({ block: "center" }), 0);
   const howto = h("div", { class: "card howto" },
     h("b", {}, "Track anything with one command"), " — on any machine with the agent installed:",
     h("pre", {}, `avm run "seed 3 training" -- python train.py --seed 3     # wraps a command: output tail, heartbeat, exit code
 avm watch "nightly backup" --pid 4242                     # follow an already-running process
 avm task start "data prep" --expect 300   # -> TASK_ID     then: avm task beat ID --progress 0.4
 avm task done ID    |    avm task fail ID --rc 1 --note "why"`),
-    h("div", { class: "muted", style: "margin-top:8px;font-size:12px" }, "A running task that stops heart-beating turns amber (stalled); a non-zero exit turns red. Both count as alerts. Claude sessions started from the Agents tab are told to use avm run for long jobs."),
+    h("div", { class: "muted", style: "margin-top:8px;font-size:12px" }, `A running task that stops heart-beating turns amber (stalled); a non-zero exit turns red. Both count as alerts until you acknowledge them (open the task, or dismiss it on the Alerts tab) or for ${state.config?.task_alert_hours ?? 24} h after they happen; the task itself stays here. Claude sessions started from the Agents tab are told to use avm run for long jobs.`),
   );
   app.append(h("div", { class: "page-head" }, h("h2", {}, "Tasks"), counts, h("div", { class: "filters" }, hostSel, statusSel, h("button", { class: "btn small", onclick: async () => { await loadTasks(true); redraw(); } }, "Refresh"))), list, howto);
   state.tasksView = { list, filter, redraw };
@@ -317,9 +343,11 @@ export function computeAlerts() {
     if (s.memory?.committed != null && s.memory?.commit_limit && s.memory.committed / s.memory.commit_limit >= 0.85) out.push({ level: "warn", what: "memory commit pressure", why: `committed ${fmt.bytes(s.memory.committed)} of ${fmt.bytes(s.memory.commit_limit)}`, host: host.name, go: `#/host/${encodeURIComponent(host.name)}`, ts: s.ts });
   }
   for (const t of state.tasks.values()) {
-    if (t.status === "failed" && now - (t.ended || t.updated) < 86400 * 3) out.push({ level: "crit", what: `task failed: ${t.name}`, why: `exit code ${t.rc ?? "?"} · ${fmt.ago(now - (t.ended || t.updated))}${t.note ? " · " + t.note : ""}`, host: t.host, go: "#/tasks", ts: t.ended });
-    if (t.status === "stalled") out.push({ level: "warn", what: `task stalled: ${t.name}`, why: `no heartbeat for ${fmt.dur(now - t.heartbeat)}`, host: t.host, go: "#/tasks", ts: t.heartbeat });
-    if (t.status === "lost") out.push({ level: "warn", what: `task lost: ${t.name}`, why: "its host went offline while it was running", host: t.host, go: "#/tasks", ts: t.updated });
+    if (!taskAlerting(t, now)) continue;
+    const go = `#/tasks?open=${t.id}`;
+    if (t.status === "failed") out.push({ level: "crit", what: `task failed: ${t.name}`, why: `exit code ${t.rc ?? "?"} · ${fmt.ago(now - (t.ended || t.updated))}${t.note ? " · " + t.note : ""}`, host: t.host, go, ts: t.ended, task: t.id });
+    if (t.status === "stalled") out.push({ level: "warn", what: `task stalled: ${t.name}`, why: `no heartbeat for ${fmt.dur(now - t.heartbeat)}`, host: t.host, go, ts: t.heartbeat, task: t.id });
+    if (t.status === "lost") out.push({ level: "warn", what: `task lost: ${t.name}`, why: "its host went offline while it was running", host: t.host, go, ts: t.updated, task: t.id });
   }
   for (const j of state.jobs.values()) if (j.status === "failed" && now - (j.ended || j.created) < 86400) out.push({ level: "warn", what: `claude prompt failed: ${j.title}`, why: (j.error || "").slice(0, 160), host: j.host, go: `#/agents/${encodeURIComponent(j.host)}`, ts: j.ended });
   return out.sort((a, b) => (a.level === "crit" ? 0 : 1) - (b.level === "crit" ? 0 : 1) || (b.ts || 0) - (a.ts || 0));
@@ -334,12 +362,21 @@ export async function renderAlerts() {
     list.innerHTML = "";
     const alerts = computeAlerts();
     if (!alerts.length) list.append(h("div", { class: "empty" }, "All quiet. Offline hosts, failing checks, stalled or failed tasks and failed prompts show up here."));
-    for (const a of alerts) list.append(h("div", { class: "card alert " + a.level, onclick: () => navigate(a.go) }, h("span", { class: "dot" }), h("div", {}, h("div", { class: "what" }, a.what), h("div", { class: "why" }, a.why)), h("div", { class: "host" }, a.host)));
+    for (const a of alerts) {
+      // Opening a task alert counts as having checked it: acknowledge, then show the task.
+      const open = () => { if (a.task) ackTasks([a.task]); navigate(a.go); };
+      const dismiss = a.task ? h("button", { class: "btn small", title: "Acknowledge: stop alerting, keep the task", onclick: (e) => { e.stopPropagation(); ackTasks([a.task]); } }, "Dismiss") : null;
+      list.append(h("div", { class: "card alert " + a.level, onclick: open }, h("span", { class: "dot" }), h("div", {}, h("div", { class: "what" }, a.what), h("div", { class: "why" }, a.why)), h("div", { class: "host" }, a.host, dismiss ? " " : null, dismiss)));
+    }
+    dismissAll.style.display = alerts.some((a) => a.task) ? "" : "none";
     emit_badges();
   };
+  const dismissAll = h("button", { class: "btn small", title: "Acknowledge every task alert shown (tasks are kept)", onclick: () => ackTasks(computeAlerts().filter((a) => a.task).map((a) => a.task)) }, "Dismiss all task alerts");
   redraw();
-  app.append(h("div", { class: "page-head" }, h("h2", {}, "Alerts"), h("span", { class: "muted" }, "what needs attention right now")), list);
+  app.append(h("div", { class: "page-head" }, h("h2", {}, "Alerts"), h("span", { class: "muted" }, "what needs attention right now"), h("div", { class: "filters" }, dismissAll)), list);
   state.alertsView = { redraw };
 }
 const emit_badges = () => document.dispatchEvent(new CustomEvent("avm-badges"));
 for (const t of ["host", "task", "claude_job", "task_deleted"]) on(t, () => { if (state.view === "alerts" && state.alertsView) state.alertsView.redraw(); else emit_badges(); });
+// Task alerts expire with time, not only on events: re-evaluate once a minute.
+setInterval(() => { if (state.view === "alerts" && state.alertsView) state.alertsView.redraw(); else emit_badges(); }, 60000);

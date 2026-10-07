@@ -51,7 +51,7 @@ from every machine, live on one page.
 | Tab | What it shows |
 |-----|---------------|
 | **Fleet** | one card per machine (CPU/mem/disk/GPU meters, sparkline, checks, running tasks); click for the full host page with charts, tables and the checks editor. Drag cards by their handle to reorder; on a host page, **Customize** lets you drag panels around and hide the ones you don't need — per host or for all hosts. Layouts are saved to your user on the hub, so they follow you across browsers. |
-| **Tasks** | everything reported through the `avm` command: live status, elapsed time, heartbeat, exit code, last output lines. Failed → red, stalled (no heartbeat) → amber, host gone → lost. |
+| **Tasks** | everything reported through the `avm` command: live status, elapsed time, heartbeat, exit code, last output lines. Failed → red, stalled (no heartbeat) → amber, host gone → lost. A failed/stalled/lost task alerts (Alerts tab, sidebar badges, host-card chip) until you open it or dismiss it, or for `AVM_TASK_ALERT_HOURS` (default 24, `0` = never expire) after it happened; acknowledged tasks stay in the list and a later failure alerts again. |
 | **Agents** | Claude Code sessions on each machine (from `~/.claude/projects`: what each was started with, what it last said, how long ago) and a prompt console: pick a permission mode, a working directory, optionally a session to continue, and send. Output streams back live; follow-ups resume the same session. |
 | **Alerts** | one list of what needs attention: offline hosts, failing checks, the GPU-stall rule, agent update errors, failed/stalled/lost tasks, failed prompts. Clicking goes to the source. |
 

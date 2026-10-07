@@ -73,6 +73,9 @@ class Settings:
     retention_1m_days: int = 90
     offline_after_sec: int = 30
     retention_tasks_days: int = 60
+    # Failed / stalled / lost tasks alert (Alerts tab, sidebar badges, host-card chips) until
+    # acknowledged on the dashboard or until this many hours after they last changed. 0 = never expire.
+    task_alert_hours: float = 24
     max_payload_bytes: int = 512 * 1024
 
     # Derived-alert rules (hub-side). GPU stall: a host reports an active job
@@ -115,6 +118,7 @@ def load_settings() -> Settings:
     s.retention_1m_days = int(env.get("AVM_RETENTION_1M_DAYS", s.retention_1m_days))
     s.offline_after_sec = int(env.get("AVM_OFFLINE_AFTER_SEC", s.offline_after_sec))
     s.retention_tasks_days = int(env.get("AVM_RETENTION_TASKS_DAYS", s.retention_tasks_days))
+    s.task_alert_hours = float(env.get("AVM_TASK_ALERT_HOURS", s.task_alert_hours))
     s.max_payload_bytes = int(env.get("AVM_MAX_PAYLOAD_BYTES", s.max_payload_bytes))
     s.gpu_stall_minutes = int(env.get("AVM_RULE_GPU_STALL_MINUTES", s.gpu_stall_minutes))
     s.gpu_stall_percent = float(env.get("AVM_RULE_GPU_STALL_PERCENT", s.gpu_stall_percent))

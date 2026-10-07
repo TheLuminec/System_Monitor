@@ -90,7 +90,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     user        TEXT,
     log         TEXT NOT NULL DEFAULT '',
     meta        TEXT,
-    note        TEXT
+    note        TEXT,
+    acked       REAL,                     -- when a failed/stalled/lost task was acknowledged (stops alerting)
+    acked_by    TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_host_status ON tasks(host_id, status);
 CREATE INDEX IF NOT EXISTS tasks_started ON tasks(started);
@@ -233,6 +235,10 @@ class Database:
         for col, ddl in (("check_config", "TEXT"), ("check_rev", "INTEGER NOT NULL DEFAULT 0"), ("pending_cmd", "TEXT")):
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE hosts ADD COLUMN {col} {ddl}")
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)")}
+        for col, ddl in (("acked", "REAL"), ("acked_by", "TEXT")):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
 
     def close(self) -> None:
         with self._lock:
@@ -441,8 +447,10 @@ class Database:
                 sets.append("status=?"); vals.append(status)
                 if status in ("done", "failed"):
                     sets.append("ended=?"); vals.append(now)
+                if status != row["status"]:
+                    sets.append("acked=NULL, acked_by=NULL")   # a new outcome alerts afresh
             elif beat and row["status"] == "stalled":
-                sets.append("status='running'")
+                sets.append("status='running', acked=NULL, acked_by=NULL")
             if progress is not None:
                 sets.append("progress=?"); vals.append(max(0.0, min(1.0, float(progress))))
             if rc is not None:
@@ -459,7 +467,7 @@ class Database:
             return _row(self._conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
 
     def task_list(self, host_id: int | None = None, status: str | None = None, limit: int = 200, with_log: bool = False) -> list[dict]:
-        cols = "*" if with_log else "id, host_id, name, status, source, started, ended, updated, heartbeat, expect_beat, progress, rc, command, cwd, pid, user, meta, note"
+        cols = "*" if with_log else "id, host_id, name, status, source, started, ended, updated, heartbeat, expect_beat, progress, rc, command, cwd, pid, user, meta, note, acked, acked_by"
         where, vals = [], []
         if host_id is not None:
             where.append("host_id=?"); vals.append(host_id)
@@ -475,6 +483,28 @@ class Database:
         with self._lock:
             return self._conn.execute("DELETE FROM tasks WHERE id=?", (task_id,)).rowcount > 0
 
+    def task_ack(self, task_ids: list[int] | None = None, host_id: int | None = None, by: str | None = None,
+                 undo: bool = False, now: float | None = None) -> list[dict]:
+        """Acknowledge (or un-acknowledge) failed/stalled/lost tasks so they stop alerting. Nothing is deleted.
+        task_ids=None means every matching problem task (optionally on one host). Returns changed rows."""
+        now = now or time.time()
+        where, vals = ["status IN ('failed','stalled','lost')", "acked IS NOT NULL" if undo else "acked IS NULL"], []
+        if task_ids is not None:
+            if not task_ids:
+                return []
+            where.append(f"id IN ({','.join('?' * len(task_ids))})"); vals += task_ids
+        if host_id is not None:
+            where.append("host_id=?"); vals.append(host_id)
+        with self._lock:
+            ids = [r["id"] for r in self._conn.execute(f"SELECT id FROM tasks WHERE {' AND '.join(where)}", vals).fetchall()]
+            if ids:
+                marks = ",".join("?" * len(ids))
+                if undo:
+                    self._conn.execute(f"UPDATE tasks SET acked=NULL, acked_by=NULL WHERE id IN ({marks})", ids)
+                else:
+                    self._conn.execute(f"UPDATE tasks SET acked=?, acked_by=? WHERE id IN ({marks})", [now, by, *ids])
+            return [dict(self._conn.execute("SELECT * FROM tasks WHERE id=?", (i,)).fetchone()) for i in ids]
+
     def task_mark_stalled(self, now: float | None = None) -> list[dict]:
         """Running tasks whose heartbeat is older than 1.5x their expectation -> stalled. Returns changed rows."""
         now = now or time.time()
@@ -484,7 +514,7 @@ class Database:
             ).fetchall()
             ids = [r["id"] for r in rows]
             if ids:
-                self._conn.execute(f"UPDATE tasks SET status='stalled', updated=? WHERE id IN ({','.join('?' * len(ids))})", [now, *ids])
+                self._conn.execute(f"UPDATE tasks SET status='stalled', updated=?, acked=NULL, acked_by=NULL WHERE id IN ({','.join('?' * len(ids))})", [now, *ids])
             return [dict(self._conn.execute("SELECT * FROM tasks WHERE id=?", (i,)).fetchone()) for i in ids]
 
     def task_mark_lost(self, host_id: int, now: float | None = None) -> list[dict]:
@@ -494,7 +524,7 @@ class Database:
             rows = self._conn.execute("SELECT id FROM tasks WHERE host_id=? AND status IN ('running','stalled')", (host_id,)).fetchall()
             ids = [r["id"] for r in rows]
             if ids:
-                self._conn.execute(f"UPDATE tasks SET status='lost', updated=? WHERE id IN ({','.join('?' * len(ids))})", [now, *ids])
+                self._conn.execute(f"UPDATE tasks SET status='lost', updated=?, acked=NULL, acked_by=NULL WHERE id IN ({','.join('?' * len(ids))})", [now, *ids])
             return [dict(self._conn.execute("SELECT * FROM tasks WHERE id=?", (i,)).fetchone()) for i in ids]
 
     def task_prune(self, days: int, now: float | None = None) -> int:

@@ -309,6 +309,7 @@ async def get_config(ident: Identity = Depends(require_viewer)):
         "version": __version__,
         "user": {"subject": ident.subject, "method": ident.method},
         "offline_after_sec": settings.offline_after_sec,
+        "task_alert_hours": settings.task_alert_hours,
         "ranges": RANGES,
         "metrics": list(METRICS),
         "access_enabled": settings.access_enabled,
