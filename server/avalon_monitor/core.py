@@ -73,6 +73,27 @@ class AgentBundle:
     def available(self) -> bool:
         return bool(self.data)
 
+    COMPANIONS = ("avm.py",)
+
+    def companion_hashes(self) -> dict:
+        """sha256 of each companion file, so agents can resync one that changed on its own
+        (an avm-only release does not change the agent script, which is what triggers self-update)."""
+        cache = self.__dict__.setdefault("_companion_cache", {})
+        out = {}
+        for name in self.COMPANIONS:
+            p = self.path.parent / name
+            try:
+                mt = p.stat().st_mtime
+            except OSError:
+                continue
+            if cache.get(name, (None,))[0] != mt:
+                try:
+                    cache[name] = (mt, hashlib.sha256(p.read_bytes()).hexdigest())
+                except OSError:
+                    continue
+            out[name] = cache[name][1]
+        return out
+
     def sibling(self, name: str) -> Optional[bytes]:
         """Another file shipped beside the agent script (e.g. avm.py)."""
         p = self.path.parent / name

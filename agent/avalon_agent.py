@@ -71,7 +71,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.3.1"
+AGENT_VERSION = "1.4.0"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -1439,6 +1439,35 @@ def self_update(cfg: Dict[str, str], info: Dict[str, Any]) -> bool:
     return True
 
 
+_COMPANION_TRIED: Dict[str, Any] = {}
+
+
+def sync_companions(cfg: Dict[str, str], info: Dict[str, Any]) -> None:
+    """Re-fetch a companion file (avm.py) whose hash differs from the hub's, even when the agent
+    itself is current. One attempt per advertised hash per 10 minutes."""
+    files = info.get("files")
+    if not isinstance(files, dict):
+        return
+    if not info.get("auto_update", True) or cfg["AVM_AUTO_UPDATE"].strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    for name, want in files.items():
+        if name != "avm.py" or not isinstance(want, str):
+            continue
+        dest = os.path.join(os.path.dirname(_SELF_PATH), name)
+        try:
+            with open(dest, "rb") as f:
+                have = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            have = None
+        if have == want:
+            continue
+        last = _COMPANION_TRIED.get(name)
+        if last and last[0] == want and time.monotonic() < last[1]:
+            continue
+        _COMPANION_TRIED[name] = (want, time.monotonic() + 600)
+        _refresh_companion(cfg, name)
+
+
 def _refresh_companion(cfg: Dict[str, str], name: str) -> None:
     """Best-effort: keep avm.py (the task CLI) next to this script in step with the hub."""
     url = cfg["AVM_SERVER_URL"].rstrip("/") + "/api/v1/agent/file/" + name
@@ -1580,6 +1609,8 @@ def main(argv=None) -> int:
                 try:
                     if self_update(cfg, reply["agent"]):
                         respawn()
+                    else:
+                        sync_companions(cfg, reply["agent"])
                 except Exception as e:  # never let an update problem stop reporting
                     _update_failed("installed, but respawn failed: %r - restart the agent service/task to load it" % e)
         except urllib.error.HTTPError as e:

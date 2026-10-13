@@ -259,7 +259,7 @@ async def ingest(request: Request):
     agent_bundle.refresh()
     if agent_bundle.available:
         reply["agent"] = {"version": agent_bundle.version, "sha256": agent_bundle.sha256,
-                          "auto_update": settings.agent_auto_update}
+                          "auto_update": settings.agent_auto_update, "files": agent_bundle.companion_hashes()}
     queued, cancel = await run_in_threadpool(db.jobs_pending_for, host.id)
     if queued:
         reply["claude_jobs"] = queued
@@ -283,7 +283,7 @@ async def agent_script(request: Request):
 async def agent_file(name: str, request: Request):
     """Companion files for self-update (currently avm.py). Same access rules as ingest."""
     await require_agent(request)
-    if name not in ("avm.py",):
+    if name not in AgentBundle.COMPANIONS:
         raise HTTPException(404, "unknown file")
     data = agent_bundle.sibling(name)
     if data is None:
