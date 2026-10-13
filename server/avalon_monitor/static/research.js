@@ -1,7 +1,7 @@
 // Research results pages: renders the latest document a project pushed with `avm results push`
 // (schema "<name>-results/<n>") and per-metric history across pushes. Everything is rendered as
 // text/SVG from the pushed document only - nothing is ever fetched from the project itself.
-import { $, h, fmt, state, api, on, navigate, toast } from "./core.js?v=1.5.0";
+import { $, h, fmt, state, api, on, navigate, toast } from "./core.js?v=1.5.1";
 
 const NS = "http://www.w3.org/2000/svg";
 function s(tag, attrs = {}, ...kids) {
@@ -41,7 +41,14 @@ function domainOf(values, preferUnit) {
   if (hi === lo) hi = lo + 1;
   return [lo, hi + (hi - lo) * 0.04];
 }
-const ticksFor = ([lo, hi]) => (lo === 0 && hi === 1 ? [0, 0.25, 0.5, 0.75, 1] : [lo, lo + (hi - lo) / 2, hi]);
+function ticksFor([lo, hi]) {
+  if (lo === 0 && hi === 1) return [0, 0.25, 0.5, 0.75, 1];
+  const raw = (hi - lo) / 4, mag = 10 ** Math.floor(Math.log10(raw)), f = raw / mag;
+  const step = (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * mag;
+  const out = [];
+  for (let t = Math.ceil(lo / step - 1e-9) * step; t <= hi + step * 1e-9; t += step) out.push(Math.abs(t) < step * 1e-9 ? 0 : +t.toPrecision(12));
+  return out;
+}
 
 // A figure redraws itself whenever its card changes width (phone <-> desktop, sidebar toggles).
 function responsive(draw) {
@@ -191,9 +198,15 @@ function barFigure(fig) {
     const x = (v) => x0 + ((Math.max(dom[0], Math.min(dom[1], v)) - dom[0]) / (dom[1] - dom[0])) * (x1 - x0);
     const H = top + rows.length * RH + axisH;
     const g = s("svg", { width: W, height: H, class: "bars" });
+    const band = Array.isArray(fig.band) && num(fig.band[0]) != null && num(fig.band[1]) != null && fig.band[1] > fig.band[0] ? fig.band : null;
+    if (band) {
+      const bx = s("rect", { x: x(band[0]), y: top, width: Math.max(1, x(band[1]) - x(band[0])), height: H - axisH - top + 2, class: "band" });
+      tip(bx, `${fig.band_label || "band"}: ${fv(band[0])} to ${fv(band[1])}`);
+      g.append(bx);
+    }
     for (const t of ticksFor(dom)) {
-      g.append(s("line", { x1: x(t), x2: x(t), y1: top, y2: H - axisH + 2, class: "grid" }));
-      g.append(s("text", { x: x(t), y: H - 4, "text-anchor": "middle", class: "tick" }, String(+t.toFixed(2))));
+      g.append(s("line", { x1: x(t), x2: x(t), y1: top, y2: H - axisH + 2, class: t === 0 && dom[0] < 0 ? "zero" : "grid" }));
+      g.append(s("text", { x: x(t), y: H - 4, "text-anchor": "middle", class: "tick" }, String(+t.toFixed(3))));
     }
     const maxChars = Math.floor((narrow ? W - valW : labW) / 6.4);
     rows.forEach((r, i) => {
@@ -202,10 +215,14 @@ function barFigure(fig) {
       g.append(narrow ? s("text", { x: x0, y: yc - 10, class: "lab" }, clip(r.label, maxChars))
                       : s("text", { x: labW, y: yc + 4, "text-anchor": "end", class: "lab" }, clip(r.label, maxChars)));
       if (v != null) {
-        const xa = x(Math.max(dom[0], 0)), xb = x(v), wbar = Math.max(0, xb - xa), rr = Math.min(4, wbar);
+        // bars grow from 0 (or the domain edge nearest it) in either direction:
         // square at the baseline, 4px rounded data-end
-        g.append(s("path", { class: "bar", d: `M${xa},${yc - BH / 2}h${wbar - rr}a${rr},${rr} 0 0 1 ${rr},${rr}v${BH - 2 * rr}a${rr},${rr} 0 0 1 ${-rr},${rr}h${-(wbar - rr)}z` }));
-        if (Array.isArray(r.ci) && num(r.ci[0]) != null && num(r.ci[1]) != null) g.append(s("line", { x1: x(r.ci[0]), x2: x(r.ci[1]), y1: yc, y2: yc, class: "whisk" }));
+        const xa = x(Math.min(dom[1], Math.max(dom[0], 0))), xb = x(v), wbar = Math.abs(xb - xa), rr = Math.min(4, wbar / 2, BH / 2), dir = xb >= xa ? 1 : -1;
+        if (wbar > 0.5) g.append(s("path", { class: "bar", d: `M${xa},${yc - BH / 2}h${dir * (wbar - rr)}a${rr},${rr} 0 0 ${dir > 0 ? 1 : 0} ${dir * rr},${rr}v${BH - 2 * rr}a${rr},${rr} 0 0 ${dir > 0 ? 1 : 0} ${-dir * rr},${rr}h${-dir * (wbar - rr)}z` }));
+        if (Array.isArray(r.ci) && num(r.ci[0]) != null && num(r.ci[1]) != null) {
+          g.append(s("line", { x1: x(r.ci[0]), x2: x(r.ci[1]), y1: yc, y2: yc, class: "whisk-bar" }));
+          for (const c of r.ci) g.append(s("line", { x1: x(c), x2: x(c), y1: yc - 4, y2: yc + 4, class: "whisk-bar" }));
+        }
       }
       g.append(s("text", { x: W - 2, y: yc + 4, "text-anchor": "end", class: "val" }, fv(v)));
       const hit = s("rect", { x: 0, y: yc - RH / 2 - off, width: W, height: RH, fill: "transparent" });
@@ -217,7 +234,8 @@ function barFigure(fig) {
   };
   const better = fig.better === "lower" ? "lower is better" : fig.better === "higher" ? "higher is better" : null;
   return h("div", { class: "card table-card fig" },
-    h("div", { class: "fig-head" }, h("h3", {}, fig.title || fig.id), h("span", { class: "muted fig-cap" }, [fig.unit, better].filter(Boolean).join(" · "))),
+    h("div", { class: "fig-head" }, h("h3", {}, fig.title || fig.id), h("span", { class: "muted fig-cap" }, [fig.unit, better].filter(Boolean).join(" · ")),
+      Array.isArray(fig.band) ? h("span", { class: "viz-legend" }, h("span", {}, h("i", { class: "lg-band" }), fig.band_label || "band")) : null),
     rows.length ? responsive(draw) : h("div", { class: "muted" }, "no rows"));
 }
 
