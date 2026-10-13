@@ -86,7 +86,8 @@ cmp -s "$STAGE/server/requirements.txt" "$APP_DIR/server/requirements.txt" \
   || die "$SHORT changes server/requirements.txt (new dependencies need root) - use: sudo ./deploy/upgrade.sh"
 cmp -s "$STAGE/deploy/avalon-monitor.service" /etc/systemd/system/$UNIT \
   || die "$SHORT changes the systemd unit - use: sudo ./deploy/upgrade.sh"
-if [[ "$agent" == no ]] && ! diff -rq -x __pycache__ "$STAGE/agent" "$APP_DIR/agent" >/dev/null 2>&1; then
+# --strip-trailing-cr: .gitattributes gives *.ps1 CRLF in archives, the sudo install copied LF
+if [[ "$agent" == no ]] && ! diff -rq --strip-trailing-cr -x __pycache__ "$STAGE/agent" "$APP_DIR/agent" >/dev/null 2>&1; then
   echo "deploy: note: $SHORT changes agent/, which is root-owned here - deploying the hub only; agent needs sudo ./deploy/upgrade.sh"
 fi
 python3 -m compileall -q "$STAGE/server" "$STAGE/agent" >/dev/null || die "$SHORT does not compile"
