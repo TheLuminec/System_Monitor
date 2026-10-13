@@ -1,14 +1,16 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.4.0";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.5.0";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
-         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate } from "./core.js?v=1.4.0";
-import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, taskAlerting, ackTasks } from "./views.js?v=1.4.0";
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate } from "./core.js?v=1.5.0";
+import { renderResearch } from "./research.js?v=1.5.0";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, taskAlerting, ackTasks } from "./views.js?v=1.5.0";
 
 // ------------------------------------------------------------------ shell
 const NAV = [
   { id: "fleet", hash: "#/", label: "Fleet", icon: ICON.fleet },
   { id: "tasks", hash: "#/tasks", label: "Tasks", icon: ICON.tasks },
   { id: "agents", hash: "#/agents", label: "Agents", icon: ICON.agents },
+  { id: "research", hash: "#/research", label: "Research", icon: ICON.research },
   { id: "alerts", hash: "#/alerts", label: "Alerts", icon: ICON.alerts },
 ];
 
@@ -37,6 +39,7 @@ function currentSection() {
   if (hsh.startsWith("#/tasks")) return "tasks";
   if (hsh.startsWith("#/agents")) return "agents";
   if (hsh.startsWith("#/alerts")) return "alerts";
+  if (hsh.startsWith("#/research")) return "research";
   return "fleet";
 }
 document.addEventListener("avm-badges", renderNav);
@@ -534,6 +537,7 @@ function connectWs() {
     else if (msg.type === "task_deleted") emit("task_deleted", msg);
     else if (msg.type === "claude_job") emit("claude_job", msg.job);
     else if (msg.type === "claude_event") emit("claude_event", msg);
+    else if (msg.type === "results") emit("results", msg);
   };
   ws.onclose = (ev) => {
     state.live = false; $("#conn").className = "conn"; clearInterval(ping);
@@ -573,6 +577,7 @@ function route() {
   else if (hsh.startsWith("#/tasks")) { const q = new URLSearchParams(hsh.split("?")[1] || ""); renderTasks({ host: q.get("host"), status: q.get("status"), open: q.get("open") }); }
   else if ((m = hsh.match(/^#\/agents(?:\/([^?]+))?(?:\?(.*))?$/))) { const q = new URLSearchParams(m[2] || ""); renderAgents({ host: m[1] ? decodeURIComponent(m[1]) : null, job: q.get("job") }); }
   else if (hsh.startsWith("#/alerts")) renderAlerts();
+  else if ((m = hsh.match(/^#\/research(?:\/([^?]+))?(?:\?(.*))?$/))) { const q = new URLSearchParams(m[2] || ""); renderResearch({ project: m[1] ? decodeURIComponent(m[1]) : null, push: q.get("push") }); }
   else renderFleet();
 }
 

@@ -130,6 +130,22 @@ CREATE TABLE IF NOT EXISTS claude_events (
     PRIMARY KEY (job_id, seq)
 ) WITHOUT ROWID;
 
+-- Research results documents pushed by projects (`avm results push`). Every push is kept:
+-- the latest one is rendered, older ones give per-metric history. Aggregates only - the hub
+-- stores and renders exactly what was pushed and never fetches anything itself.
+CREATE TABLE IF NOT EXISTS results (
+    id           INTEGER PRIMARY KEY,
+    project      TEXT NOT NULL,
+    host_id      INTEGER REFERENCES hosts(id) ON DELETE SET NULL,
+    received     REAL NOT NULL,
+    schema       TEXT NOT NULL,
+    generated_at TEXT,
+    commit_ref   TEXT,
+    headline     TEXT NOT NULL DEFAULT '[]', -- headline id/value/ci list extracted at push time, for cheap history
+    doc          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS results_project ON results(project, received);
+
 -- Per-user dashboard preferences (layout, hidden panels, card order).
 CREATE TABLE IF NOT EXISTS prefs (
     user    TEXT PRIMARY KEY,
@@ -531,6 +547,44 @@ class Database:
         now = now or time.time()
         with self._lock:
             return self._conn.execute("DELETE FROM tasks WHERE status IN ('done','failed','lost') AND updated < ?", (now - days * 86400,)).rowcount
+
+    # -------------------------------------------------------------- results
+    def results_add(self, project: str, host_id: int | None, schema: str, generated_at: str | None, commit_ref: str | None,
+                    headline: list[dict], doc: str) -> dict:
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO results(project, host_id, received, schema, generated_at, commit_ref, headline, doc) VALUES (?,?,?,?,?,?,?,?)",
+                (project, host_id, now, schema, generated_at, commit_ref, json.dumps(headline), doc))
+            return {"id": cur.lastrowid, "project": project, "received": now, "generated_at": generated_at, "commit": commit_ref}
+
+    def results_projects(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT r.project, COUNT(*) AS pushes, MAX(r.received) AS last_received,"
+                " (SELECT commit_ref FROM results x WHERE x.project=r.project ORDER BY received DESC LIMIT 1) AS last_commit"
+                " FROM results r GROUP BY r.project ORDER BY last_received DESC").fetchall()
+            return [dict(r) for r in rows]
+
+    def results_get(self, project: str, push_id: int | None = None) -> Optional[dict]:
+        """One push (the latest when push_id is None), with its document."""
+        with self._lock:
+            if push_id is None:
+                r = self._conn.execute("SELECT * FROM results WHERE project=? ORDER BY received DESC, id DESC LIMIT 1", (project,)).fetchone()
+            else:
+                r = self._conn.execute("SELECT * FROM results WHERE project=? AND id=?", (project, push_id)).fetchone()
+            return dict(r) if r else None
+
+    def results_history(self, project: str, limit: int = 500) -> list[dict]:
+        """Oldest -> newest pushes without their documents (headline values only)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, received, generated_at, commit_ref, host_id, headline FROM results WHERE project=?"
+                " ORDER BY received DESC, id DESC LIMIT ?", (project, limit)).fetchall()
+        out = [dict(r) for r in reversed(rows)]
+        for r in out:
+            r["headline"] = json.loads(r["headline"] or "[]")
+        return out
 
     # ---------------------------------------------------------- claude jobs
     def job_create(self, host_id: int, prompt: str, cwd: str | None, mode: str, model: str | None,

@@ -16,6 +16,10 @@ One command when you set something off:
     avm task fail  TASK_ID [--rc 1] [--note "why"]
     avm task list  [--status running]
 
+    avm results push PROJECT FILE
+        Publishes a results document (JSON, "<name>-results/<n>" schema) to the project's
+        Research page; every push is kept as history. Aggregates only - the hub renders what you send.
+
 Needs the agent's config (server URL + host token). Looked up in order:
 AVM_CONFIG, ~/.config/avalon-agent/agent.conf, /etc/avalon-agent/agent.conf,
 %ProgramData%\\AvalonAgent\\agent.conf. Only one dependency: Python 3.8+.
@@ -38,7 +42,7 @@ import urllib.request
 from collections import deque
 from typing import Any, Dict, List, Optional
 
-AVM_VERSION = "1.3.0"
+AVM_VERSION = "1.4.0"
 IS_WINDOWS = sys.platform.startswith("win")
 
 
@@ -83,8 +87,9 @@ class Hub:
         self.base = cfg["AVM_SERVER_URL"].rstrip("/") + "/api/v1"
         self.token = cfg["AVM_TOKEN"]
 
-    def call(self, path: str, body: Optional[dict] = None, method: str = "POST", timeout: float = 10.0) -> dict:
-        req = urllib.request.Request(self.base + path, method=method, data=json.dumps(body).encode() if body is not None else None,
+    def call(self, path: str, body: Optional[dict] = None, method: str = "POST", timeout: float = 10.0, raw: Optional[bytes] = None) -> dict:
+        data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+        req = urllib.request.Request(self.base + path, method=method, data=data,
                                      headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.token,
                                               "User-Agent": "avm/" + AVM_VERSION})
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -273,6 +278,22 @@ def cmd_task(args: argparse.Namespace, hub: Hub) -> int:
     return 0
 
 
+def cmd_results(args: argparse.Namespace, hub: Hub) -> int:
+    with open(args.file, "rb") as f:
+        raw = f.read()
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        sys.stderr.write("avm: %s is not valid JSON: %s\n" % (args.file, e))
+        return 2
+    if isinstance(doc, dict) and doc.get("project") not in (None, args.project):
+        sys.stderr.write("avm: %s says project %r, not %r\n" % (args.file, doc.get("project"), args.project))
+        return 2
+    r = hub.call("/projects/%s/results" % args.project, raw=raw, timeout=30.0)  # sent byte-for-byte
+    print("pushed %s results #%s (%d bytes)" % (args.project, r.get("id"), len(raw)))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="avm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version="avm " + AVM_VERSION)
@@ -300,6 +321,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     s = tp.add_parser("fail"); s.add_argument("id"); s.add_argument("--rc", type=int, default=1); s.add_argument("--note"); s.add_argument("--log", action="append")
     s = tp.add_parser("list"); s.add_argument("--status")
 
+    p = sub.add_parser("results", help="publish a results document to the dashboard's Research page")
+    rp = p.add_subparsers(dest="op", required=True)
+    s = rp.add_parser("push"); s.add_argument("project", help="project slug, e.g. xrsec"); s.add_argument("file", help="results JSON")
+
     argv = list(sys.argv[1:] if argv is None else argv)
     command: List[str] = []
     if "--" in argv:  # everything after `--` is the command, untouched by argparse
@@ -310,7 +335,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.command = command or [c for c in (args.command or []) if c != "--"]
     hub = Hub(load_config())
     try:
-        return {"run": cmd_run, "watch": cmd_watch, "task": cmd_task}[args.cmd](args, hub)
+        return {"run": cmd_run, "watch": cmd_watch, "task": cmd_task, "results": cmd_results}[args.cmd](args, hub)
     except urllib.error.HTTPError as e:
         sys.stderr.write("avm: hub rejected the request: HTTP %s %s\n" % (e.code, e.read().decode(errors="replace")[:200]))
         return 1

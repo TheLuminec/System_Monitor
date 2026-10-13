@@ -53,6 +53,7 @@ from every machine, live on one page.
 | **Fleet** | one card per machine (CPU/mem/disk/GPU meters, sparkline, checks, running tasks); click for the full host page with charts, tables and the checks editor. Drag cards by their handle to reorder; on a host page, **Customize** lets you drag panels around and hide the ones you don't need — per host or for all hosts. Layouts are saved to your user on the hub, so they follow you across browsers. |
 | **Tasks** | everything reported through the `avm` command: live status, elapsed time, heartbeat, exit code, last output lines. Failed → red, stalled (no heartbeat) → amber, host gone → lost. A failed/stalled/lost task alerts (Alerts tab, sidebar badges, host-card chip) until you open it or dismiss it, or for `AVM_TASK_ALERT_HOURS` (default 24, `0` = never expire) after it happened; acknowledged tasks stay in the list and a later failure alerts again. |
 | **Agents** | Claude Code sessions on each machine (from `~/.claude/projects`: what each was started with, what it last said, how long ago) and a prompt console: pick a permission mode, a working directory, optionally a session to continue, and send. Output streams back live; follow-ups resume the same session. |
+| **Research** | per-project results pages fed by `avm results push`: headline table (value dot + 95 % CI whisker, chance line, comparator tick, change vs the previous push, history sparkline), a must-read notes panel, programme status chips, and generic bar / distribution figures. Every push is kept; pick an earlier one from the menu. Updates live when a new push lands. |
 | **Alerts** | one list of what needs attention: offline hosts, failing checks, the GPU-stall rule, agent update errors, failed/stalled/lost tasks, failed prompts. Clicking goes to the source. |
 
 ### `avm` — one command when you set something off
@@ -67,7 +68,19 @@ avm task start "data prep" --expect 300                 # manual lifecycle -> pr
 avm task beat ID --progress 0.4 --log "epoch 3"
 avm task done ID        |   avm task fail ID --rc 1 --note "why"
 avm task list
+avm results push xrsec docs/results/dashboard.json      # publish a results document to the Research tab
 ```
+
+**Results documents** (`POST /api/v1/projects/<project>/results`, host token, tailnet only) are
+JSON objects with `schema: "<name>-results/<n>"`, `project` equal to the URL slug, and any of
+`headline` (rows: `id`, `group`, `result`, `metric`, `n`, `value`, `ci: [lo, hi] | null`, `chance`,
+`comparator: {label, value}`, `compliance`, optional `scale: [lo, hi]`), `programmes` (`title`,
+`status`: running / closed / fail / partial / registered / reference, `status_text`, `key_result`,
+`registration`, `updated`, `eta`), `bars` (`title`, `unit`, optional `domain`, `better`, `rows` of
+`label` / `value` / `ci`), `distributions` (`title`, `series` of `label` / `values`, optional
+`point_labels` to join one unit across series) and `notes` (strings). Keep headline `id`s stable:
+history is keyed on them. The hub renders only what is pushed and never reads the project itself,
+so a feed must carry aggregates only.
 
 Claude sessions launched from the Agents tab are told (via system prompt) to wrap
 long-running work in `avm run`, so their training runs show up as tasks.

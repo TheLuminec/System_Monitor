@@ -39,6 +39,7 @@ AGENT_COMMANDS = ("respawn",)
 from .core import (AGENT_SCRIPT, AgentBundle, LiveHub, agent_bundle, authz, client_ip, db, gpu_stall, hub,  # noqa: F401
                    require_agent, require_same_origin, require_viewer)
 from .routes_ops import router as ops_router, task_public
+from .routes_results import router as results_router
 
 
 # --------------------------------------------------------------- serializers
@@ -447,6 +448,7 @@ async def index(request: Request):
 
 
 app.include_router(ops_router)
+app.include_router(results_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
