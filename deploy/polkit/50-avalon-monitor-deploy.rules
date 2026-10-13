@@ -1,0 +1,14 @@
+// Let the hub's operator account start/stop/restart the Avalon Monitor hub without sudo,
+// so deploy/deploy-hub.sh can roll out code changes. Grants nothing else: no other units,
+// no enable/disable, no unit-file edits, no daemon-reload.
+//
+// Install (once):  sudo install -m 644 deploy/polkit/50-avalon-monitor-deploy.rules /etc/polkit-1/rules.d/
+// Remove:          sudo rm /etc/polkit-1/rules.d/50-avalon-monitor-deploy.rules
+polkit.addRule(function (action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "avalon-monitor.service" &&
+        ["start", "stop", "restart"].indexOf(action.lookup("verb")) >= 0 &&
+        subject.user == "thelumine") {
+        return polkit.Result.YES;
+    }
+});
