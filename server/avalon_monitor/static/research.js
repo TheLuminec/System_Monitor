@@ -1,7 +1,7 @@
 // Research results pages: renders the latest document a project pushed with `avm results push`
 // (schema "<name>-results/<n>") and per-metric history across pushes. Everything is rendered as
 // text/SVG from the pushed document only - nothing is ever fetched from the project itself.
-import { $, h, fmt, state, api, on, navigate, toast } from "./core.js?v=1.5.2";
+import { $, h, fmt, state, api, on, navigate, toast } from "./core.js?v=1.5.3";
 
 const NS = "http://www.w3.org/2000/svg";
 function s(tag, attrs = {}, ...kids) {

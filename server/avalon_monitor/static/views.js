@@ -1,5 +1,5 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate } from "./core.js?v=1.5.2";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate } from "./core.js?v=1.5.3";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
@@ -25,11 +25,12 @@ export async function ackTasks(ids, { host, undo = false } = {}) {
   } catch (e) { toast(e.message, true); return 0; }
 }
 
-const TASK_ORDER = { running: 0, stalled: 1, failed: 2, lost: 3, done: 4 };
+// Active tasks (running/stalled) first, then everything finished (done/failed/lost) together; newest first within each.
+const TASK_ACTIVE = new Set(["running", "stalled"]);
 function sortedTasks(filter = {}) {
   return [...state.tasks.values()]
     .filter((t) => (!filter.host || t.host === filter.host) && (!filter.status || t.status === filter.status))
-    .sort((a, b) => (TASK_ORDER[a.status] ?? 9) - (TASK_ORDER[b.status] ?? 9) || b.started - a.started);
+    .sort((a, b) => TASK_ACTIVE.has(b.status) - TASK_ACTIVE.has(a.status) || b.started - a.started);
 }
 
 function taskRow(t, open = false) {
