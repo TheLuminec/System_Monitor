@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api/v1")
 
 PROJECT_RE = re.compile(r"^[a-z0-9_-]{1,40}$")
 SCHEMA_RE = re.compile(r"^[a-z0-9_.-]{1,40}-results/\d+$")
-LIST_FIELDS = ("headline", "programmes", "bars", "distributions", "notes")
+LIST_FIELDS = ("headline", "programmes", "bars", "distributions", "dotbars", "notes")
 
 
 def _project(project: str) -> str:

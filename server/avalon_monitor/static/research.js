@@ -1,7 +1,7 @@
 // Research results pages: renders the latest document a project pushed with `avm results push`
 // (schema "<name>-results/<n>") and per-metric history across pushes. Everything is rendered as
 // text/SVG from the pushed document only - nothing is ever fetched from the project itself.
-import { $, h, fmt, state, api, on, navigate, toast } from "./core.js?v=1.5.3";
+import { $, h, fmt, state, api, on, navigate, toast } from "./core.js?v=1.6.0";
 
 const NS = "http://www.w3.org/2000/svg";
 function s(tag, attrs = {}, ...kids) {
@@ -321,6 +321,162 @@ function pointFigure(fig) {
     labels.length ? responsive(draw) : h("div", { class: "muted" }, "no points"));
 }
 
+// ------------------------------------------------------------ dot-bars
+// Grouped vertical bars, one colour per model (group) and solid/hatched per variant, each with a 95% CI
+// whisker and one dot per test user. Colours come from the documents' series_colors, merged page-wide so
+// one model keeps one colour on every figure; the dark theme lifts each hue toward white in CSS.
+const HEX = /^#[0-9a-f]{3}([0-9a-f]{3})?$/i;
+let patSeq = 0;
+function dotColors(figs) {
+  const map = new Map();
+  for (const f of figs) for (const [k, c] of Object.entries(f.series_colors && typeof f.series_colors === "object" ? f.series_colors : {}))
+    if (typeof c === "string" && HEX.test(c) && !map.has(k)) map.set(k, c);
+  let i = 0;
+  for (const f of figs) for (const k of [...(f.groups || []).map((g) => g?.color_key ?? g?.label), ...(f.reference_lines || []).map((r) => r?.color_key)])
+    if (typeof k === "string" && !map.has(k)) map.set(k, `var(${SERIES[i++ % SERIES.length]})`);
+  return map;
+}
+// Greedy word wrap into at most `lines` lines of ~`chars` characters; the last line is cut with an ellipsis.
+function wrapText(t, chars, lines) {
+  const out = [];
+  let cur = "";
+  for (const w of String(t ?? "").split(/\s+/).filter(Boolean)) {
+    if (!cur) cur = w; else if ((cur + " " + w).length <= chars) cur += " " + w; else { out.push(cur); cur = w; }
+  }
+  if (cur) out.push(cur);
+  if (out.length > lines) out.splice(lines - 1, out.length, out.slice(lines - 1).join(" "));
+  return out.map((l) => (l.length > chars ? l.slice(0, Math.max(1, chars - 1)) + "…" : l));
+}
+function hatch(id, color) {
+  return s("pattern", { id, class: "db-c db-hatch", style: `--sc:${color}`, width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" },
+    s("rect", { width: 6, height: 6 }), s("line", { x1: 3, y1: 0, x2: 3, y2: 6 }));
+}
+function swatch(hatched) {
+  const id = `dbp${++patSeq}`;
+  return s("svg", { width: 16, height: 11, class: "lg-db" }, hatched ? s("defs", {}, hatch(id, "var(--ink-2)")) : null,
+    s("rect", { x: 0.75, y: 0.75, width: 14.5, height: 9.5, rx: 1.5, class: "db-c db-bar " + (hatched ? "hatched" : "solid"), style: "--sc:var(--ink-2)", fill: hatched ? `url(#${id})` : null }));
+}
+
+function dotbarFigure(fig, colors) {
+  const groups = (fig.groups || []).filter((g) => g && typeof g === "object")
+    .map((g) => ({ ...g, color: colors.get(g.color_key ?? g.label) || "var(--accent)", bars: (Array.isArray(g.bars) ? g.bars : []).filter((b) => b && typeof b === "object") }))
+    .filter((g) => g.bars.length);
+  const variants = new Map((fig.variants || []).filter((v) => v && typeof v.key === "string").map((v) => [v.key, v]));
+  const isHatched = (b) => (variants.get(b.variant)?.fill ?? (b.variant === "without" ? "hatched" : "solid")) === "hatched";
+  const vLabel = (b) => variants.get(b.variant)?.label || b.variant || "";
+  const okCi = (ci) => Array.isArray(ci) && num(ci[0]) != null && num(ci[1]) != null;
+  const ptsOf = (b) => (Array.isArray(b.points) ? b.points.map((v, i) => ({ v: num(v), i })).filter((p) => p.v != null) : []);
+  const refs = (fig.reference_lines || []).filter((r) => r && num(r.value) != null)
+    .map((r) => ({ ...r, dotted: r.style ? r.style === "dotted" : !r.color_key, color: colors.get(r.color_key) || "var(--ink-3)", text: clip(r.label || "", 22) }));
+  const dom = Array.isArray(fig.domain) && num(fig.domain[0]) != null && num(fig.domain[1]) != null && fig.domain[1] > fig.domain[0]
+    ? fig.domain : domainOf([...groups.flatMap((g) => g.bars.flatMap((b) => [b.value, ...(okCi(b.ci) ? b.ci : []), ...ptsOf(b).map((p) => p.v)])), ...refs.map((r) => r.value)], fig.unit === "rate");
+  const nb = groups.reduce((a, g) => a + g.bars.length, 0);
+
+  const draw = (W) => {
+    const narrow = W < 520, top = 22, plotH = narrow ? 220 : 260, axW = 34;
+    // reference labels sit in a right gutter so they never overlap a bar; on narrow screens they become a key below
+    const gut = narrow || !refs.length ? 8 : Math.min(130, 12 + Math.max(...refs.map((r) => (r.text || fv(r.value)).length)) * 6.2);
+    const x0 = axW, x1 = W - gut, gapU = 0.7, inU = 0.15;
+    const u = (x1 - x0) / (nb + inU * (nb - groups.length) + gapU * groups.length);
+    const bw = Math.min(u, 96), r = bw < 30 ? 3.5 : 5;
+    const y = (v) => top + plotH - ((Math.max(dom[0], Math.min(dom[1], v)) - dom[0]) / (dom[1] - dom[0])) * plotH;
+    const yb = y(Math.max(dom[0], Math.min(dom[1], 0)));
+    // horizontal layout: bar centres and group extents
+    let cur = x0 + (u * gapU) / 2;
+    const lay = groups.map((g) => {
+      const g0 = cur;
+      const cx = g.bars.map((_, j) => { const c = cur + u / 2; cur += u + (j < g.bars.length - 1 ? u * inU : 0); return c; });
+      const g1 = cur; cur += u * gapU;
+      return { g, cx, g0, g1 };
+    });
+    const subChars = Math.max(4, Math.floor((u * (1 + inU * 0.8)) / 5.9)), subs = lay.map((l) => l.g.bars.map((b) => wrapText(b.sublabel, subChars, 3)));
+    const grps = lay.map((l) => wrapText(l.g.label, Math.max(4, Math.floor((l.g1 - l.g0 + u * gapU * 0.8) / 6.9)), 2));
+    const subN = Math.max(0, ...subs.flat().map((x) => x.length)), grpN = Math.max(1, ...grps.map((x) => x.length));
+    const yLab = top + plotH + 8, yGrp = yLab + subN * 13 + 4, yKey = yGrp + grpN * 14 + 8;
+    const H = yKey + (narrow ? refs.length * 16 : 0);
+    const g = s("svg", { width: W, height: H, class: "dotbars" });
+    const defs = s("defs");
+    g.append(defs);
+    const pat = new Map();
+    const patFor = (color) => { if (!pat.has(color)) { const id = `dbp${++patSeq}`; pat.set(color, id); defs.append(hatch(id, color)); } return pat.get(color); };
+
+    for (const t of ticksFor(dom)) {
+      g.append(s("line", { x1: x0, x2: x1, y1: y(t), y2: y(t), class: "grid" }));
+      g.append(s("text", { x: x0 - 6, y: y(t) + 3.5, "text-anchor": "end", class: "tick" }, String(+t.toFixed(3))));
+    }
+    const fore = [];  // drawn after the reference lines: hit areas, whiskers, dots, value labels
+    lay.forEach(({ g: grp, cx }, gi) => {
+      const col = s("g", { class: "db-c", style: `--sc:${grp.color}` });
+      g.append(col);
+      grp.bars.forEach((b, j) => {
+        const v = num(b.value), c = cx[j], ci = okCi(b.ci) ? b.ci : null, pts = ptsOf(b), hat = isHatched(b);
+        if (v != null) {
+          const yv = y(v);
+          col.append(s("rect", { x: c - bw / 2 + (hat ? 0.75 : 0), y: Math.min(yb, yv), width: bw - (hat ? 1.5 : 0), height: Math.max(0.5, Math.abs(yb - yv)), rx: 1.5,
+            class: "db-bar " + (hat ? "hatched" : "solid"), fill: hat ? `url(#${patFor(grp.color)})` : null }));
+        }
+        const hit = s("rect", { x: c - u / 2, y: top, width: u, height: plotH, fill: "transparent" });
+        tip(hit, [`${grp.label || ""} · ${vLabel(b)}${b.sublabel ? " (" + b.sublabel + ")" : ""}`, `value ${fv(v)}${ci ? " · 95% CI " + fci(ci) : ""}`,
+          pts.length ? `${pts.length} point${pts.length === 1 ? "" : "s"}` : null].filter(Boolean).join("\n"));
+        fore.push(hit);
+        if (ci) {
+          const cw = Math.min(16, bw * 0.35);
+          fore.push(s("line", { x1: c, x2: c, y1: y(ci[0]), y2: y(ci[1]), class: "db-whisk" }));
+          for (const e of ci) fore.push(s("line", { x1: c - cw / 2, x2: c + cw / 2, y1: y(e), y2: y(e), class: "db-whisk" }));
+        }
+        // dots spread evenly across the bar in data order (deterministic, so redraws don't move them)
+        const span = Math.max(0, bw - 2 * r - 6);
+        pts.forEach((p, k) => {
+          const dot = s("circle", { cx: c - span / 2 + (pts.length === 1 ? span / 2 : (span * k) / (pts.length - 1)), cy: y(p.v), r, class: "db-dot" });
+          const lab = Array.isArray(b.point_labels) && b.point_labels[p.i] != null ? String(b.point_labels[p.i]) : `#${p.i + 1}`;
+          tip(dot, `${lab}: ${fv(p.v)}\n${grp.label || ""} · ${vLabel(b)}`);
+          fore.push(dot);
+        });
+        const yTop = Math.min(v != null ? y(v) : Infinity, ci ? y(Math.max(...ci)) : Infinity, ...pts.map((p) => y(p.v) - r));
+        if (v != null) fore.push(s("text", { x: c, y: Math.max(11, yTop - 6), "text-anchor": "middle", class: "val db-val" }, fv(v)));
+        subs[gi][j].forEach((line, k) => g.append(s("text", { x: c, y: yLab + 10 + k * 13, "text-anchor": "middle", class: "db-sub" }, line)));
+      });
+      const gx = (lay[gi].g0 + lay[gi].g1) / 2;
+      grps[gi].forEach((line, k) => col.append(s("text", { x: gx, y: yGrp + 11 + k * 14, "text-anchor": "middle", class: "db-grp" }, line)));
+    });
+    g.append(s("line", { x1: x0, x2: x1, y1: yb, y2: yb, class: "zero" }));
+    // reference lines over the bars; gutter labels nudged apart when two lines are close
+    const placed = [];
+    [...refs].sort((a, b) => b.value - a.value).forEach((rf) => {
+      const yr = y(rf.value);
+      g.append(s("line", { x1: x0, x2: x1, y1: yr, y2: yr, class: "db-c db-ref" + (rf.dotted ? " dotted" : ""), style: `--sc:${rf.color}` }));
+      if (!narrow) {
+        let ly = yr + 3.5;
+        for (const p of placed) if (Math.abs(ly - p) < 12) ly = p + 12;
+        placed.push(ly);
+        const t = s("text", { x: W - 2, y: ly, "text-anchor": "end", class: "db-ref-lab" }, rf.text || fv(rf.value));
+        tip(t, `${rf.label || "reference"}: ${fv(rf.value)}`);
+        g.append(t);
+      }
+    });
+    if (narrow) refs.forEach((rf, k) => {
+      const yy = yKey + k * 16 + 8;
+      g.append(s("line", { x1: x0, x2: x0 + 22, y1: yy, y2: yy, class: "db-c db-ref" + (rf.dotted ? " dotted" : ""), style: `--sc:${rf.color}` }),
+        s("text", { x: x0 + 28, y: yy + 4, class: "db-ref-lab" }, `${rf.label || "reference"} · ${fv(rf.value)}`));
+    });
+    g.append(...fore);
+    return g;
+  };
+
+  const used = [...new Set(groups.flatMap((g) => g.bars.map((b) => b.variant)))];
+  const anyPts = groups.some((g) => g.bars.some((b) => ptsOf(b).length)), anyCi = groups.some((g) => g.bars.some((b) => okCi(b.ci)));
+  const legend = h("div", { class: "viz-legend" },
+    used.map((k) => h("span", {}, swatch(isHatched({ variant: k })), variants.get(k)?.label || k || "value")),
+    anyPts || anyCi ? h("span", { class: "muted" }, [anyPts ? "dots: test users" : null, anyCi ? "whiskers: 95% intervals" : null].filter(Boolean).join("; ")) : null);
+  const notes = (fig.notes || []).filter((n) => typeof n === "string" && n.trim());
+  return h("div", { class: "card table-card fig" },
+    h("div", { class: "fig-head" }, h("h3", {}, fig.title || fig.id), fig.unit ? h("span", { class: "muted fig-cap" }, fig.unit) : null),
+    fig.subtitle ? h("div", { class: "muted fig-sub" }, fig.subtitle) : null,
+    legend,
+    nb ? responsive(draw) : h("div", { class: "muted" }, "no bars"),
+    notes.length ? h("ul", { class: "fig-notes" }, notes.map((n) => h("li", {}, n))) : null);
+}
+
 // ---------------------------------------------------------------- page
 const view = { project: null, push: null };
 
@@ -360,18 +516,21 @@ export async function renderResearch(params = {}) {
   const notes = (doc.notes || []).filter((n) => typeof n === "string" && n.trim());
   const notesEl = notes.length ? h("div", { class: "card research-notes" }, h("h3", {}, "Read before quoting any number"), h("ul", {}, notes.map((n) => h("li", {}, n)))) : null;
 
+  const dots = (doc.dotbars || []).filter((f) => f && typeof f === "object");
+  const dotColorMap = dotColors(dots);
   const figs = [
     ...(doc.bars || []).filter((f) => f && typeof f === "object").map(barFigure),
     ...(doc.distributions || []).filter((f) => f && typeof f === "object").map((f) => (Array.isArray(f.point_labels) && f.point_labels.length ? pointFigure(f) : stripFigure(f))),
   ];
-  app.append(
+  app.append(...[
     h("div", { class: "page-head" }, h("h2", {}, "Research"), h("span", { class: "muted" }, project), h("div", { class: "filters" }, projSel, pushSel)),
     meta,
     headlineTable(doc, pushes, cur.id) || h("div", { class: "empty" }, "This push has no headline results."),
+    dots.length ? h("div", { class: "research-dotbars dotbars-sec" }, dots.map((f) => dotbarFigure(f, dotColorMap))) : null,
     notesEl,
     programmes(doc),
     figs.length ? h("div", { class: "research-figs" }, figs) : null,
-  );
+  ].filter(Boolean));
 }
 
 on("results", (m) => {

@@ -1,5 +1,5 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate } from "./core.js?v=1.5.3";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate } from "./core.js?v=1.6.0";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
