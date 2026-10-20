@@ -336,12 +336,14 @@ function dotColors(figs) {
     if (typeof k === "string" && !map.has(k)) map.set(k, `var(${SERIES[i++ % SERIES.length]})`);
   return map;
 }
-// Greedy word wrap into at most `lines` lines of ~`chars` characters; the last line is cut with an ellipsis.
+// Greedy word wrap (also breaking after hyphens) into at most `lines` lines of ~`chars` characters;
+// the last line is cut with an ellipsis.
 function wrapText(t, chars, lines) {
   const out = [];
   let cur = "";
-  for (const w of String(t ?? "").split(/\s+/).filter(Boolean)) {
-    if (!cur) cur = w; else if ((cur + " " + w).length <= chars) cur += " " + w; else { out.push(cur); cur = w; }
+  for (const w of String(t ?? "").split(/\s+/).filter(Boolean).flatMap((w) => w.split(/(?<=-)(?=.)/).map((p, i) => (i ? "\u0000" : "") + p))) {
+    const join = w.startsWith("\u0000"), p = join ? w.slice(1) : w, sep = join ? "" : " ";
+    if (!cur) cur = p; else if ((cur + sep + p).length <= chars) cur += sep + p; else { out.push(cur); cur = p; }
   }
   if (cur) out.push(cur);
   if (out.length > lines) out.splice(lines - 1, out.length, out.slice(lines - 1).join(" "));
@@ -367,7 +369,7 @@ function dotbarFigure(fig, colors) {
   const okCi = (ci) => Array.isArray(ci) && num(ci[0]) != null && num(ci[1]) != null;
   const ptsOf = (b) => (Array.isArray(b.points) ? b.points.map((v, i) => ({ v: num(v), i })).filter((p) => p.v != null) : []);
   const refs = (fig.reference_lines || []).filter((r) => r && num(r.value) != null)
-    .map((r) => ({ ...r, dotted: r.style ? r.style === "dotted" : !r.color_key, color: colors.get(r.color_key) || "var(--ink-3)", text: clip(r.label || "", 22) }));
+    .map((r) => ({ ...r, dotted: r.style ? r.style === "dotted" : !r.color_key, color: colors.get(r.color_key) || "var(--ink-3)", lines: wrapText(r.label || fv(r.value), 19, 2) }));
   const dom = Array.isArray(fig.domain) && num(fig.domain[0]) != null && num(fig.domain[1]) != null && fig.domain[1] > fig.domain[0]
     ? fig.domain : domainOf([...groups.flatMap((g) => g.bars.flatMap((b) => [b.value, ...(okCi(b.ci) ? b.ci : []), ...ptsOf(b).map((p) => p.v)])), ...refs.map((r) => r.value)], fig.unit === "rate");
   const nb = groups.reduce((a, g) => a + g.bars.length, 0);
@@ -375,10 +377,10 @@ function dotbarFigure(fig, colors) {
   const draw = (W) => {
     const narrow = W < 520, top = 22, plotH = narrow ? 220 : 260, axW = 34;
     // reference labels sit in a right gutter so they never overlap a bar; on narrow screens they become a key below
-    const gut = narrow || !refs.length ? 8 : Math.min(130, 12 + Math.max(...refs.map((r) => (r.text || fv(r.value)).length)) * 6.2);
+    const gut = narrow || !refs.length ? 8 : Math.min(130, 12 + Math.max(...refs.flatMap((r) => r.lines.map((l) => l.length))) * 6.2);
     const x0 = axW, x1 = W - gut, gapU = 0.7, inU = 0.15;
     const u = (x1 - x0) / (nb + inU * (nb - groups.length) + gapU * groups.length);
-    const bw = Math.min(u, 96), r = bw < 30 ? 3.5 : 5;
+    const bw = Math.min(u, 96);
     const y = (v) => top + plotH - ((Math.max(dom[0], Math.min(dom[1], v)) - dom[0]) / (dom[1] - dom[0])) * plotH;
     const yb = y(Math.max(dom[0], Math.min(dom[1], 0)));
     // horizontal layout: bar centres and group extents
@@ -389,8 +391,9 @@ function dotbarFigure(fig, colors) {
       const g1 = cur; cur += u * gapU;
       return { g, cx, g0, g1 };
     });
-    const subChars = Math.max(4, Math.floor((u * (1 + inU * 0.8)) / 5.9)), subs = lay.map((l) => l.g.bars.map((b) => wrapText(b.sublabel, subChars, 3)));
-    const grps = lay.map((l) => wrapText(l.g.label, Math.max(4, Math.floor((l.g1 - l.g0 + u * gapU * 0.8) / 6.9)), 2));
+    // a single-bar group's labels may use the gap around it; bars in a pair only the gap between them
+    const subs = lay.map((l) => l.g.bars.map((b) => wrapText(b.sublabel, Math.max(4, Math.floor((u * (1 + (l.g.bars.length === 1 ? gapU * 0.9 : inU * 0.8))) / 5.9)), 3)));
+    const grps = lay.map((l) => wrapText(l.g.label, Math.max(4, Math.floor((l.g1 - l.g0 + u * gapU * 0.9) / 6.6)), 3));
     const subN = Math.max(0, ...subs.flat().map((x) => x.length)), grpN = Math.max(1, ...grps.map((x) => x.length));
     const yLab = top + plotH + 8, yGrp = yLab + subN * 13 + 4, yKey = yGrp + grpN * 14 + 8;
     const H = yKey + (narrow ? refs.length * 16 : 0);
@@ -410,6 +413,7 @@ function dotbarFigure(fig, colors) {
       g.append(col);
       grp.bars.forEach((b, j) => {
         const v = num(b.value), c = cx[j], ci = okCi(b.ci) ? b.ci : null, pts = ptsOf(b), hat = isHatched(b);
+        const r = bw < 30 || pts.length > 30 ? 3.5 : 5;
         if (v != null) {
           const yv = y(v);
           col.append(s("rect", { x: c - bw / 2 + (hat ? 0.75 : 0), y: Math.min(yb, yv), width: bw - (hat ? 1.5 : 0), height: Math.max(0.5, Math.abs(yb - yv)), rx: 1.5,
@@ -446,10 +450,12 @@ function dotbarFigure(fig, colors) {
       const yr = y(rf.value);
       g.append(s("line", { x1: x0, x2: x1, y1: yr, y2: yr, class: "db-c db-ref" + (rf.dotted ? " dotted" : ""), style: `--sc:${rf.color}` }));
       if (!narrow) {
+        // nudge down past labels already placed (each occupies [y, y + 12 * lines))
         let ly = yr + 3.5;
-        for (const p of placed) if (Math.abs(ly - p) < 12) ly = p + 12;
-        placed.push(ly);
-        const t = s("text", { x: W - 2, y: ly, "text-anchor": "end", class: "db-ref-lab" }, rf.text || fv(rf.value));
+        for (const p of placed) if (ly < p.end && ly + 12 * rf.lines.length > p.start - 12) ly = p.end;
+        placed.push({ start: ly, end: ly + 12 * rf.lines.length });
+        const t = s("text", { x: W - 2, y: ly, "text-anchor": "end", class: "db-ref-lab" },
+          rf.lines.map((l, k) => s("tspan", { x: W - 2, dy: k ? 12 : 0 }, l)));
         tip(t, `${rf.label || "reference"}: ${fv(rf.value)}`);
         g.append(t);
       }
