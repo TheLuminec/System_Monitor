@@ -100,6 +100,7 @@ def _claude_summary(c: Optional[dict]) -> Optional[dict]:
             "sessions": len(sessions), "active": sum(1 for x in sessions if x.get("active")),
             "agents_live": sum(1 for x in agents if x.get("live")) if isinstance(agents, list) else None,
             "actions": "agent_actions" in (c.get("features") or []),
+            "bin_source": c.get("bin_source"), "home": c.get("home"),
             "processes": len(c.get("processes") or []), "running_job": c.get("running_job")}
 
 

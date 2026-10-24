@@ -71,7 +71,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.5.1"
+AGENT_VERSION = "1.6.0"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -933,7 +933,7 @@ class ClaudeRunner:
             known = [os.path.join(home, ".local", "bin", "claude.exe"), os.path.join(os.environ.get("APPDATA", ""), "npm", "claude.cmd"),
                      os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "claude", "claude.exe")] + known
         candidates = []
-        for c in found + known:
+        for c in found + known + self._desktop_bundles():   # a real CLI install wins over Claude Desktop's bundled copy
             if c and os.path.isfile(c) and os.access(c, os.X_OK) and os.path.realpath(c) not in {os.path.realpath(x) for x in candidates}:
                 candidates.append(c)
         for c in candidates:
@@ -942,6 +942,34 @@ class ClaudeRunner:
                 return c
             log.info("claude at %s does not run (--version failed); trying the next one", c)
         return candidates[0] if candidates else None
+
+    @staticmethod
+    def _desktop_bundles() -> List[str]:
+        """Claude Desktop (Windows) ships Claude Code as %APPDATA%\\Claude\\claude-code\\<version>\\<hash>\\claude.exe and
+        keeps a couple of versions; newest first. The path changes with every Desktop update, so it is never cached."""
+        root = os.path.join(os.environ.get("APPDATA", ""), "Claude", "claude-code") if IS_WINDOWS else ""
+        out: List[Tuple[Tuple[int, ...], str]] = []
+        try:
+            for ver in os.listdir(root) if root and os.path.isdir(root) else []:
+                vdir = os.path.join(root, ver)
+                key = tuple(int(x) for x in re.findall(r"\d+", ver)[:4])
+                for sub in [vdir] + [os.path.join(vdir, d) for d in os.listdir(vdir) if os.path.isdir(os.path.join(vdir, d))]:
+                    exe = os.path.join(sub, "claude.exe")
+                    if os.path.isfile(exe):
+                        out.append((key, exe))
+        except OSError:
+            pass
+        return [exe for _, exe in sorted(out, reverse=True)]
+
+    def _is_desktop_bundle(self, path: Optional[str]) -> bool:
+        root = os.path.join(os.environ.get("APPDATA", ""), "Claude", "claude-code")
+        return bool(IS_WINDOWS and path and os.path.normcase(os.path.abspath(path)).startswith(os.path.normcase(os.path.abspath(root)) + os.sep))
+
+    def _ensure_bin(self) -> None:
+        """Desktop updates delete old bundled versions: find the current one again when ours disappears."""
+        if self.bin and not os.path.isfile(self.bin) and not self.cfg["AVM_CLAUDE_BIN"]:
+            log.info("claude at %s is gone (Claude Desktop updated?); looking again", self.bin)
+            self.bin, self.version, self._version_checked = self._find_claude(), None, 0.0
 
     # ---- discovery
     def check_version(self) -> Optional[str]:
@@ -1068,6 +1096,7 @@ class ClaudeRunner:
         """Claude Code's own session list (`claude agents --json --all`): background agents including stopped ones,
         plus live interactive sessions. Subagents never appear there, so it stays small however busy a session is.
         Refreshed in a background thread every AGENTS_REFRESH_SEC; returns the last good list."""
+        self._ensure_bin()
         if self.bin and not self._agents_busy and time.monotonic() - self._agents_at > self.AGENTS_REFRESH_SEC:
             self._agents_busy = True
             threading.Thread(target=self._refresh_agents, daemon=True, name="claude-agents").start()
@@ -1113,6 +1142,13 @@ class ClaudeRunner:
             a = {"key": key, "session_id": sid, "kind": s.get("kind") or "", "name": (s.get("name") or "")[:120],
                  "cwd": s.get("cwd") or "", "live": bool(s.get("pid")), "pid": s.get("pid"), "state": s.get("state"),
                  "status": s.get("status"), "started": (s["startedAt"] / 1000.0) if isinstance(s.get("startedAt"), (int, float)) else None}
+            if s.get("pid") and a["kind"] != "background":   # Claude Desktop's Code sessions: entrypoint is in ~/.claude/sessions/<pid>.json
+                try:
+                    with open(os.path.join(self.home, ".claude", "sessions", "%d.json" % int(s["pid"])), encoding="utf-8") as f:
+                        if json.load(f).get("entrypoint") == "claude-desktop":
+                            a["kind"] = "desktop"
+                except (OSError, ValueError, TypeError):
+                    pass
             hint = None
             if s.get("id"):  # background job state: a one-line "what I'm doing" plus the transcript path
                 try:
@@ -1179,6 +1215,7 @@ class ClaudeRunner:
         return {"available": bool(self.bin), "bin": self.bin, "version": self.check_version(), "user": _whoami(), "home": self.home,
                 "sessions": _safe(self.sessions, default=[]), "processes": _safe(self.processes, default=[]),
                 "agents": _safe(self.agents, default=[]), "features": self.FEATURES,
+                "bin_source": "desktop" if self._is_desktop_bundle(self.bin) else ("cli" if self.bin else None),
                 "running_job": running, "queued_jobs": queued}
 
     # ---- job execution
@@ -1346,7 +1383,9 @@ class ClaudeRunner:
         key, sid, cwd = t.get("key") or "", t.get("session_id") or "", t.get("cwd") or None
         self._post("/claude/jobs/%d/start" % jid, {})
         new_key = None
-        if action == "stop":
+        if t.get("kind") == "desktop":   # the hub refuses these too; belt and braces for a job queued before that
+            ok, out = False, "Claude Desktop sessions belong to the Desktop app: reopen or close them there."
+        elif action == "stop":
             rc, out = self._claude(["stop", key], timeout=60)
             ok = rc == 0
         elif action == "restart":

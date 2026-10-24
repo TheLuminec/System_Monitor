@@ -1,5 +1,5 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate } from "./core.js?v=1.7.0";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate } from "./core.js?v=1.8.0";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
@@ -166,8 +166,13 @@ function trackedState(t, host) {
   if (host?.status !== "online") return { cls: "never", label: `host ${host?.status || "unknown"}`, why: "status as of the host's last report" };
   if (t.live) return t.status === "busy" || t.state === "working" ? { cls: "busy", label: "working" } : t.state === "blocked" ? { cls: "warn", label: "waiting for input" } : { cls: "online", label: "idle" };
   if (t.state === "working") return { cls: "bad", label: "stopped mid-task" };
-  return { cls: "never", label: t.state === "ended" ? "ended" : "stopped" };
+  return { cls: "never", label: t.kind === "desktop" ? "closed" : t.state === "ended" ? "ended" : "stopped" };
 }
+const KIND_LABEL = { background: "background", interactive: "interactive", desktop: "Claude Desktop" };
+// A Windows agent installed as SYSTEM looks in SYSTEM's profile and can't see the user's Claude sessions.
+const agentIsSystem = (c) => !!c && (/\$$/.test(c.user || "") || /systemprofile/i.test(c.home || ""));
+// Only Claude Desktop's bundled Claude Code here: it can list sessions but gets its login from the app, so no prompts.
+const desktopOnly = (c) => c?.bin_source === "desktop";
 async function trackSession(host, a) {
   try {
     await post("/api/v1/claude/tracked", { host, key: a.key, session_id: a.session_id || null, name: a.name || null, cwd: a.cwd || null, kind: a.kind || null });
@@ -207,7 +212,7 @@ function renderAgentHosts() {
     const trkDown = host.status === "online" ? trk.filter((t) => !t.live && t.state === "working").length : 0;
     const card = h("div", { class: "card agent-host" + (host.name === v.host ? " sel" : ""), onclick: () => navigate("#/agents/" + encodeURIComponent(host.name)) },
       h("div", { class: "row" }, h("span", { class: "status-dot " + host.status }), h("span", { class: "name" }, host.display_name),
-        h("span", { class: "muted" }, c ? (c.available ? `claude ${c.version || ""}` : "no claude cli") : (host.status === "online" ? "agent < 1.3" : host.status))),
+        h("span", { class: "muted" }, c ? (c.available ? `claude ${c.version || ""}${desktopOnly(c) ? " (Desktop)" : ""}` : agentIsSystem(c) ? "agent runs as SYSTEM" : "no claude cli") : (host.status === "online" ? "agent < 1.3" : host.status))),
       h("div", { class: "row", style: "font-size:12px;color:var(--ink-2);gap:12px" },
         trk.length ? h("span", { title: "tracked sessions · running now" }, `${trk.length} tracked · ${trkLive} running`) : null,
         trkDown ? h("span", { style: "color:var(--s-crit)" }, `${trkDown} stopped mid-task`) : null,
@@ -266,7 +271,14 @@ async function renderConsole() {
   sendBtn.onclick = send;
   ta.onkeydown = (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } };
   const avail = !c ? h("div", { class: "muted", style: "font-size:12.5px" }, host.status === "online" ? "This host's agent predates Claude support (needs 1.3). It updates itself on its next report once the hub is upgraded." : `Host is ${host.status}; prompts queue until it reports.`)
-    : !c.available ? h("div", { class: "chip bad" }, "claude CLI not found on this host") : null;
+    : agentIsSystem(c) ? h("div", { class: "chip warn", style: "white-space:normal", title: "From an admin PowerShell in the agent folder" },
+        "The agent runs as SYSTEM, so it can't see your Claude sessions. Reinstall it as you: install-windows.ps1 -Upgrade -AsCurrentUser")
+    : !c.available ? h("div", { class: "chip bad" }, "claude CLI not found on this host")
+    : desktopOnly(c) ? h("div", { class: "chip", style: "white-space:normal" }, "Claude Desktop only: sessions are listed and trackable; prompting needs the Claude Code CLI") : null;
+  if (desktopOnly(c) || agentIsSystem(c)) {   // the hub would refuse these prompts anyway
+    for (const el of [ta, sendBtn, mode, resume, cwd, model]) el.disabled = true;
+    ta.placeholder = desktopOnly(c) ? `Prompting ${host.display_name} needs the Claude Code CLI installed there (Claude Desktop's built-in copy only runs inside the app).` : ta.placeholder;
+  }
   const continueIn = (sid, dir) => { resume.value = sid; if (dir) cwd.value = dir; ta.focus(); toast("Next prompt continues this session"); };
 
   // ---- tracked sessions (registered; kept when stopped or the host is offline)
@@ -282,15 +294,18 @@ async function renderConsole() {
     const btn = (label, cls, onclick, extra = {}) => h("button", { class: "btn small " + cls, onclick, ...extra }, label);
     const actions = [];
     if (pend) actions.push(h("span", { class: "chip warn" }, `${pend.action} ${pend.status === "queued" ? (host.status === "online" ? "queued…" : "queued until the host is back") : "running…"}`));
-    else if (!t.live || host.status !== "online") {
+    else if (t.kind === "desktop") {   // owned by the Desktop app: nothing to restart or prompt from here
+      if (!t.live) actions.push(h("span", { class: "muted", style: "font-size:12px" }, "reopen it in Claude Desktop"));
+      if (!t.live && t.session_id && !desktopOnly(c)) actions.push(btn("Prompt it", "", () => continueIn(t.session_id, t.cwd), { title: "continue this conversation with the Claude Code CLI on this host (claude -p --resume)" }));
+    } else if (!t.live || host.status !== "online") {
       actions.push(btn("Restart", "primary", () => trackedAction(t, "restart"), canAct ? { title: t.kind === "background" ? "claude respawn: same agent, same conversation" : "resume as a background agent" }
         : { disabled: "", title: host.status === "online" ? "needs agent 1.5 on this host" : "host offline" }));
-      if (t.session_id) actions.push(btn("Prompt it", "", () => continueIn(t.session_id, t.cwd), { title: "send one prompt that continues this conversation (claude -p --resume)" }));
+      if (t.session_id && !desktopOnly(c)) actions.push(btn("Prompt it", "", () => continueIn(t.session_id, t.cwd), { title: "send one prompt that continues this conversation (claude -p --resume)" }));
     } else if (t.kind === "background") actions.push(btn("Stop", "danger", () => { if (confirm(`Stop ${t.name || t.key}?`)) trackedAction(t, "stop"); }, canAct ? {} : { disabled: "", title: "needs agent 1.5 on this host" }));
     actions.push(btn("Untrack", "", async () => { if (!confirm(`Stop tracking ${t.name || t.key}? (The session itself is not touched.)`)) return; try { await post(`/api/v1/claude/tracked/${t.id}`, undefined, "DELETE"); } catch (e) { toast(e.message, true); } }, { style: "margin-left:auto" }));
     tbox.append(h("div", { class: "session tracked" },
       h("div", { class: "t" }, h("span", { class: "trk-dot " + st.cls, title: st.why || "" }), h("b", {}, t.name || t.key.slice(0, 8)),
-        h("span", { class: "chip trk " + st.cls }, st.label), t.kind ? h("span", { class: "muted", style: "font-size:11px" }, t.kind) : null,
+        h("span", { class: "chip trk " + st.cls }, st.label), t.kind ? h("span", { class: "muted", style: "font-size:11px" }, KIND_LABEL[t.kind] || t.kind) : null,
         h("span", { class: "muted", style: "margin-left:auto;white-space:nowrap", title: t.last_live ? "last seen running " + fmt.when(t.last_live) : "" }, ago)),
       t.detail ? h("div", { class: "snip" }, h("b", {}, "doing: "), t.detail) : null,
       t.last_said ? h("div", { class: "snip" }, h("b", {}, "last said: "), t.last_said) : null,
@@ -314,7 +329,7 @@ async function renderConsole() {
     for (const a of others) {
       box.append(h("div", { class: "session compact" },
         h("div", { class: "t" }, h("span", { class: "trk-dot " + (a.live ? (a.status === "busy" ? "busy" : "online") : "never") }), h("b", {}, a.name || a.key.slice(0, 8)),
-          h("span", { class: "muted", style: "font-size:11px" }, `${a.kind || ""}${a.live ? "" : " · stopped"}${a.state && a.state !== "done" ? " · " + a.state : ""}`),
+          h("span", { class: "muted", style: "font-size:11px" }, `${KIND_LABEL[a.kind] || a.kind || ""}${a.live ? "" : (a.kind === "desktop" ? " · closed" : " · stopped")}${a.state && a.state !== "done" ? " · " + a.state : ""}`),
           h("span", { class: "muted", style: "margin-left:auto;white-space:nowrap" }, a.last_activity ? fmt.ago(Date.now() / 1000 - a.last_activity) : ""),
           h("button", { class: "btn small", onclick: () => trackSession(host.name, a) }, "Track")),
         a.detail || a.last_said ? h("div", { class: "snip" }, a.detail || a.last_said) : null));

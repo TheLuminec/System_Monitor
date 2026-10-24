@@ -47,7 +47,7 @@ import urllib.request
 from collections import deque
 from typing import Any, Dict, List, Optional
 
-AVM_VERSION = "1.5.0"
+AVM_VERSION = "1.6.0"
 IS_WINDOWS = sys.platform.startswith("win")
 
 
@@ -309,7 +309,7 @@ def _this_session() -> Dict[str, Any]:
     if job_dir:
         info.update(key=os.path.basename(job_dir.rstrip("/\\")), kind="background")
     elif sid:
-        info.update(key=sid, kind="interactive")
+        info.update(key=sid, kind="desktop" if os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "claude-desktop" else "interactive")
     pid = os.environ.get("CLAUDE_PID")
     if pid:  # Claude Code's own record of this session carries its display name and start directory
         try:

@@ -7,6 +7,8 @@
   Set-ExecutionPolicy -Scope Process Bypass
   .\install\install-windows.ps1 -Server http://avalon:8787 -Token avm_xxx [-Name desktop-c] [-Interval 5]
   .\install\install-windows.ps1 -Server ... -Token ... -AsCurrentUser   # run as you at logon, so Claude prompts work
+  .\install\install-windows.ps1 -Upgrade -AsCurrentUser                 # switch an existing SYSTEM install to run as you
+      (needed for the Agents page to see your Claude Code / Claude Desktop sessions; starts at logon instead of boot)
 
   .\install\install-windows.ps1 -Uninstall
 
@@ -89,7 +91,12 @@ $avmCmd = Join-Path $AppDir "avm.cmd"
 Set-Content -Path $avmCmd -Value "@echo off`r`nset AVM_CONFIG=$conf`r`n`"$vpy`" `"$AppDir\avm.py`" %*" -Encoding ASCII
 $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
 if ($machinePath -notlike "*$AppDir*") { [Environment]::SetEnvironmentVariable("Path", "$machinePath;$AppDir", "Machine"); Write-Host "==> added $AppDir to the system PATH (open a new terminal to use 'avm')" }
-if ($AsCurrentUser) { icacls $conf /grant:r "$($env:USERNAME):R" | Out-Null }
+if ($AsCurrentUser) {
+  icacls $conf /grant:r "$($env:USERNAME):R" | Out-Null
+  # The agent replaces its own script on self-update; running as you, it needs write access to its folder.
+  # (agent.conf keeps its own explicit ACL - inheritance was removed from it - so the token stays read-only.)
+  icacls $AppDir /grant "$($env:USERNAME):(OI)(CI)M" | Out-Null
+}
 
 Write-Host "==> registering scheduled task $TaskName"
 $action = New-ScheduledTaskAction -Execute $vpyw -Argument "`"$AppDir\avalon_agent.py`" --config `"$conf`"" -WorkingDirectory $AppDir

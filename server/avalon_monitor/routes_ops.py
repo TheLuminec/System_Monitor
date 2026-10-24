@@ -229,6 +229,10 @@ async def job_create(body: JobCreate, request: Request, ident: Identity = Depend
     h = await run_in_threadpool(db.host_by_name, body.host)
     if not h:
         raise HTTPException(404, "no such host")
+    if ((h.last_sample or {}).get("claude") or {}).get("bin_source") == "desktop":
+        # Claude Desktop's bundled CLI gets its login from the app; started by the agent it fails with "OAuth session expired".
+        raise HTTPException(422, f"{h.name} only has Claude Desktop's built-in Claude Code, which can't run prompts outside the app. "
+                                 "Install the Claude Code CLI there (and log in once) to prompt it from the dashboard.")
     j = await run_in_threadpool(db.job_create, h.id, body.prompt, body.cwd, body.mode, body.model, body.resume_session, ident.subject)
     log.info("%s queued claude job #%d on %s (mode=%s)", ident.subject, j["id"], h.name, body.mode)
     await hub.broadcast({"type": "claude_job", "job": job_public(j)})
@@ -325,7 +329,7 @@ class TrackAdd(BaseModel):
     session_id: Optional[str] = Field(default=None, pattern=KEY_RE)
     name: Optional[str] = Field(default=None, max_length=120)
     cwd: Optional[str] = Field(default=None, max_length=500)
-    kind: Optional[str] = Field(default=None, pattern=r"^(background|interactive)$")
+    kind: Optional[str] = Field(default=None, pattern=r"^(background|interactive|desktop)$")
     note: Optional[str] = Field(default=None, max_length=300)
 
 
@@ -377,6 +381,8 @@ async def tracked_action(tid: int, body: TrackAction, request: Request, ident: I
     t = await run_in_threadpool(db.tracked_get, tid)
     if not t:
         raise HTTPException(404, "not tracked")
+    if t["kind"] == "desktop":
+        raise HTTPException(422, "Claude Desktop sessions belong to the Desktop app: reopen or close them there.")
     label = t["name"] or t["key"][:8]
     target = {"key": t["key"], "session_id": t["session_id"], "kind": t["kind"], "name": t["name"], "cwd": t["cwd"]}
     prompt = body.prompt or "You were restarted from the Avalon Monitor dashboard. Re-read your recent context and pick up where you left off."
