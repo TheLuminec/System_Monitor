@@ -16,9 +16,11 @@ RestartSec=5
 # Exit 2 = bad/missing config: retrying cannot help.
 RestartPreventExitStatus=2
 Nice=10
-# Runs as root so it can read all disks/sensors/process names; it never writes anything.
+# Runs as root so it can read all disks/sensors/process names; it writes nothing but its own script on self-update.
 NoNewPrivileges=true
 ProtectSystem=strict
+# ProtectSystem=strict makes /opt read-only; self-update must replace avalon_agent.py/avm.py here (Fishseus failed with EROFS).
+ReadWritePaths=/opt/avalon-agent
 ProtectHome=read-only
 PrivateTmp=true
 

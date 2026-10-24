@@ -104,7 +104,7 @@ mkdir -p "$UNIT_DIR"
 sed -e "s|/opt/avalon-agent|$APP_DIR|g" -e "s|/etc/avalon-agent|$ETC_DIR|g" \
   "$SRC_DIR/install/avalon-agent.service" > "$UNIT_DIR/avalon-agent.service"
 if [[ $USER_MODE -eq 1 ]]; then
-  sed -i -e '/^ProtectHome=/d' -e '/^ProtectSystem=/d' -e '/^PrivateTmp=/d' -e '/^# Runs as root/d' \
+  sed -i -e '/^ProtectHome=/d' -e '/^ProtectSystem=/d' -e '/^ReadWritePaths=/d' -e '/^# ProtectSystem=strict makes/d' -e '/^PrivateTmp=/d' -e '/^# Runs as root/d' \
          -e 's/^WantedBy=multi-user.target/WantedBy=default.target/' "$UNIT_DIR/avalon-agent.service"
 fi
 if [[ "${AVM_SKIP_SYSTEMD:-0}" != "1" ]]; then
