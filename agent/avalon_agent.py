@@ -71,7 +71,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.5.0"
+AGENT_VERSION = "1.5.1"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -921,22 +921,27 @@ class ClaudeRunner:
         self._agents_busy = False
 
     def _find_claude(self) -> Optional[str]:
-        """PATH first; then the usual install locations (service units often run with a minimal PATH)."""
-        for name in (("claude.cmd", "claude.exe", "claude") if IS_WINDOWS else ("claude",)):
-            p = shutil.which(name)
-            if p:
-                return p
+        """The first `claude` that actually runs: PATH hits, then the usual install locations (service units often run
+        with a minimal PATH). Each is probed with --version, because a stale global npm shim can sit earlier on PATH
+        and only print "native binary not installed" (seen on AVALON: /usr/bin/claude)."""
         home = self.home
-        candidates = [os.path.join(home, ".local", "bin", "claude"), os.path.join(home, ".claude", "local", "claude"),
-                      os.path.join(home, ".npm-global", "bin", "claude"), "/usr/local/bin/claude", "/opt/homebrew/bin/claude",
-                      os.path.join(home, ".volta", "bin", "claude"), os.path.join(home, ".nvm", "current", "bin", "claude")]
+        found = [shutil.which(n) for n in (("claude.cmd", "claude.exe", "claude") if IS_WINDOWS else ("claude",))]
+        known = [os.path.join(home, ".local", "bin", "claude"), os.path.join(home, ".claude", "local", "claude"),
+                 os.path.join(home, ".npm-global", "bin", "claude"), "/usr/local/bin/claude", "/opt/homebrew/bin/claude",
+                 os.path.join(home, ".volta", "bin", "claude"), os.path.join(home, ".nvm", "current", "bin", "claude")]
         if IS_WINDOWS:
-            candidates = [os.path.join(home, ".local", "bin", "claude.exe"), os.path.join(os.environ.get("APPDATA", ""), "npm", "claude.cmd"),
-                          os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "claude", "claude.exe")] + candidates
+            known = [os.path.join(home, ".local", "bin", "claude.exe"), os.path.join(os.environ.get("APPDATA", ""), "npm", "claude.cmd"),
+                     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "claude", "claude.exe")] + known
+        candidates = []
+        for c in found + known:
+            if c and os.path.isfile(c) and os.access(c, os.X_OK) and os.path.realpath(c) not in {os.path.realpath(x) for x in candidates}:
+                candidates.append(c)
         for c in candidates:
-            if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            out = _run([c, "--version"], timeout=15)
+            if out and out.strip()[:1].isdigit():   # "2.1.310 (Claude Code)"
                 return c
-        return None
+            log.info("claude at %s does not run (--version failed); trying the next one", c)
+        return candidates[0] if candidates else None
 
     # ---- discovery
     def check_version(self) -> Optional[str]:
