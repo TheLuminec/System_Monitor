@@ -36,11 +36,23 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
   throw "Run this from an elevated (Administrator) PowerShell."
 }
 
+# Every running copy of the agent from this install, whoever owns it. A self-update respawn runs outside the scheduled
+# task, so stopping the task alone misses it: a leftover SYSTEM copy then kept reporting next to a new per-user one.
+function Stop-AgentProcesses {
+  Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
+    Where-Object { $_.CommandLine -and $_.CommandLine -like "*$AppDir*avalon_agent.py*" } |
+    ForEach-Object {
+      Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+      Write-Host "==> stopped running agent process $($_.ProcessId)"
+    }
+}
+
 if ($Uninstall) {
   if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
   }
+  Stop-AgentProcesses
   if (Test-Path $AppDir) { Remove-Item -Recurse -Force $AppDir }
   Write-Host "Avalon agent removed."
   return
@@ -116,6 +128,7 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
   Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "Avalon Monitor agent" | Out-Null
 }
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Stop-AgentProcesses   # including self-update respawns the task no longer owns (e.g. the old SYSTEM agent when switching to -AsCurrentUser)
 Start-ScheduledTask -TaskName $TaskName
 Start-Sleep -Seconds 2
 Write-Host ("Task state: " + (Get-ScheduledTask -TaskName $TaskName).State)

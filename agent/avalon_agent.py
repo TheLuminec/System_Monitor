@@ -71,7 +71,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.6.0"
+AGENT_VERSION = "1.6.1"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -233,6 +233,8 @@ def host_info(cfg: Dict[str, str]) -> Dict[str, Any]:
             "kernel": platform.release(),
             "boot_time": boot,
             "agent_version": AGENT_VERSION,
+            "agent_pid": os.getpid(),       # lets the hub notice two agents reporting under one token
+            "agent_user": _whoami(),
             "cpu_model": _cpu_model(),
             "cpu_count": psutil.cpu_count(logical=True),
             "cpu_count_physical": psutil.cpu_count(logical=False),
