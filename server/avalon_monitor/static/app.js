@@ -1,9 +1,9 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.8.2";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.9.0";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
-         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct } from "./core.js?v=1.8.2";
-import { renderResearch } from "./research.js?v=1.8.2";
-import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.8.2";
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct } from "./core.js?v=1.9.0";
+import { renderResearch } from "./research.js?v=1.9.0";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.9.0";
 
 // ------------------------------------------------------------------ shell
 const NAV = [
@@ -189,6 +189,11 @@ function updateCard(card, host) {
   for (const x of failed.slice(0, 3)) checks.append(h("span", { class: "chip " + (x.status === "failed" ? "bad" : "warn"), title: (x.note ? x.note + " · " : "") + "click to open (acknowledges the alert)", onclick: (e) => { e.stopPropagation(); ackTasks([x.id]); navigate(`#/tasks?open=${x.id}`); } }, `task ${x.status}: ${x.name}`));
   if (host.agent_update_error) checks.append(h("span", { class: "chip bad", title: host.agent_update_error }, "agent update failed"));
   else if (host.agent_outdated && host.status === "online") checks.append(h("span", { class: "chip warn", title: `running agent ${host.agent_version || "?"}; the hub serves a newer script and the agent updates itself on its next report` }, "agent updating"));
+  const hostTasks = [...state.tasks.values()].filter((x) => x.host === host.name);
+  const gpuHolder = hostTasks.find((x) => x.status === "running" && x.meta?.resources?.gpu === "exclusive");
+  const queuedHere = hostTasks.filter((x) => x.status === "queued").length;
+  if (gpuHolder) checks.append(h("span", { class: "chip gpu-hold", title: "exclusive GPU job (avm run --exclusive)", onclick: (e) => { e.stopPropagation(); navigate(`#/tasks?open=${gpuHolder.id}`); } }, `GPU: ${gpuHolder.name}`));
+  if (queuedHere) checks.append(h("span", { class: "chip warn", title: "jobs waiting in this host's avm queue", onclick: (e) => { e.stopPropagation(); navigate(`#/tasks?host=${encodeURIComponent(host.name)}&status=queued`); } }, `${queuedHere} queued`));
   if (s.memory?.committed != null && s.memory?.commit_limit) {
     const cp = (100 * s.memory.committed) / s.memory.commit_limit;
     if (cp >= commitWarnPct(host)) checks.append(h("span", { class: "chip warn", title: `committed ${fmt.bytes(s.memory.committed)} of ${fmt.bytes(s.memory.commit_limit)} limit (warns at ${commitWarnPct(host)}%; set AVM_COMMIT_WARN_PCT in the host settings)` }, `commit ${Math.round(cp)}%`));

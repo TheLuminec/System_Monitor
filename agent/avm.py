@@ -25,6 +25,22 @@ One command when you set something off:
         stays listed (and can be restarted) even after it stops or the machine goes offline.
     avm agent untrack            (from inside the session)    avm agent list
 
+Resources and the wait queue (host-local; opt-in - plain `avm run` behaves exactly as before):
+
+    avm run "nymeria b4020" --gpu --exclusive --mem 19G --wait [--max-wait 8h] -- python train.py
+        --gpu / --exclusive  uses the GPU / is a heavy GPU job (one exclusive job at a time; light ones may share)
+        --mem 19G, --vram 6G what the job expects to use (admission counts it while the job is starting up)
+        --wait               queue until it fits: first come first served among jobs competing for the same thing,
+                             admitted on MEASURED free memory/VRAM (never RSS) minus declared start-up reservations
+        --max-wait 8h        give up loudly (task failed, exit 124) instead of waiting forever
+      Tags without --wait just declare (shown on the dashboard, counted by queued jobs). A job that can never fit is
+      rejected at submit (exit 2). Exit code and output of the command are passed through untouched. Nested
+      `avm run --wait` inside a running queued job inherits its reservation instead of queueing behind it.
+      The child gets AVM_TASK_ID, AVM_STARTED_AT and (in a git checkout) AVM_CODE_SHA, recorded at start, not queue time.
+    avm queue status [--json]     avm queue drain [--wait]     avm queue resume
+        drain: admit nothing new (running jobs finish; --wait returns once the host is idle) - e.g. before a git pull.
+      Settings (agent.conf): AVM_QUEUE_HEADROOM_GB (default 2), AVM_QUEUE_SETTLE_SEC (default 180), AVM_QUEUE_DIR.
+
 Needs the agent's config (server URL + host token). Looked up in order:
 AVM_CONFIG, ~/.config/avalon-agent/agent.conf, /etc/avalon-agent/agent.conf,
 %ProgramData%\\AvalonAgent\\agent.conf. Only one dependency: Python 3.8+.
@@ -35,19 +51,21 @@ import argparse
 import getpass
 import json
 import os
+import re
 import shlex
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections import deque
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-AVM_VERSION = "1.6.0"
+AVM_VERSION = "1.7.0"
 IS_WINDOWS = sys.platform.startswith("win")
 
 
@@ -62,7 +80,7 @@ def _candidates() -> List[str]:
     return [x for x in c if x]
 
 
-def load_config() -> Dict[str, str]:
+def load_config(required: bool = True) -> Dict[str, str]:
     cfg: Dict[str, str] = {}
     for path in _candidates():
         if os.path.isfile(path):
@@ -81,7 +99,7 @@ def load_config() -> Dict[str, str]:
     for k in ("AVM_SERVER_URL", "AVM_TOKEN"):
         if os.environ.get(k):
             cfg[k] = os.environ[k]
-    if not cfg.get("AVM_SERVER_URL") or not cfg.get("AVM_TOKEN"):
+    if required and (not cfg.get("AVM_SERVER_URL") or not cfg.get("AVM_TOKEN")):
         sys.stderr.write("avm: no agent config found (looked in %s); set AVM_SERVER_URL and AVM_TOKEN\n" % ", ".join(_candidates()))
         sys.exit(2)
     return cfg
@@ -89,6 +107,7 @@ def load_config() -> Dict[str, str]:
 
 class Hub:
     def __init__(self, cfg: Dict[str, str]):
+        self.cfg = cfg
         self.base = cfg["AVM_SERVER_URL"].rstrip("/") + "/api/v1"
         self.token = cfg["AVM_TOKEN"]
 
@@ -133,6 +152,331 @@ def _fmt_dur(s: float) -> str:
     return "%dh%02dm" % (s // 3600, (s % 3600) // 60)
 
 
+# ------------------------------------------------------------------- queue
+# Resource tags and an opt-in wait queue, local to this host. No daemon: every declared (--gpu/--mem/--vram) or
+# waiting (--wait) job holds an OS lock on its own ticket for as long as its avm process lives, so a crash or a
+# reboot releases its place and reservation by itself, and nothing starts again after a reboot. Admission never
+# needs the hub (it only displays the queue); tickets carry job names and sizes only - no commands or paths.
+QUEUE_POLL = 5.0
+QUEUE_BEAT = 30.0
+EXIT_GAVE_UP = 124     # --max-wait expired (like timeout(1))
+
+
+def _size_gb(v: Optional[str]) -> Optional[float]:
+    if v in (None, ""):
+        return None
+    m = re.fullmatch(r"\s*([\d.]+)\s*([kmgt]?)i?b?\s*", str(v), re.I)
+    if not m:
+        raise ValueError("bad size %r (use e.g. 19G or 512M)" % v)
+    return float(m.group(1)) * {"": 1.0, "G": 1.0, "T": 1024.0, "M": 1 / 1024, "K": 1 / 1048576}[m.group(2).upper()]
+
+
+def _duration(v: Optional[str]) -> Optional[float]:
+    if v in (None, ""):
+        return None
+    m = re.fullmatch(r"\s*([\d.]+)\s*([smhd]?)\s*", str(v), re.I)
+    if not m:
+        raise ValueError("bad duration %r (use e.g. 90m or 8h)" % v)
+    return float(m.group(1)) * {"": 1, "S": 1, "M": 60, "H": 3600, "D": 86400}[m.group(2).upper()]
+
+
+def _mem_gb() -> Tuple[Optional[float], Optional[float]]:
+    """(available, total) RAM in GB: MemAvailable on Linux (never RSS), GlobalMemoryStatusEx on Windows."""
+    if IS_WINDOWS:
+        import ctypes
+
+        class _MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + \
+                       [(n, ctypes.c_ulonglong) for n in ("tp", "ap", "tpf", "apf", "tv", "av", "aev")]
+        ms = _MS()
+        ms.dwLength = ctypes.sizeof(_MS)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):  # type: ignore[attr-defined]
+            return ms.ap / 2 ** 30, ms.tp / 2 ** 30
+        return None, None
+    try:
+        info: Dict[str, float] = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                info[k] = int(v.split()[0]) / 2 ** 20   # kB -> GB
+        return info.get("MemAvailable"), info.get("MemTotal")
+    except (OSError, ValueError, IndexError):
+        return None, None
+
+
+def _vram_gb() -> Tuple[Optional[float], Optional[float]]:
+    """(free, total) VRAM of GPU 0 in GB from nvidia-smi; (None, None) without an NVIDIA GPU."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+        free, total = (float(x) / 1024 for x in out[0].split(","))
+        return free, total
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None, None
+
+
+def _try_lock(f, blocking: bool = False) -> bool:
+    """Exclusive OS lock on an open file; released by the OS when the process dies."""
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            f.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    return True
+                except OSError:
+                    if not blocking:
+                        return False
+                    time.sleep(0.1)
+        import fcntl
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        return True
+    except OSError:
+        return False
+
+
+def _unlock(f) -> None:
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def _competes(a: dict, b: dict) -> bool:
+    """Two jobs contend when both are exclusive GPU jobs, or both declared RAM, or both declared VRAM."""
+    return (a.get("gpu") == "exclusive" and b.get("gpu") == "exclusive") or bool(a.get("mem_gb") and b.get("mem_gb")) \
+        or bool(a.get("vram_gb") and b.get("vram_gb"))
+
+
+def _res_text(t: dict) -> str:
+    parts = [("GPU exclusive" if t.get("gpu") == "exclusive" else "GPU") if t.get("gpu") else "",
+             "%gG RAM" % t["mem_gb"] if t.get("mem_gb") else "", "%gG VRAM" % t["vram_gb"] if t.get("vram_gb") else ""]
+    return ", ".join(x for x in parts if x) or "-"
+
+
+class Queue:
+    def __init__(self, cfg: Dict[str, str]):
+        self.dir = self._dir(cfg)
+        self.headroom = float(cfg.get("AVM_QUEUE_HEADROOM_GB") or 2)
+        self.settle = float(cfg.get("AVM_QUEUE_SETTLE_SEC") or 180)
+        self.me: Optional[Dict[str, Any]] = None
+        self._lockf = None
+
+    @staticmethod
+    def _dir(cfg: Dict[str, str]) -> str:
+        d = os.environ.get("AVM_QUEUE_DIR") or cfg.get("AVM_QUEUE_DIR") or (
+            os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "AvalonAgent", "queue") if IS_WINDOWS else "/tmp/avm-queue")
+        try:
+            os.makedirs(d, exist_ok=True)
+            if not IS_WINDOWS and os.stat(d).st_uid == os.getuid():
+                os.chmod(d, 0o1777)   # shared by every user on the host; sticky: only owners remove their tickets
+            probe = os.path.join(d, ".probe-%d" % os.getpid())
+            open(probe, "w").close()
+            os.remove(probe)
+        except OSError:
+            d = os.path.join(tempfile.gettempdir(), "avm-queue-" + _user())
+            os.makedirs(d, exist_ok=True)
+        return d
+
+    def _path(self, tid: str, ext: str) -> str:
+        return os.path.join(self.dir, tid + ext)
+
+    def _alive(self, tid: str) -> bool:
+        try:
+            f = open(self._path(tid, ".lock"), "rb")
+        except OSError:
+            return False
+        try:
+            if _try_lock(f):   # we got it: its owner is gone
+                _unlock(f)
+                return False
+            return True
+        finally:
+            f.close()
+
+    def _forget(self, tid: str) -> None:
+        for ext in (".json", ".lock"):
+            try:
+                os.remove(self._path(tid, ext))
+            except OSError:
+                pass   # another user's leftovers (sticky dir): ignored, they are dead anyway
+
+    def tickets(self) -> List[Dict[str, Any]]:
+        """Live tickets in queue order; dead ones (owner crashed / rebooted) are dropped."""
+        out = []
+        try:
+            names = os.listdir(self.dir)
+        except OSError:
+            return []
+        for fn in names:
+            if not fn.endswith(".json"):
+                continue
+            tid = fn[:-5]
+            if self.me and tid == self.me["id"]:
+                out.append(self.me)
+                continue
+            if not self._alive(tid):
+                self._forget(tid)
+                continue
+            try:
+                with open(self._path(tid, ".json"), encoding="utf-8") as f:
+                    out.append(json.load(f))
+            except (OSError, ValueError):
+                continue   # being rewritten right now
+        return sorted(out, key=lambda t: t.get("seq", ""))
+
+    def register(self, info: Dict[str, Any]) -> None:
+        tid = "%019d-%d" % (int(time.time() * 1e6), os.getpid())
+        self._lockf = open(self._path(tid, ".lock"), "w")   # lock first, then publish: a visible ticket is always locked
+        self._lockf.write("x")
+        self._lockf.flush()
+        if not _try_lock(self._lockf):
+            raise OSError("cannot lock queue ticket in %s" % self.dir)
+        try:
+            os.chmod(self._path(tid, ".lock"), 0o644)
+        except OSError:
+            pass
+        self.me = dict(info, id=tid, seq=tid, pid=os.getpid(), user=_user(), queued_at=time.time())
+        self.save()
+
+    def save(self) -> None:
+        if not self.me:
+            return
+        path = self._path(self.me["id"], ".json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.me, f)
+        try:
+            os.chmod(tmp, 0o644)
+        except OSError:
+            pass
+        for attempt in range(20):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:   # Windows: someone is reading it right now
+                time.sleep(0.05)
+
+    def release(self) -> None:
+        if self.me:
+            for ext in (".json", ".json.tmp"):
+                try:
+                    os.remove(self._path(self.me["id"], ext))
+                except OSError:
+                    pass
+        if self._lockf:
+            _unlock(self._lockf)
+            self._lockf.close()
+            try:
+                os.remove(self._path(self.me["id"], ".lock"))
+            except OSError:
+                pass
+        self.me, self._lockf = None, None
+
+    def draining(self) -> Optional[str]:
+        try:
+            with open(os.path.join(self.dir, "DRAIN"), encoding="utf-8") as f:
+                return f.read().strip() or "draining"
+        except OSError:
+            return None
+
+    def impossible(self, res: Dict[str, Any]) -> Optional[str]:
+        """Reject at submit what could never fit, instead of queueing it forever."""
+        _, total = _mem_gb()
+        if res.get("mem_gb") and total and res["mem_gb"] + self.headroom > total:
+            return "asks for %g GB RAM but this host has %.1f GB (%.1f GB after %g GB headroom)" % (
+                res["mem_gb"], total, total - self.headroom, self.headroom)
+        if res.get("vram_gb"):
+            _, vtotal = _vram_gb()
+            if vtotal is None:
+                return "asks for VRAM but no NVIDIA GPU was found (nvidia-smi)"
+            if res["vram_gb"] > vtotal:
+                return "asks for %g GB VRAM but the GPU has %.1f GB" % (res["vram_gb"], vtotal)
+        return None
+
+    def check(self) -> Tuple[bool, str, int]:
+        """(fits now, why not, place in line). Call with the admit lock held."""
+        me, now = self.me or {}, time.time()
+        drain = self.draining()
+        ts = self.tickets()
+        running = [t for t in ts if t.get("state") == "running"]
+        ahead = [t for t in ts if t.get("state") == "waiting" and t.get("seq", "") < me.get("seq", "") and _competes(t, me)]
+        if drain:
+            return False, "host is draining (%s); `avm queue resume` reopens it" % drain, len(ahead) + 1
+        if ahead:
+            return False, "behind '%s'%s" % (ahead[0].get("name"), " and %d more" % (len(ahead) - 1) if len(ahead) > 1 else ""), len(ahead) + 1
+        if me.get("gpu") == "exclusive":
+            holder = next((t for t in running if t.get("gpu") == "exclusive"), None)
+            if holder:
+                return False, "GPU in exclusive use by '%s'" % holder.get("name"), 1
+        settling = [t for t in running if now - (t.get("started_at") or 0) < self.settle]
+        if me.get("mem_gb"):
+            avail, _ = _mem_gb()
+            if avail is not None:
+                held = sum(t.get("mem_gb") or 0 for t in settling)
+                free = avail - held - self.headroom
+                if free < me["mem_gb"]:
+                    return False, "needs %g GB RAM; %.1f GB available%s, %g GB headroom" % (
+                        me["mem_gb"], avail, " minus %g GB held by starting jobs" % held if held else "", self.headroom), 1
+        if me.get("vram_gb"):
+            vfree, _ = _vram_gb()
+            if vfree is not None:
+                held = sum(t.get("vram_gb") or 0 for t in settling)
+                if vfree - held - 0.5 < me["vram_gb"]:
+                    return False, "needs %g GB VRAM; %.1f GB free%s" % (
+                        me["vram_gb"], vfree, " minus %g GB held by starting jobs" % held if held else ""), 1
+        return True, "", 0
+
+    def try_admit(self) -> Tuple[bool, str, int]:
+        """Check and, if it fits, mark this ticket running - atomically, so two jobs can't both take the same free memory."""
+        try:
+            lockf = open(os.path.join(self.dir, "admit.lock"), "a+")
+        except OSError:
+            lockf = open(os.path.join(self.dir, "admit.lock"), "r")
+        try:
+            _try_lock(lockf, blocking=True)
+            ok, why, pos = self.check()
+            if ok and self.me is not None:
+                self.me.update(state="running", started_at=time.time(), reason=None)
+            elif self.me is not None:
+                self.me["reason"] = why
+            self.save()
+            return ok, why, pos
+        finally:
+            _unlock(lockf)
+            lockf.close()
+
+
+def _code_identity(cwd: str) -> Optional[Dict[str, Any]]:
+    """git HEAD (+ dirty flag) of the job's directory, taken when it actually starts (not when it was queued)."""
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        d = subprocess.run(["git", "-C", cwd, "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True, timeout=20)
+        return {"sha": r.stdout.strip(), "dirty": bool(d.stdout.strip()), "at": time.time()}
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _resources(args: argparse.Namespace) -> Dict[str, Any]:
+    res: Dict[str, Any] = {}
+    if args.gpu or args.exclusive:
+        res["gpu"] = "exclusive" if args.exclusive else "shared"
+    if args.mem:
+        res["mem_gb"] = round(_size_gb(args.mem) or 0, 2)
+    if args.vram:
+        res["vram_gb"] = round(_size_gb(args.vram) or 0, 2)
+    return res
+
+
 # --------------------------------------------------------------------- run
 def cmd_run(args: argparse.Namespace, hub: Hub) -> int:
     command = args.command
@@ -142,10 +486,27 @@ def cmd_run(args: argparse.Namespace, hub: Hub) -> int:
     if len(command) == 1 and (" " in command[0]):
         command = command[0] if IS_WINDOWS else shlex.split(command[0])
     shown = command if isinstance(command, str) else " ".join(shlex.quote(c) for c in command)
+    try:
+        res = _resources(args)
+        max_wait = _duration(args.max_wait)
+    except ValueError as e:
+        sys.stderr.write("avm run: %s\n" % e)
+        return 2
+    if res or args.wait:
+        return _run_queued(args, hub, command, shown, res, max_wait)
     beat_every = max(5.0, float(args.beat))
     expect = beat_every * 2
     tid = _start(hub, args.name, "run", expect, shown, None, args.note)
     sys.stderr.write("avm: task #%d '%s' started (%s)\n" % (tid, args.name, shown[:80]))
+    return _execute(hub, args, command, tid, beat_every)
+
+
+def _execute(hub: Hub, args: argparse.Namespace, command: Any, tid: Optional[int], beat_every: float,
+             env: Optional[Dict[str, str]] = None) -> int:
+    """Run the command, stream its output through untouched, beat the task, report the exit code (passed through)."""
+    def call(path: str, body: dict) -> None:
+        if tid is not None:
+            hub.try_call(path % tid, body)
 
     tail: deque = deque(maxlen=60)
     pending: List[str] = []
@@ -153,12 +514,12 @@ def cmd_run(args: argparse.Namespace, hub: Hub) -> int:
     t0 = time.time()
     try:
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=isinstance(command, str),
-                                bufsize=1, universal_newlines=True, errors="replace")
+                                bufsize=1, universal_newlines=True, errors="replace", env=env)
     except OSError as e:
-        hub.try_call("/tasks/%d/finish" % tid, {"status": "failed", "rc": 127, "log": ["cannot start: %s" % e]})
+        call("/tasks/%d/finish", {"status": "failed", "rc": 127, "log": ["cannot start: %s" % e]})
         sys.stderr.write("avm: cannot start command: %s\n" % e)
         return 127
-    hub.try_call("/tasks/%d/beat" % tid, {"pid": proc.pid})
+    call("/tasks/%d/beat", {"pid": proc.pid})
 
     stop = threading.Event()
 
@@ -166,7 +527,7 @@ def cmd_run(args: argparse.Namespace, hub: Hub) -> int:
         while not stop.wait(beat_every):
             with lock:
                 lines, pending[:] = pending[:], []
-            hub.try_call("/tasks/%d/beat" % tid, {"log": lines[-40:]})
+            call("/tasks/%d/beat", {"log": lines[-40:]})
 
     th = threading.Thread(target=beater, daemon=True)
     th.start()
@@ -195,10 +556,162 @@ def cmd_run(args: argparse.Namespace, hub: Hub) -> int:
     with lock:
         lines, pending[:] = pending[:], []
     status = "done" if rc == 0 else "failed"
-    hub.try_call("/tasks/%d/finish" % tid, {"status": status, "rc": rc, "log": lines[-40:],
-                                             "note": "%s after %s" % (status, _fmt_dur(time.time() - t0))})
-    sys.stderr.write("avm: task #%d %s (rc=%s, %s)\n" % (tid, status, rc, _fmt_dur(time.time() - t0)))
+    call("/tasks/%d/finish", {"status": status, "rc": rc, "log": lines[-40:],
+                              "note": "%s after %s" % (status, _fmt_dur(time.time() - t0))})
+    sys.stderr.write("avm: task %s %s (rc=%s, %s)\n" % ("#%d" % tid if tid is not None else "(untracked)", status, rc, _fmt_dur(time.time() - t0)))
     return rc
+
+
+def _try_start(hub: Hub, body: Dict[str, Any]) -> Optional[int]:
+    """Create the dashboard task, but never let the hub block a queued job: None when it can't be reached."""
+    r = hub.try_call("/tasks", body)
+    return int(r["id"]) if r and r.get("id") is not None else None
+
+
+def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, res: Dict[str, Any], max_wait: Optional[float]) -> int:
+    """avm run with resource tags and/or --wait: declare, queue until it fits, then run exactly like a plain avm run."""
+    q = Queue(hub.cfg)
+    beat_every = max(5.0, float(args.beat))
+    meta: Dict[str, Any] = {"hostname": socket.gethostname(), "resources": res}
+    if args.note:
+        meta["note"] = args.note
+    body = {"name": args.name, "source": "run", "command": shown, "cwd": os.getcwd(), "pid": None, "user": _user(), "meta": meta}
+    env = dict(os.environ)
+
+    parent = os.environ.get("AVM_QUEUE_HOLD")
+    if parent and q._alive(parent):   # nested inside a queued job: use its reservation, never wait behind it
+        sys.stderr.write("avm: inside a queued job's reservation (%s): starting at once\n" % parent)
+        meta["queue"] = {"inherited": parent}
+        tid = _try_start(hub, dict(body, expect_beat=beat_every * 2))
+        if tid is not None:
+            env["AVM_TASK_ID"] = str(tid)
+        return _execute(hub, args, command, tid, beat_every, env)
+
+    if args.wait:
+        why = q.impossible(res)
+        if why:
+            sys.stderr.write("avm: '%s' can never start on this host: %s\n" % (args.name, why))
+            return 2
+    q.register({"name": args.name, "state": "waiting" if args.wait else "running", **res,
+                **({} if args.wait else {"started_at": time.time()})})
+    tid: Optional[int] = None
+    try:
+        if args.wait:
+            ok, why, pos = q.try_admit()
+            if not ok:
+                since = q.me["queued_at"] if q.me else time.time()
+                meta["queue"] = {"since": since, "reason": why, "position": pos, "max_wait": max_wait}
+                tid = _try_start(hub, dict(body, status="queued", expect_beat=max(QUEUE_BEAT, beat_every) * 2))
+                sys.stderr.write("avm: '%s' queued (%s)%s\n" % (args.name, why, "; task #%d" % tid if tid is not None else ""))
+
+                def interrupted(signum, frame):
+                    raise KeyboardInterrupt
+                try:
+                    signal.signal(signal.SIGTERM, interrupted)
+                except (ValueError, OSError):
+                    pass
+                last_beat, last_why = time.time(), why
+                try:
+                    while True:
+                        time.sleep(QUEUE_POLL)
+                        ok, why, pos = q.try_admit()
+                        if ok:
+                            break
+                        waited = time.time() - since
+                        if max_wait is not None and waited >= max_wait:
+                            note = "gave up after waiting %s (--max-wait): %s" % (_fmt_dur(waited), why)
+                            if tid is not None:
+                                hub.try_call("/tasks/%d/finish" % tid, {"status": "failed", "rc": EXIT_GAVE_UP, "note": note})
+                            sys.stderr.write("avm: '%s' %s\n" % (args.name, note))
+                            return EXIT_GAVE_UP
+                        if why != last_why:
+                            sys.stderr.write("avm: '%s' still queued: %s\n" % (args.name, why))
+                            last_why = why
+                        if time.time() - last_beat >= QUEUE_BEAT:
+                            last_beat = time.time()
+                            meta["queue"] = {"since": since, "reason": why, "position": pos, "max_wait": max_wait}
+                            if tid is None:   # the hub was unreachable when we queued: try again
+                                tid = _try_start(hub, dict(body, status="queued", expect_beat=max(QUEUE_BEAT, beat_every) * 2))
+                            else:
+                                hub.try_call("/tasks/%d/beat" % tid, {"status": "queued", "meta": {"queue": meta["queue"]}})
+                except KeyboardInterrupt:
+                    if tid is not None:
+                        hub.try_call("/tasks/%d/finish" % tid, {"status": "failed", "rc": 130, "note": "cancelled while queued"})
+                    sys.stderr.write("avm: '%s' cancelled while queued\n" % args.name)
+                    return 130
+                finally:
+                    try:
+                        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                    except (ValueError, OSError):
+                        pass
+                meta["queue"] = {"since": since, "waited": time.time() - since}
+                sys.stderr.write("avm: '%s' admitted after %s\n" % (args.name, _fmt_dur(time.time() - since)))
+            else:
+                meta["queue"] = {"since": q.me["queued_at"] if q.me else time.time(), "waited": 0}
+        code = _code_identity(os.getcwd())
+        if code:
+            meta["code"] = code
+            env["AVM_CODE_SHA"] = code["sha"] + ("-dirty" if code["dirty"] else "")
+        env["AVM_STARTED_AT"] = "%d" % time.time()
+        if q.me:
+            env["AVM_QUEUE_HOLD"] = q.me["id"]
+        if tid is None:
+            tid = _try_start(hub, dict(body, expect_beat=beat_every * 2, meta=meta))
+        else:
+            hub.try_call("/tasks/%d/beat" % tid, {"status": "running", "meta": {k: meta[k] for k in ("queue", "code") if k in meta}})
+        if tid is not None:
+            env["AVM_TASK_ID"] = str(tid)
+        sys.stderr.write("avm: task %s '%s' started [%s] (%s)\n" % ("#%d" % tid if tid is not None else "(hub unreachable: untracked)",
+                                                                   args.name, _res_text(res), shown[:80]))
+        return _execute(hub, args, command, tid, beat_every, env)
+    finally:
+        q.release()
+
+
+def cmd_queue(args: argparse.Namespace, cfg: Dict[str, str]) -> int:
+    q = Queue(cfg)
+    flag = os.path.join(q.dir, "DRAIN")
+    if args.op == "drain":
+        if not q.draining():
+            with open(flag, "w", encoding="utf-8") as f:
+                f.write("drained by %s at %s" % (_user(), time.strftime("%Y-%m-%d %H:%M")))
+        print("draining: queued jobs will not start; running ones finish (`avm queue resume` to reopen)")
+        if args.wait:
+            while True:
+                running = [t for t in q.tickets() if t.get("state") == "running"]
+                if not running:
+                    print("idle: no queued or declared job is running")
+                    return 0
+                time.sleep(QUEUE_POLL)
+        return 0
+    if args.op == "resume":
+        try:
+            os.remove(flag)
+            print("resumed: queued jobs may start again")
+        except FileNotFoundError:
+            print("not draining")
+        return 0
+    ts = q.tickets()
+    avail, total = _mem_gb()
+    vfree, vtotal = _vram_gb()
+    if args.json:
+        print(json.dumps({"draining": q.draining(), "tickets": ts, "mem_available_gb": avail, "mem_total_gb": total,
+                          "vram_free_gb": vfree, "vram_total_gb": vtotal, "headroom_gb": q.headroom, "dir": q.dir}, indent=1))
+        return 0
+    now = time.time()
+    print("RAM %s free of %s GB  ·  VRAM %s  ·  headroom %g GB%s" % (
+        "%.1f" % avail if avail is not None else "?", "%.0f" % total if total else "?",
+        "%.1f of %.0f GB free" % (vfree, vtotal) if vfree is not None else "n/a", q.headroom,
+        "  ·  DRAINING (%s)" % q.draining() if q.draining() else ""))
+    if not ts:
+        print("queue empty")
+    for t in ts:
+        running = t.get("state") == "running"
+        since = t.get("started_at") if running else t.get("queued_at")
+        print("%s %-8s %-30s %-10s %-26s %s%s" % ("▶" if running else "…", "running" if running else "waiting", (t.get("name") or "")[:30],
+                                                (t.get("user") or "")[:10], _res_text(t)[:26], _fmt_dur(now - (since or now)),
+                                                "" if running else "  " + (t.get("reason") or "")))
+    return 0
 
 
 # ------------------------------------------------------------------- watch
@@ -355,6 +868,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("name")
     p.add_argument("--beat", default=30, type=float, help="heartbeat seconds (default 30; stalled after 2x)")
     p.add_argument("--note", default=None)
+    p.add_argument("--gpu", action="store_true", help="uses the GPU (light jobs may share it)")
+    p.add_argument("--exclusive", action="store_true", help="heavy GPU job: one exclusive job at a time (implies --gpu)")
+    p.add_argument("--mem", default=None, help="RAM it expects to use, e.g. 19G")
+    p.add_argument("--vram", default=None, help="VRAM it expects to use, e.g. 6G")
+    p.add_argument("--wait", action="store_true", help="queue until it fits (first come, first served)")
+    p.add_argument("--max-wait", default=None, help="give up after this long in the queue, e.g. 8h (exit 124)")
     p.add_argument("command", nargs="*", help="-- command args...")
 
     p = sub.add_parser("watch", help="track an already-running pid")
@@ -383,14 +902,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap2.add_parser("untrack")
     ap2.add_parser("list")
 
+    p = sub.add_parser("queue", help="this host's resource queue: status / drain / resume")
+    qp = p.add_subparsers(dest="op", required=True)
+    s = qp.add_parser("status"); s.add_argument("--json", action="store_true")
+    s = qp.add_parser("drain"); s.add_argument("--wait", action="store_true", help="return once nothing queued/declared is running")
+    qp.add_parser("resume")
+
     argv = list(sys.argv[1:] if argv is None else argv)
     command: List[str] = []
     if "--" in argv:  # everything after `--` is the command, untouched by argparse
         i = argv.index("--")
         argv, command = argv[:i], argv[i + 1:]
+    argv = [{"--gpu=exclusive": "--exclusive", "--gpu=shared": "--gpu"}.get(a, a) for a in argv]   # accept --gpu=exclusive
     args = ap.parse_args(argv)
     if args.cmd == "run":
         args.command = command or [c for c in (args.command or []) if c != "--"]
+    if args.cmd == "queue":   # host-local: works without (or before) any hub config
+        return cmd_queue(args, load_config(required=False))
     hub = Hub(load_config())
     try:
         return {"run": cmd_run, "watch": cmd_watch, "task": cmd_task, "results": cmd_results, "agent": cmd_agent}[args.cmd](args, hub)

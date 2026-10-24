@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     id          INTEGER PRIMARY KEY,
     host_id     INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
-    status      TEXT NOT NULL,            -- running | done | failed | stalled | lost
+    status      TEXT NOT NULL,            -- queued | running | done | failed | stalled | lost (queued: `avm run --wait` waiting for resources)
     source      TEXT NOT NULL DEFAULT '', -- run | task | watch
     started     REAL NOT NULL,
     ended       REAL,
@@ -179,7 +179,7 @@ CREATE TABLE IF NOT EXISTS prefs (
 """
 
 TASK_LOG_LINES = 200
-TASK_STATES = ("running", "done", "failed", "stalled", "lost")
+TASK_STATES = ("queued", "running", "done", "failed", "stalled", "lost")
 JOB_STATES = ("queued", "running", "done", "failed", "cancelled")
 
 
@@ -460,13 +460,13 @@ class Database:
 
     # ---------------------------------------------------------------- tasks
     def task_create(self, host_id: int, name: str, source: str, expect_beat: Optional[float], command: str | None,
-                    cwd: str | None, pid: int | None, user: str | None, meta: dict | None) -> dict:
+                    cwd: str | None, pid: int | None, user: str | None, meta: dict | None, status: str = "running") -> dict:
         now = time.time()
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO tasks(host_id, name, status, source, started, updated, heartbeat, expect_beat, command, cwd, pid, user, meta)"
-                " VALUES (?,?,'running',?,?,?,?,?,?,?,?,?,?)",
-                (host_id, name[:200], source, now, now, now, expect_beat, command, cwd, pid, user,
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (host_id, name[:200], status, source, now, now, now, expect_beat, command, cwd, pid, user,
                  json.dumps(meta) if meta else None),
             )
             return _row(self._conn.execute("SELECT * FROM tasks WHERE id=?", (cur.lastrowid,)).fetchone())
@@ -477,8 +477,10 @@ class Database:
 
     def task_update(self, task_id: int, host_id: int | None = None, *, status: str | None = None, progress: float | None = None,
                     rc: int | None = None, log_lines: list[str] | None = None, note: str | None = None, beat: bool = True,
-                    pid: int | None = None) -> Optional[dict]:
-        """Apply a heartbeat / log / finish update. host_id (when given) must match - agents can only touch their own tasks."""
+                    pid: int | None = None, meta: dict | None = None) -> Optional[dict]:
+        """Apply a heartbeat / log / finish update. host_id (when given) must match - agents can only touch their own tasks.
+        meta is merged key by key (a None value removes the key). queued -> running restarts the clock at admission;
+        the time it was queued stays in meta.queue.since."""
         now = time.time()
         with self._lock:
             row = self._conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -491,6 +493,8 @@ class Database:
                 sets.append("status=?"); vals.append(status)
                 if status in ("done", "failed"):
                     sets.append("ended=?"); vals.append(now)
+                if status == "running" and row["status"] == "queued":   # admitted: elapsed counts from here
+                    sets.append("started=?"); vals.append(now)
                 if status != row["status"]:
                     sets.append("acked=NULL, acked_by=NULL")   # a new outcome alerts afresh
             elif beat and row["status"] == "stalled":
@@ -506,6 +510,14 @@ class Database:
             if log_lines:
                 merged = (row["log"].splitlines() + [l[:500] for l in log_lines])[-TASK_LOG_LINES:]
                 sets.append("log=?"); vals.append("\n".join(merged))
+            if meta:
+                cur_meta = json.loads(row["meta"]) if row["meta"] else {}
+                for k, v in meta.items():
+                    if v is None:
+                        cur_meta.pop(k, None)
+                    else:
+                        cur_meta[k] = v
+                sets.append("meta=?"); vals.append(json.dumps(cur_meta) if cur_meta else None)
             vals.append(task_id)
             self._conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", vals)
             return _row(self._conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
@@ -518,7 +530,7 @@ class Database:
         if status:
             where.append("status=?"); vals.append(status)
         sql = f"SELECT {cols} FROM tasks" + (" WHERE " + " AND ".join(where) if where else "") + \
-              " ORDER BY (status IN ('running','stalled')) DESC, started DESC LIMIT ?"
+              " ORDER BY CASE WHEN status IN ('running','stalled') THEN 0 WHEN status='queued' THEN 1 ELSE 2 END, started DESC LIMIT ?"
         vals.append(limit)
         with self._lock:
             return [dict(r) for r in self._conn.execute(sql, vals).fetchall()]
@@ -554,7 +566,7 @@ class Database:
         now = now or time.time()
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id FROM tasks WHERE status='running' AND expect_beat IS NOT NULL AND heartbeat < ? - expect_beat * 1.5", (now,)
+                "SELECT id FROM tasks WHERE status IN ('running','queued') AND expect_beat IS NOT NULL AND heartbeat < ? - expect_beat * 1.5", (now,)
             ).fetchall()
             ids = [r["id"] for r in rows]
             if ids:
@@ -565,7 +577,7 @@ class Database:
         """A host went offline: its running/stalled tasks can no longer report."""
         now = now or time.time()
         with self._lock:
-            rows = self._conn.execute("SELECT id FROM tasks WHERE host_id=? AND status IN ('running','stalled')", (host_id,)).fetchall()
+            rows = self._conn.execute("SELECT id FROM tasks WHERE host_id=? AND status IN ('running','stalled','queued')", (host_id,)).fetchall()
             ids = [r["id"] for r in rows]
             if ids:
                 self._conn.execute(f"UPDATE tasks SET status='lost', updated=?, acked=NULL, acked_by=NULL WHERE id IN ({','.join('?' * len(ids))})", [now, *ids])

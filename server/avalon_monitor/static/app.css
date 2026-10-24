@@ -265,6 +265,10 @@ td .bar i { display: block; height: 100%; background: var(--c, var(--m-disk)); b
 .task .right b { display: block; font-size: 14px; color: var(--ink); }
 .task .prog { grid-column: 1 / -1; height: 4px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
 .task .prog i { display: block; height: 100%; background: var(--c-blue); border-radius: 999px; }
+.task.queued .dot { background: transparent; border: 2px solid var(--s-warn); box-sizing: border-box; }
+.task .name .chip.res { font-size: 10.5px; padding: 0 7px; margin-left: 6px; vertical-align: 1px; }
+.task .name .chip.res.excl { color: var(--c-violet); border-color: color-mix(in srgb, var(--c-violet) 45%, transparent); }
+.chip.gpu-hold { color: var(--c-violet); border-color: color-mix(in srgb, var(--c-violet) 45%, transparent); }
 .task .detail { grid-column: 1 / -1; display: none; border-top: 1px solid var(--border); padding-top: 10px; }
 .task.open .detail { display: block; }
 .log { font-family: var(--mono); font-size: 11.5px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; color: var(--ink-2); }

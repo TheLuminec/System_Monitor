@@ -1,5 +1,5 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.8.2";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.9.0";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
@@ -25,27 +25,41 @@ export async function ackTasks(ids, { host, undo = false } = {}) {
   } catch (e) { toast(e.message, true); return 0; }
 }
 
-// Active tasks (running/stalled) first, then everything finished (done/failed/lost) together; newest first within each.
+// Active tasks (running/stalled) first, newest first; then the queue (`avm run --wait`) in queue order, oldest first;
+// then everything finished (done/failed/lost) together, newest first.
 const TASK_ACTIVE = new Set(["running", "stalled"]);
+const taskRank = (t) => (TASK_ACTIVE.has(t.status) ? 0 : t.status === "queued" ? 1 : 2);
 function sortedTasks(filter = {}) {
   return [...state.tasks.values()]
     .filter((t) => (!filter.host || t.host === filter.host) && (!filter.status || t.status === filter.status))
-    .sort((a, b) => TASK_ACTIVE.has(b.status) - TASK_ACTIVE.has(a.status) || b.started - a.started);
+    .sort((a, b) => taskRank(a) - taskRank(b) || (a.status === "queued" ? a.started - b.started : b.started - a.started));
+}
+// Resource tags from `avm run --gpu/--exclusive/--mem/--vram` (meta.resources), as chips.
+function resourceChips(t) {
+  const r = t.meta?.resources || {};
+  const out = [];
+  if (r.gpu) out.push(h("span", { class: "chip res" + (r.gpu === "exclusive" ? " excl" : "") }, r.gpu === "exclusive" ? "GPU exclusive" : "GPU"));
+  if (r.mem_gb) out.push(h("span", { class: "chip res" }, `${r.mem_gb}G RAM`));
+  if (r.vram_gb) out.push(h("span", { class: "chip res" }, `${r.vram_gb}G VRAM`));
+  return out;
 }
 
 function taskRow(t, open = false) {
   const now = Date.now() / 1000;
   const elapsed = (t.ended || now) - t.started;
   const row = h("div", { class: `card task ${t.status}${open ? " open" : ""}`, "data-id": t.id });
-  const statusText = { running: "running", done: "done", failed: `failed${t.rc != null ? " · rc " + t.rc : ""}`, stalled: `stalled · no heartbeat for ${fmt.dur(t.beat_age)}`, lost: "lost · host went offline" }[t.status] || t.status;
+  const q = t.meta?.queue || {};
+  const statusText = { running: "running", done: "done", failed: `failed${t.rc != null ? " · rc " + t.rc : ""}`, stalled: `stalled · no heartbeat for ${fmt.dur(t.beat_age)}`, lost: "lost · host went offline",
+    queued: `queued${q.position ? " · #" + q.position + " in line" : ""}${q.reason ? " · " + q.reason : ""}` }[t.status] || t.status;
   row.append(
     h("span", { class: "dot" }),
     h("div", {},
-      h("div", { class: "name" }, t.name),
+      h("div", { class: "name" }, t.name, ...resourceChips(t)),
       h("div", { class: "sub" }, h("span", {}, t.host), h("span", {}, statusText), t.command ? h("span", { class: "num", title: t.command }, t.command.length > 60 ? t.command.slice(0, 60) + "…" : t.command) : null, t.user ? h("span", {}, t.user) : null, t.note ? h("span", {}, t.note) : null,
         TASK_PROBLEM.has(t.status) && !taskAlerting(t) ? h("span", { class: "chip", title: t.acked ? `acknowledged ${fmt.when(t.acked)}${t.acked_by ? " by " + t.acked_by : ""}` : "older than the alert window" }, t.acked ? "acknowledged" : "alert expired") : null),
     ),
-    h("div", { class: "right num" }, h("b", { "data-f": "elapsed" }, fmt.dur(elapsed)), t.status === "running" ? `started ${fmt.when(t.started)}` : `${fmt.when(t.ended || t.updated)}`),
+    h("div", { class: "right num" }, h("b", { "data-f": "elapsed" }, fmt.dur(elapsed)),
+      t.status === "running" ? `started ${fmt.when(t.started)}${q.waited >= 60 ? " · waited " + fmt.dur(q.waited) : ""}` : t.status === "queued" ? `waiting since ${fmt.when(t.started)}` : `${fmt.when(t.ended || t.updated)}`),
   );
   if (t.status === "running" && t.progress != null) row.append(h("div", { class: "prog" }, h("i", { style: `width:${Math.round(t.progress * 100)}%` })));
   const detail = h("div", { class: "detail" });
@@ -68,7 +82,10 @@ async function fillTaskDetail(el, id) {
   try { t = await api(`/api/v1/tasks/${id}`); } catch (e) { el.append(h("div", { class: "muted" }, e.message)); return; }
   state.tasks.set(t.id, { ...state.tasks.get(t.id), ...t, log: undefined });
   const kv = [["Host", t.host], ["Source", `avm ${t.source}`], ["Command", t.command], ["Working dir", t.cwd], ["PID", t.pid], ["User", t.user], ["Started", fmt.when(t.started)], ["Ended", t.ended ? fmt.when(t.ended) : null],
-    ["Heartbeat", t.expect_beat ? `every ≤${t.expect_beat}s · last ${fmt.ago(t.beat_age)}` : "none expected"], ["Exit code", t.rc], ["Progress", t.progress != null ? Math.round(t.progress * 100) + "%" : null], ["Note", t.note]].filter(([, v]) => v != null && v !== "");
+    ["Heartbeat", t.expect_beat ? `every ≤${t.expect_beat}s · last ${fmt.ago(t.beat_age)}` : "none expected"], ["Exit code", t.rc], ["Progress", t.progress != null ? Math.round(t.progress * 100) + "%" : null], ["Note", t.note],
+    ["Resources", t.meta?.resources && Object.keys(t.meta.resources).length ? Object.entries(t.meta.resources).map(([k, v]) => `${k.replace("_gb", "")} ${v}${k.endsWith("_gb") ? " GB" : ""}`).join(" · ") : null],
+    ["Queue", t.meta?.queue ? (t.meta.queue.inherited ? "inside a queued job's reservation" : t.status === "queued" ? `since ${fmt.when(t.meta.queue.since)} · ${t.meta.queue.reason || ""}${t.meta.queue.max_wait ? " · gives up after " + fmt.dur(t.meta.queue.max_wait) : ""}` : `waited ${fmt.dur(t.meta.queue.waited || 0)}`) : null],
+    ["Code at start", t.meta?.code ? `${t.meta.code.sha}${t.meta.code.dirty ? " (uncommitted changes)" : ""}` : null]].filter(([, v]) => v != null && v !== "");
   el.append(h("dl", { class: "kvlist" }, ...kv.flatMap(([k, v]) => [h("dt", {}, k), h("dd", { class: "num" }, String(v))])));
   const log = h("div", { class: "log", "data-f": "log" }, (t.log || []).join("\n") || "(no output captured)");
   el.append(h("div", { style: "margin-top:10px" }, h("div", { class: "muted", style: "font-size:11px;margin-bottom:4px" }, "last output lines"), log));
@@ -79,8 +96,8 @@ async function fillTaskDetail(el, id) {
       ? h("button", { class: "btn small", title: "Make this task alert again", onclick: () => ackTasks([t.id], { undo: true }) }, "Restore alert")
       : h("button", { class: "btn small", title: "Stop alerting on this task (it stays in the list)", onclick: () => ackTasks([t.id]) }, "Acknowledge"));
   }
-  if (t.status !== "running") actions.append(h("button", { class: "btn small danger", onclick: async () => { try { await post(`/api/v1/tasks/${t.id}`, undefined, "DELETE"); } catch (e) { toast(e.message, true); } } }, "Delete"));
-  if (t.status === "running" || t.status === "stalled") actions.append(h("span", { class: "muted", style: "font-size:12px" }, "live · updates as the task reports"));
+  if (t.status !== "running" && t.status !== "queued") actions.append(h("button", { class: "btn small danger", onclick: async () => { try { await post(`/api/v1/tasks/${t.id}`, undefined, "DELETE"); } catch (e) { toast(e.message, true); } } }, "Delete"));
+  if (t.status === "running" || t.status === "stalled" || t.status === "queued") actions.append(h("span", { class: "muted", style: "font-size:12px" }, t.status === "queued" ? "waiting on its host's queue · cancel it with Ctrl-C where it was started" : "live · updates as the task reports"));
   el.append(actions);
 }
 
@@ -90,14 +107,14 @@ export async function renderTasks(params = {}) {
   try { await loadTasks(); } catch (e) { app.append(h("div", { class: "empty" }, `Cannot load tasks: ${e.message}`)); return; }
   const filter = { host: params.host || "", status: params.status || "" };
   const hostSel = h("select", { onchange: () => { filter.host = hostSel.value; redraw(); } }, h("option", { value: "" }, "all hosts"), ...[...state.hosts.keys()].sort().map((n) => h("option", { value: n, selected: n === filter.host ? "" : null }, n)));
-  const statusSel = h("select", { onchange: () => { filter.status = statusSel.value; redraw(); } }, h("option", { value: "" }, "any status"), ...["running", "stalled", "failed", "lost", "done"].map((s) => h("option", { value: s, selected: s === filter.status ? "" : null }, s)));
+  const statusSel = h("select", { onchange: () => { filter.status = statusSel.value; redraw(); } }, h("option", { value: "" }, "any status"), ...["running", "queued", "stalled", "failed", "lost", "done"].map((s) => h("option", { value: s, selected: s === filter.status ? "" : null }, s)));
   const list = h("div", { class: "task-list" });
   const counts = h("span", { class: "muted", "data-f": "counts" });
   const redraw = () => {
     list.innerHTML = "";
     const rows = sortedTasks(filter);
-    const running = rows.filter((t) => t.status === "running").length;
-    counts.textContent = `${running} running · ${rows.length} shown`;
+    const running = rows.filter((t) => t.status === "running").length, queued = rows.filter((t) => t.status === "queued").length;
+    counts.textContent = `${running} running${queued ? ` · ${queued} queued` : ""} · ${rows.length} shown`;
     if (!rows.length) list.append(h("div", { class: "empty" }, "No tasks yet. Start one with the avm command below."));
     for (const t of rows) list.append(taskRow(t, t.id === openId));
   };
@@ -109,7 +126,9 @@ export async function renderTasks(params = {}) {
     h("pre", {}, `avm run "seed 3 training" -- python train.py --seed 3     # wraps a command: output tail, heartbeat, exit code
 avm watch "nightly backup" --pid 4242                     # follow an already-running process
 avm task start "data prep" --expect 300   # -> TASK_ID     then: avm task beat ID --progress 0.4
-avm task done ID    |    avm task fail ID --rc 1 --note "why"`),
+avm task done ID    |    avm task fail ID --rc 1 --note "why"
+avm run "nymeria b4020" --exclusive --mem 19G --wait -- python train.py   # declare GPU/RAM; queue until it fits
+avm queue status    |    avm queue drain --wait    |    avm queue resume       # this host's queue`),
     h("div", { class: "muted", style: "margin-top:8px;font-size:12px" }, `A running task that stops heart-beating turns amber (stalled); a non-zero exit turns red. Both count as alerts until you acknowledge them (open the task, or dismiss it on the Alerts tab) or for ${state.config?.task_alert_hours ?? 24} h after they happen; the task itself stays here. Claude sessions started from the Agents tab are told to use avm run for long jobs.`),
   );
   app.append(h("div", { class: "page-head" }, h("h2", {}, "Tasks"), counts, h("div", { class: "filters" }, hostSel, statusSel, h("button", { class: "btn small", onclick: async () => { await loadTasks(true); redraw(); } }, "Refresh"))), list, howto);
@@ -125,7 +144,7 @@ on("task", (t) => {
     const f = state.tasksView.filter;
     if ((f.host && t.host !== f.host) || (f.status && t.status !== f.status)) { existing?.remove(); return; }
     const fresh = taskRow(state.tasks.get(t.id), wasOpen);
-    if (existing) existing.replaceWith(fresh); else state.tasksView.redraw();
+    if (existing && prev?.status === t.status) existing.replaceWith(fresh); else state.tasksView.redraw();   // new status: re-sort
   }
   if (prev && prev.status !== t.status && (t.status === "failed" || t.status === "stalled")) toast(`Task "${t.name}" on ${t.host} ${t.status}`, true);
 });
@@ -135,7 +154,7 @@ on("task_deleted", ({ id }) => { state.tasks.delete(id); if (state.view === "tas
 setInterval(() => {
   if (state.view !== "tasks") return;
   const now = Date.now() / 1000;
-  for (const el of document.querySelectorAll(".task.running, .task.stalled")) {
+  for (const el of document.querySelectorAll(".task.running, .task.stalled, .task.queued")) {
     const t = state.tasks.get(Number(el.dataset.id)); if (!t) continue;
     const b = el.querySelector('[data-f="elapsed"]'); if (b) b.textContent = fmt.dur(now - t.started);
   }
@@ -476,6 +495,14 @@ export function computeAlerts() {
     if (t.status === "failed") out.push({ level: "crit", what: `task failed: ${t.name}`, why: `exit code ${t.rc ?? "?"} · ${fmt.ago(now - (t.ended || t.updated))}${t.note ? " · " + t.note : ""}`, host: t.host, go, ts: t.ended, task: t.id });
     if (t.status === "stalled") out.push({ level: "warn", what: `task stalled: ${t.name}`, why: `no heartbeat for ${fmt.dur(now - t.heartbeat)}`, host: t.host, go, ts: t.heartbeat, task: t.id });
     if (t.status === "lost") out.push({ level: "warn", what: `task lost: ${t.name}`, why: "its host went offline while it was running", host: t.host, go, ts: t.updated, task: t.id });
+  }
+  // a queued job waiting 30+ min while no declared/queued job runs on its host: something outside avm holds the
+  // memory/GPU, the host is draining, or the queue is stuck - say so instead of letting it sit silently overnight
+  for (const t of state.tasks.values()) {
+    if (t.status !== "queued" || now - t.started < 1800) continue;
+    const busy = [...state.tasks.values()].some((x) => x.host === t.host && x.status === "running" && x.meta?.resources && Object.keys(x.meta.resources).length);
+    if (!busy) out.push({ level: "warn", what: `queued ${fmt.dur(now - t.started)} with nothing queued running: ${t.name}`, why: t.meta?.queue?.reason || "check avm queue status on the host",
+      host: t.host, go: `#/tasks?open=${t.id}`, ts: t.started });
   }
   // a tracked agent whose process is gone while Claude still says it was working: it crashed or was killed
   for (const t of state.tracked?.values() || []) {

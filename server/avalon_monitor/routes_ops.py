@@ -79,6 +79,7 @@ class TaskStart(BaseModel):
     pid: Optional[int] = None
     user: Optional[str] = None
     meta: Optional[dict] = None
+    status: str = Field(default="running", pattern=r"^(running|queued)$")   # queued: `avm run --wait` waiting for resources
 
 
 class TaskUpdate(BaseModel):
@@ -86,6 +87,8 @@ class TaskUpdate(BaseModel):
     log: list[str] = Field(default_factory=list)
     note: Optional[str] = None
     pid: Optional[int] = None
+    status: Optional[str] = Field(default=None, pattern=r"^(running|queued)$")   # queued -> running on admission
+    meta: Optional[dict] = None          # merged into the task's meta (queue position/reason, resources, code at start)
 
 
 class TaskFinish(BaseModel):
@@ -104,15 +107,16 @@ async def task_start(body: TaskStart, host: HostRow = Depends(require_agent)):
     if body.source not in ("run", "task", "watch"):
         raise HTTPException(422, "source must be run, task or watch")
     t = await run_in_threadpool(db.task_create, host.id, body.name, body.source, body.expect_beat, body.command,
-                                body.cwd, body.pid, body.user, body.meta)
-    log.info("task #%d '%s' started on %s", t["id"], t["name"], host.name)
+                                body.cwd, body.pid, body.user, body.meta, body.status)
+    log.info("task #%d '%s' %s on %s", t["id"], t["name"], "queued" if body.status == "queued" else "started", host.name)
     await _emit_task(t)
     return {"ok": True, "id": t["id"], "task": task_public(t)}
 
 
 @router.post("/tasks/{task_id}/beat")
 async def task_beat(task_id: int, body: TaskUpdate, host: HostRow = Depends(require_agent)):
-    t = await run_in_threadpool(db.task_update, task_id, host.id, progress=body.progress, log_lines=body.log, note=body.note, pid=body.pid)
+    t = await run_in_threadpool(db.task_update, task_id, host.id, progress=body.progress, log_lines=body.log, note=body.note, pid=body.pid,
+                                status=body.status, meta=body.meta)
     if t is None:
         raise HTTPException(404, "no such task on this host")
     await _emit_task(t)
