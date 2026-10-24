@@ -14,6 +14,15 @@ export const h = (tag, attrs = {}, ...children) => {
 };
 export const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 export const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+// Memory-commit warning threshold (% of the commit limit) for a host: AVM_COMMIT_WARN_PCT in its settings, default 85;
+// "off" or 0 disables it (on Linux with the default heuristic overcommit the limit is never enforced).
+export function commitWarnPct(host) {
+  const v = String(host?.commit_warn_pct ?? "").trim().toLowerCase();
+  if (!v) return 85;
+  if (v === "off" || v === "0" || v === "none") return Infinity;
+  const n = parseFloat(v);
+  return n > 0 ? n : 85;
+}
 
 export const fmt = {
   pct: (v, d = 0) => (v == null ? "—" : v.toFixed(d) + "%"),

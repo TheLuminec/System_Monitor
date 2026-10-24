@@ -1,9 +1,9 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.8.1";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.8.2";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
-         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate } from "./core.js?v=1.8.1";
-import { renderResearch } from "./research.js?v=1.8.1";
-import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.8.1";
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct } from "./core.js?v=1.8.2";
+import { renderResearch } from "./research.js?v=1.8.2";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.8.2";
 
 // ------------------------------------------------------------------ shell
 const NAV = [
@@ -191,7 +191,7 @@ function updateCard(card, host) {
   else if (host.agent_outdated && host.status === "online") checks.append(h("span", { class: "chip warn", title: `running agent ${host.agent_version || "?"}; the hub serves a newer script and the agent updates itself on its next report` }, "agent updating"));
   if (s.memory?.committed != null && s.memory?.commit_limit) {
     const cp = (100 * s.memory.committed) / s.memory.commit_limit;
-    if (cp >= 85) checks.append(h("span", { class: "chip warn", title: `committed ${fmt.bytes(s.memory.committed)} of ${fmt.bytes(s.memory.commit_limit)} limit` }, `commit ${Math.round(cp)}%`));
+    if (cp >= commitWarnPct(host)) checks.append(h("span", { class: "chip warn", title: `committed ${fmt.bytes(s.memory.committed)} of ${fmt.bytes(s.memory.commit_limit)} limit (warns at ${commitWarnPct(host)}%; set AVM_COMMIT_WARN_PCT in the host settings)` }, `commit ${Math.round(cp)}%`));
   }
   drawCardSpark(card, host.name);
 }
@@ -342,6 +342,7 @@ const CHECK_KINDS = [
 ];
 const CHECK_SINGLE = [
   { key: "AVM_MEM_AVAILABLE_WARN_GB", label: "Warn when free memory below (GB)", hint: "e.g. 8" },
+  { key: "AVM_COMMIT_WARN_PCT", label: "Warn when memory commit above (%)", hint: "85 (default) · off" },
   { key: "AVM_PROCESSES", label: "Top processes reported", hint: "8" },
   { key: "AVM_TAGS", label: "Tags", hint: "comma-separated chips" },
 ];

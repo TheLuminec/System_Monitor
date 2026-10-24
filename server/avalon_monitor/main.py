@@ -32,6 +32,7 @@ REMOTE_KEYS = (
     "AVM_WATCH_PROCESSES", "AVM_WATCH_FILES", "AVM_WATCH_TCP", "AVM_WATCH_MOUNTS", "AVM_WATCH_CONTENT",
     "AVM_WATCH_MARKERS", "AVM_WATCH_NONEMPTY", "AVM_WATCH_UNITS", "AVM_WATCH_JOBS",
     "AVM_MEM_AVAILABLE_WARN_GB", "AVM_PROCESSES", "AVM_TAGS",
+    "AVM_COMMIT_WARN_PCT",   # hub/dashboard only (memory-commit warning threshold); agents ignore keys they don't know
 )
 AGENT_COMMANDS = ("respawn",)
 
@@ -147,6 +148,7 @@ def host_public(h: HostRow, full: bool = False) -> dict[str, Any]:
                                and (h.last_sample or {}).get("agent_sha256") != agent_bundle.sha256),
         "agent_update_error": (h.last_sample or {}).get("agent_update_error"),
         "claude": _claude_summary((h.last_sample or {}).get("claude")),
+        "commit_warn_pct": (h.check_config or {}).get("AVM_COMMIT_WARN_PCT") or None,
     }
     if full:
         out["sample"] = h.last_sample
