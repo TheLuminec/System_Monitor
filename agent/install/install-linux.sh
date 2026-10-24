@@ -45,6 +45,13 @@ fi
 if [[ $UPGRADE -eq 0 && ( -z "$SERVER" || -z "$TOKEN" ) ]]; then
   echo "--server and --token are required (or --upgrade)"; exit 1
 fi
+if [[ $UPGRADE -eq 1 && ! -s "$ETC_DIR/agent.conf" ]]; then
+  # --upgrade keeps the existing config; without one it would install a unit that can never start.
+  echo "--upgrade needs an existing $ETC_DIR/agent.conf (none here); install with --server and --token instead"
+  INVOKER_HOME="$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)"
+  [[ $USER_MODE -eq 0 && -s "$INVOKER_HOME/.config/avalon-agent/agent.conf" ]] && echo "    (this host has a user-level agent: did you mean --user --upgrade?)"
+  exit 1
+fi
 command -v python3 >/dev/null || { echo "python3 is required (apt install python3 python3-venv)"; exit 1; }
 
 echo "==> installing to $APP_DIR"

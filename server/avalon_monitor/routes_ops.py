@@ -54,6 +54,18 @@ def task_public(t: dict) -> dict:
 def job_public(j: dict) -> dict:
     out = dict(j)
     out["host"] = host_name(j["host_id"])
+    if isinstance(out.get("target"), str):
+        try:
+            out["target"] = json.loads(out["target"])
+        except ValueError:
+            out["target"] = None
+    return out
+
+
+def tracked_public(t: dict) -> dict:
+    out = dict(t)
+    out["host"] = host_name(t["host_id"])
+    out["live"] = bool(t.get("live"))
     return out
 
 
@@ -204,6 +216,7 @@ class JobFinish(BaseModel):
     duration_ms: Optional[int] = None
     num_turns: Optional[int] = None
     error: Optional[str] = None
+    new_key: Optional[str] = Field(default=None, max_length=80)   # restart came back as a new background agent
 
 
 @router.post("/claude/jobs")
@@ -288,13 +301,112 @@ async def job_events(job_id: int, body: JobEvents, host: HostRow = Depends(requi
 async def job_finish(job_id: int, body: JobFinish, host: HostRow = Depends(require_agent)):
     if body.status not in ("done", "failed", "cancelled"):
         raise HTTPException(422, "bad status")
-    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    fields = {k: v for k, v in body.model_dump().items() if v is not None and k != "new_key"}
     j = await run_in_threadpool(db.job_update, job_id, host.id, ended=time.time(), **fields)
     if j is None:
         raise HTTPException(404, "no such job on this host")
     log.info("claude job #%d on %s %s (%s turns, $%s)", job_id, host.name, body.status, body.num_turns, body.cost_usd)
-    await hub.broadcast({"type": "claude_job", "job": job_public(j)})
+    pub = job_public(j)
+    if body.new_key and j.get("action") and (pub.get("target") or {}).get("key"):
+        row = await run_in_threadpool(db.tracked_rekey, host.id, pub["target"]["key"], body.new_key)
+        if row:
+            log.info("tracked session %s on %s now runs as %s", pub["target"]["key"], host.name, body.new_key)
+            await hub.broadcast({"type": "claude_tracked", "row": tracked_public(row)})
+    await hub.broadcast({"type": "claude_job", "job": pub})
     return {"ok": True}
+
+
+# ======================================================= tracked sessions
+KEY_RE = r"^[A-Za-z0-9][A-Za-z0-9_-]{3,79}$"
+
+
+class TrackAdd(BaseModel):
+    key: str = Field(pattern=KEY_RE)
+    session_id: Optional[str] = Field(default=None, pattern=KEY_RE)
+    name: Optional[str] = Field(default=None, max_length=120)
+    cwd: Optional[str] = Field(default=None, max_length=500)
+    kind: Optional[str] = Field(default=None, pattern=r"^(background|interactive)$")
+    note: Optional[str] = Field(default=None, max_length=300)
+
+
+class TrackAddHost(TrackAdd):
+    host: str
+
+
+class TrackAction(BaseModel):
+    action: str = Field(pattern=r"^(restart|stop)$")
+    prompt: Optional[str] = Field(default=None, max_length=MAX_PROMPT)   # only used when a restart resumes as a new agent
+
+
+async def _host_or_404(name: str) -> HostRow:
+    h = await run_in_threadpool(db.host_by_name, name)
+    if not h:
+        raise HTTPException(404, "no such host")
+    return h
+
+
+@router.get("/claude/tracked")
+async def tracked_list(ident: Identity = Depends(require_viewer), host: Optional[str] = None):
+    host_id = (await _host_or_404(host)).id if host else None
+    return {"tracked": [tracked_public(t) for t in await run_in_threadpool(db.tracked_list, host_id)]}
+
+
+@router.post("/claude/tracked")
+async def tracked_add(body: TrackAddHost, request: Request, ident: Identity = Depends(require_viewer)):
+    require_same_origin(request)
+    h = await _host_or_404(body.host)
+    row = await run_in_threadpool(db.tracked_add, h.id, body.key, body.model_dump(), ident.subject)
+    log.info("%s tracks claude session %s on %s", ident.subject, body.key, h.name)
+    await hub.broadcast({"type": "claude_tracked", "row": tracked_public(row)})
+    return {"ok": True, "row": tracked_public(row)}
+
+
+@router.delete("/claude/tracked/{tid}")
+async def tracked_delete(tid: int, request: Request, ident: Identity = Depends(require_viewer)):
+    require_same_origin(request)
+    if not await run_in_threadpool(db.tracked_delete, tid):
+        raise HTTPException(404, "not tracked")
+    await hub.broadcast({"type": "claude_untracked", "id": tid})
+    return {"ok": True}
+
+
+@router.post("/claude/tracked/{tid}/action")
+async def tracked_action(tid: int, body: TrackAction, request: Request, ident: Identity = Depends(require_viewer)):
+    """Queue a restart/stop for the session's host. It runs on the host's next report (or when it comes back online)."""
+    require_same_origin(request)
+    t = await run_in_threadpool(db.tracked_get, tid)
+    if not t:
+        raise HTTPException(404, "not tracked")
+    label = t["name"] or t["key"][:8]
+    target = {"key": t["key"], "session_id": t["session_id"], "kind": t["kind"], "name": t["name"], "cwd": t["cwd"]}
+    prompt = body.prompt or "You were restarted from the Avalon Monitor dashboard. Re-read your recent context and pick up where you left off."
+    j = await run_in_threadpool(db.job_create, t["host_id"], prompt, t["cwd"], "plan", None, None, ident.subject,
+                                body.action, target, f"{body.action} · {label}")
+    log.info("%s queued %s of %s on %s", ident.subject, body.action, t["key"], host_name(t["host_id"]))
+    await hub.broadcast({"type": "claude_job", "job": job_public(j)})
+    return {"ok": True, "job": job_public(j)}
+
+
+# agent side: `avm agent track` lets a session register itself (the host comes from the agent token)
+@router.post("/agent/claude/track")
+async def agent_track(body: TrackAdd, host: HostRow = Depends(require_agent)):
+    row = await run_in_threadpool(db.tracked_add, host.id, body.key, body.model_dump(), f"avm@{host.name}")
+    await hub.broadcast({"type": "claude_tracked", "row": tracked_public(row)})
+    return {"ok": True, "row": tracked_public(row)}
+
+
+@router.post("/agent/claude/untrack")
+async def agent_untrack(body: TrackAdd, host: HostRow = Depends(require_agent)):
+    t = await run_in_threadpool(db.tracked_find, host.id, body.key)
+    if not t or not await run_in_threadpool(db.tracked_delete, t["id"], host.id):
+        raise HTTPException(404, "not tracked on this host")
+    await hub.broadcast({"type": "claude_untracked", "id": t["id"]})
+    return {"ok": True}
+
+
+@router.get("/agent/claude/tracked")
+async def agent_tracked(host: HostRow = Depends(require_agent)):
+    return {"tracked": [tracked_public(t) for t in await run_in_threadpool(db.tracked_list, host.id)]}
 
 
 # =================================================================== prefs

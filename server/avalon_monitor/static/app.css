@@ -288,6 +288,23 @@ td .bar i { display: block; height: 100%; background: var(--c, var(--m-disk)); b
 .session .snip b { color: var(--ink-3); font-weight: 500; }
 .session .actions { display: flex; gap: 6px; margin-top: 4px; }
 .sessions { display: flex; flex-direction: column; gap: 8px; }
+.session .actions { flex-wrap: wrap; align-items: center; }
+.session > .proj { font-family: var(--mono); font-size: 11px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session.compact { padding: 8px 10px; gap: 3px; }
+.session.compact .snip { -webkit-line-clamp: 1; }
+.session.tracked .t b { font-size: 13px; }
+.trk-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--s-offline); }
+.trk-dot.online { background: var(--s-good); }
+.trk-dot.busy { background: var(--c-blue); animation: pulse 2s infinite; }
+.trk-dot.warn { background: var(--s-warn); }
+.trk-dot.bad { background: var(--s-crit); }
+.chip.trk { font-size: 10.5px; padding: 1px 7px; }
+.chip.trk.online { color: var(--s-good); border-color: color-mix(in srgb, var(--s-good) 40%, transparent); }
+.chip.trk.busy { color: var(--c-blue); border-color: color-mix(in srgb, var(--c-blue) 40%, transparent); }
+.chip.trk.warn { color: var(--s-warn); border-color: color-mix(in srgb, var(--s-warn) 40%, transparent); }
+.chip.trk.bad { color: var(--s-crit); border-color: color-mix(in srgb, var(--s-crit) 45%, transparent); }
+details.transcripts > summary { cursor: pointer; font-weight: 600; font-size: 13px; list-style-position: inside; }
+details.transcripts[open] > summary { margin-bottom: 10px; }
 .console { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .prompt-box { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
 .prompt-box textarea { font: inherit; font-size: 13.5px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; min-height: 84px; resize: vertical; }

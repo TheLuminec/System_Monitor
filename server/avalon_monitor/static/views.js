@@ -1,5 +1,5 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate } from "./core.js?v=1.6.0";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate } from "./core.js?v=1.7.0";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
@@ -150,12 +150,41 @@ export async function loadJobs(force = false) {
   state.jobsLoaded = true;
 }
 
+// Tracked sessions: the Claude Code sessions the user registered (here, or with `avm agent track` from inside one).
+// They stay listed when the session stops or its host goes offline, so they can be restarted.
+export async function loadTracked(force = false) {
+  if (state.trackedLoaded && !force) return;
+  const r = await api("/api/v1/claude/tracked");
+  state.tracked = new Map(r.tracked.map((t) => [t.id, t]));
+  state.trackedLoaded = true;
+}
+const trackedOn = (host) => [...(state.tracked?.values() || [])].filter((t) => t.host === host)
+  .sort((a, b) => (b.live - a.live) || (b.last_activity || 0) - (a.last_activity || 0));
+const pendingAction = (t) => [...state.jobs.values()].find((j) => j.action && j.host === t.host && j.target?.key === t.key && (j.status === "queued" || j.status === "running"));
+// What to call a tracked session's condition, from Claude's own state plus whether its process and host are up.
+function trackedState(t, host) {
+  if (host?.status !== "online") return { cls: "never", label: `host ${host?.status || "unknown"}`, why: "status as of the host's last report" };
+  if (t.live) return t.status === "busy" || t.state === "working" ? { cls: "busy", label: "working" } : t.state === "blocked" ? { cls: "warn", label: "waiting for input" } : { cls: "online", label: "idle" };
+  if (t.state === "working") return { cls: "bad", label: "stopped mid-task" };
+  return { cls: "never", label: t.state === "ended" ? "ended" : "stopped" };
+}
+async function trackSession(host, a) {
+  try {
+    await post("/api/v1/claude/tracked", { host, key: a.key, session_id: a.session_id || null, name: a.name || null, cwd: a.cwd || null, kind: a.kind || null });
+    toast(`Tracking ${a.name || a.key.slice(0, 8)}`);
+  } catch (e) { toast("Could not track: " + e.message, true); }
+}
+async function trackedAction(t, action) {
+  try { await post(`/api/v1/claude/tracked/${t.id}/action`, { action }); toast(`${action === "restart" ? "Restart" : "Stop"} queued for ${t.name || t.key.slice(0, 8)}`); }
+  catch (e) { toast(e.message, true); }
+}
+
 const MODE_LABEL = { plan: "Plan / read-only", acceptEdits: "Accept edits", full: "Full access" };
 
 export async function renderAgents(params = {}) {
   const app = $("#app"); app.innerHTML = "";
   state.view = "agents";
-  try { await loadJobs(); } catch (e) { app.append(h("div", { class: "empty" }, `Cannot load jobs: ${e.message}`)); return; }
+  try { await Promise.all([loadJobs(), loadTracked()]); } catch (e) { app.append(h("div", { class: "empty" }, `Cannot load jobs: ${e.message}`)); return; }
   const hosts = [...state.hosts.values()].sort((a, b) => (a.status === "online" ? 0 : 1) - (b.status === "online" ? 0 : 1) || a.display_name.localeCompare(b.display_name));
   const sel = params.host && state.hosts.has(params.host) ? params.host : (hosts.find((x) => x.status === "online" && x.claude?.available)?.name || hosts[0]?.name);
   const left = h("div", {});
@@ -174,11 +203,16 @@ function renderAgentHosts() {
     const c = host.claude;
     const running = [...state.jobs.values()].filter((j) => j.host === host.name && j.status === "running").length;
     const queued = [...state.jobs.values()].filter((j) => j.host === host.name && j.status === "queued").length;
+    const trk = trackedOn(host.name), trkLive = host.status === "online" ? trk.filter((t) => t.live).length : 0;
+    const trkDown = host.status === "online" ? trk.filter((t) => !t.live && t.state === "working").length : 0;
     const card = h("div", { class: "card agent-host" + (host.name === v.host ? " sel" : ""), onclick: () => navigate("#/agents/" + encodeURIComponent(host.name)) },
       h("div", { class: "row" }, h("span", { class: "status-dot " + host.status }), h("span", { class: "name" }, host.display_name),
         h("span", { class: "muted" }, c ? (c.available ? `claude ${c.version || ""}` : "no claude cli") : (host.status === "online" ? "agent < 1.3" : host.status))),
       h("div", { class: "row", style: "font-size:12px;color:var(--ink-2);gap:12px" },
-        c ? h("span", {}, `${c.sessions} session${c.sessions === 1 ? "" : "s"} · ${c.active} active`) : null,
+        trk.length ? h("span", { title: "tracked sessions · running now" }, `${trk.length} tracked · ${trkLive} running`) : null,
+        trkDown ? h("span", { style: "color:var(--s-crit)" }, `${trkDown} stopped mid-task`) : null,
+        c && c.agents_live != null ? h("span", { class: "muted" }, `${c.agents_live} live session${c.agents_live === 1 ? "" : "s"}`)
+          : c ? h("span", {}, `${c.sessions} session${c.sessions === 1 ? "" : "s"} · ${c.active} active`) : null,
         running ? h("span", { style: "color:var(--c-blue)" }, `${running} running`) : null,
         queued ? h("span", { style: "color:var(--s-warn)" }, `${queued} queued`) : null,
         c?.user ? h("span", { class: "muted" }, "as " + c.user) : null),
@@ -204,9 +238,13 @@ async function renderConsole() {
   const mode = h("select", { title: "Permission mode" }, ...Object.entries(MODE_LABEL).map(([k, l]) => h("option", { value: k, class: k === "full" ? "mode-full" : "" }, l)));
   const cwd = h("input", { class: "cwd", list: "cwd-list", placeholder: "working directory (default: home)", value: cwds[0] || "", spellcheck: "false" });
   const dl = h("datalist", { id: "cwd-list" }, ...cwds.map((x) => h("option", { value: x })));
+  const tracked = trackedOn(host.name);
+  const resumable = [...tracked.filter((t) => t.session_id && !sessions.some((s) => s.session_id === t.session_id))
+    .map((t) => ({ session_id: t.session_id, label: `★ ${t.name || t.key.slice(0, 8)}` })),
+    ...sessions.slice(0, 15).map((s) => ({ session_id: s.session_id, label: `${(s.first_prompt || s.session_id).slice(0, 48)} · ${fmt.ago(Date.now() / 1000 - s.last_activity)}` }))];
   const resume = h("select", { title: "Continue an existing session" }, h("option", { value: "" }, "new session"),
-    ...sessions.slice(0, 15).map((s) => h("option", { value: s.session_id }, `${(s.first_prompt || s.session_id).slice(0, 48)} · ${fmt.ago(Date.now() / 1000 - s.last_activity)}`)));
-  if (v.resumeSession) { resume.value = v.resumeSession; const s = sessions.find((x) => x.session_id === v.resumeSession); if (s?.cwd) cwd.value = s.cwd; }
+    ...resumable.map((s) => h("option", { value: s.session_id }, s.label)));
+  if (v.resumeSession) { resume.value = v.resumeSession; const s = sessions.find((x) => x.session_id === v.resumeSession) || tracked.find((x) => x.session_id === v.resumeSession); if (s?.cwd) cwd.value = s.cwd; }
   const model = h("input", { placeholder: "model (optional)", style: "width:150px", spellcheck: "false" });
   const sendBtn = h("button", { class: "btn primary", html: ICON.send + " Send" });
   const send = async () => {
@@ -229,25 +267,76 @@ async function renderConsole() {
   ta.onkeydown = (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } };
   const avail = !c ? h("div", { class: "muted", style: "font-size:12.5px" }, host.status === "online" ? "This host's agent predates Claude support (needs 1.3). It updates itself on its next report once the hub is upgraded." : `Host is ${host.status}; prompts queue until it reports.`)
     : !c.available ? h("div", { class: "chip bad" }, "claude CLI not found on this host") : null;
+  const continueIn = (sid, dir) => { resume.value = sid; if (dir) cwd.value = dir; ta.focus(); toast("Next prompt continues this session"); };
+
+  // ---- tracked sessions (registered; kept when stopped or the host is offline)
+  const canAct = !!c?.actions;
+  const trackedCard = h("div", { class: "card table-card" },
+    h("h3", {}, `Tracked agents on ${host.display_name}`, h("span", { class: "muted", style: "font-weight:400;font-size:12px;margin-left:8px" },
+      "stay listed when stopped · track one below, or run ", h("code", {}, "avm agent track"), " inside it")));
+  if (!tracked.length) trackedCard.append(h("div", { class: "muted", style: "font-size:12.5px" }, "Nothing tracked on this host yet."));
+  const tbox = h("div", { class: "sessions" });
+  for (const t of tracked) {
+    const st = trackedState(t, host), pend = pendingAction(t);
+    const ago = t.last_activity ? fmt.ago(Date.now() / 1000 - t.last_activity) : "";
+    const btn = (label, cls, onclick, extra = {}) => h("button", { class: "btn small " + cls, onclick, ...extra }, label);
+    const actions = [];
+    if (pend) actions.push(h("span", { class: "chip warn" }, `${pend.action} ${pend.status === "queued" ? (host.status === "online" ? "queued…" : "queued until the host is back") : "running…"}`));
+    else if (!t.live || host.status !== "online") {
+      actions.push(btn("Restart", "primary", () => trackedAction(t, "restart"), canAct ? { title: t.kind === "background" ? "claude respawn: same agent, same conversation" : "resume as a background agent" }
+        : { disabled: "", title: host.status === "online" ? "needs agent 1.5 on this host" : "host offline" }));
+      if (t.session_id) actions.push(btn("Prompt it", "", () => continueIn(t.session_id, t.cwd), { title: "send one prompt that continues this conversation (claude -p --resume)" }));
+    } else if (t.kind === "background") actions.push(btn("Stop", "danger", () => { if (confirm(`Stop ${t.name || t.key}?`)) trackedAction(t, "stop"); }, canAct ? {} : { disabled: "", title: "needs agent 1.5 on this host" }));
+    actions.push(btn("Untrack", "", async () => { if (!confirm(`Stop tracking ${t.name || t.key}? (The session itself is not touched.)`)) return; try { await post(`/api/v1/claude/tracked/${t.id}`, undefined, "DELETE"); } catch (e) { toast(e.message, true); } }, { style: "margin-left:auto" }));
+    tbox.append(h("div", { class: "session tracked" },
+      h("div", { class: "t" }, h("span", { class: "trk-dot " + st.cls, title: st.why || "" }), h("b", {}, t.name || t.key.slice(0, 8)),
+        h("span", { class: "chip trk " + st.cls }, st.label), t.kind ? h("span", { class: "muted", style: "font-size:11px" }, t.kind) : null,
+        h("span", { class: "muted", style: "margin-left:auto;white-space:nowrap", title: t.last_live ? "last seen running " + fmt.when(t.last_live) : "" }, ago)),
+      t.detail ? h("div", { class: "snip" }, h("b", {}, "doing: "), t.detail) : null,
+      t.last_said ? h("div", { class: "snip" }, h("b", {}, "last said: "), t.last_said) : null,
+      h("div", { class: "proj", title: t.cwd || "" }, t.cwd || "", t.note ? h("span", { class: "muted" }, " · " + t.note) : null),
+      h("div", { class: "actions" }, actions)));
+  }
+  if (tracked.length) trackedCard.append(tbox);
+  v.right.append(trackedCard);
+
   v.right.append(h("div", { class: "card prompt-box" },
     h("div", { style: "display:flex;align-items:center;gap:8px" }, h("b", {}, host.display_name), h("span", { class: "muted", style: "font-size:12px" }, c ? `claude ${c.version || "?"} · runs as ${c.user || "?"}` : ""), h("span", { class: "spacer" }), avail),
     ta, dl,
     h("div", { class: "opts" }, mode, resume, cwd, model, sendBtn),
   ));
 
-  // ---- recent sessions on the host
+  // ---- other sessions Claude Code knows about (never subagents) - track the ones worth keeping
+  const known = new Set(tracked.flatMap((t) => [t.key, t.session_id]).filter(Boolean));
+  const others = (c?.agents || []).filter((a) => a.listed !== false && !known.has(a.key) && !known.has(a.session_id));
+  if (others.length) {
+    const box = h("div", { class: "sessions" });
+    for (const a of others) {
+      box.append(h("div", { class: "session compact" },
+        h("div", { class: "t" }, h("span", { class: "trk-dot " + (a.live ? (a.status === "busy" ? "busy" : "online") : "never") }), h("b", {}, a.name || a.key.slice(0, 8)),
+          h("span", { class: "muted", style: "font-size:11px" }, `${a.kind || ""}${a.live ? "" : " · stopped"}${a.state && a.state !== "done" ? " · " + a.state : ""}`),
+          h("span", { class: "muted", style: "margin-left:auto;white-space:nowrap" }, a.last_activity ? fmt.ago(Date.now() / 1000 - a.last_activity) : ""),
+          h("button", { class: "btn small", onclick: () => trackSession(host.name, a) }, "Track")),
+        a.detail || a.last_said ? h("div", { class: "snip" }, a.detail || a.last_said) : null));
+    }
+    v.right.append(h("div", { class: "card table-card" }, h("h3", {}, `Other sessions on ${host.display_name}`,
+      h("span", { class: "muted", style: "font-weight:400;font-size:12px;margin-left:8px" }, "from claude agents · subagents are never listed")), box));
+  }
+
+  // ---- raw transcripts (older agents, or sessions Claude no longer lists), collapsed
   if (sessions.length) {
     const box = h("div", { class: "sessions" });
-    for (const s of sessions.slice(0, 8)) {
-      box.append(h("div", { class: "session" },
+    for (const s of sessions.slice(0, 20)) {
+      box.append(h("div", { class: "session compact" },
         h("div", { class: "t" }, h("span", { class: "status-dot " + (s.active ? "online" : "never"), style: "width:7px;height:7px" }), h("span", { class: "proj", title: s.cwd }, s.cwd || s.project),
           h("span", { class: "muted", style: "margin-left:auto;white-space:nowrap" }, fmt.ago(Date.now() / 1000 - s.last_activity)), s.dashboard_job ? h("span", { class: "chip", style: "font-size:10px" }, "from dashboard") : null),
         s.first_prompt ? h("div", { class: "snip" }, h("b", {}, "started with: "), s.first_prompt) : null,
-        s.last_assistant ? h("div", { class: "snip" }, h("b", {}, "last said: "), s.last_assistant) : (s.last_user ? h("div", { class: "snip" }, h("b", {}, "last asked: "), s.last_user) : null),
-        h("div", { class: "actions" }, h("button", { class: "btn small", onclick: () => { resume.value = s.session_id; if (s.cwd) cwd.value = s.cwd; ta.focus(); toast("Next prompt continues this session"); } }, "Continue this session")),
-      ));
+        h("div", { class: "actions" },
+          h("button", { class: "btn small", onclick: () => continueIn(s.session_id, s.cwd) }, "Continue this session"),
+          known.has(s.session_id) ? null : h("button", { class: "btn small", onclick: () => trackSession(host.name, { key: s.session_id, session_id: s.session_id, cwd: s.cwd, name: (s.first_prompt || "").slice(0, 60), kind: "interactive" }) }, "Track"))));
     }
-    v.right.append(h("div", { class: "card table-card" }, h("h3", {}, `Sessions on ${host.display_name}`, h("span", { class: "muted", style: "font-weight:400;font-size:12px;margin-left:8px" }, "last 24 h · from ~/.claude")), box));
+    v.right.append(h("details", { class: "card table-card transcripts" }, h("summary", {}, `Recent transcripts on ${host.display_name}`,
+      h("span", { class: "muted", style: "font-weight:400;font-size:12px;margin-left:8px" }, `${sessions.length} in the last 24 h · from ~/.claude`)), box));
   }
 
   // ---- jobs + transcript
@@ -267,7 +356,7 @@ function renderJobs() {
   for (const j of jobs) {
     v.jobsEl.append(h("div", { class: `card job ${j.status}${j.id === v.job ? " sel" : ""}`, onclick: () => { v.job = j.id; renderJobs(); renderTranscript(); } },
       h("span", { class: "dot" }),
-      h("div", {}, h("div", {}, j.title), h("div", { class: "meta" }, `${j.status} · ${MODE_LABEL[j.mode] || j.mode} · ${fmt.when(j.created)}${j.created_by ? " · " + j.created_by : ""}${j.cost_usd != null ? " · " + fmt.usd(j.cost_usd) : ""}`)),
+      h("div", {}, h("div", {}, j.title), h("div", { class: "meta" }, `${j.status} · ${j.action ? "session " + j.action : MODE_LABEL[j.mode] || j.mode} · ${fmt.when(j.created)}${j.created_by ? " · " + j.created_by : ""}${j.cost_usd != null ? " · " + fmt.usd(j.cost_usd) : ""}`)),
       (j.status === "queued" || j.status === "running") ? h("button", { class: "btn small danger", onclick: async (e) => { e.stopPropagation(); try { await post(`/api/v1/claude/jobs/${j.id}/cancel`, {}); } catch (err) { toast(err.message, true); } } }, "Cancel") : h("span", { class: "muted num", style: "font-size:11px" }, j.num_turns != null ? `${j.num_turns} turn${j.num_turns === 1 ? "" : "s"}` : ""),
     ));
   }
@@ -284,10 +373,17 @@ async function renderTranscript() {
   }
   const head = h("div", { style: "display:flex;gap:10px;align-items:center;flex-wrap:wrap" },
     h("b", {}, `#${j.id}`), h("span", { class: "chip " + (j.status === "failed" ? "bad" : j.status === "done" ? "ok" : j.status === "running" ? "" : "warn") }, j.status),
-    h("span", { class: "muted", style: "font-size:12px" }, `${MODE_LABEL[j.mode] || j.mode}${j.cwd ? " · " + j.cwd : ""}${j.session_id ? " · session " + j.session_id.slice(0, 8) : ""}${j.duration_ms ? " · " + fmt.dur(j.duration_ms / 1000) : ""}${j.cost_usd != null ? " · " + fmt.usd(j.cost_usd) : ""}`),
+    h("span", { class: "muted", style: "font-size:12px" }, `${j.action ? "session " + j.action : MODE_LABEL[j.mode] || j.mode}${j.cwd ? " · " + j.cwd : ""}${j.session_id ? " · session " + j.session_id.slice(0, 8) : ""}${j.duration_ms ? " · " + fmt.dur(j.duration_ms / 1000) : ""}${j.cost_usd != null ? " · " + fmt.usd(j.cost_usd) : ""}`),
     h("span", { class: "spacer" }),
     j.session_id && (j.status === "done" || j.status === "failed") ? h("button", { class: "btn small", onclick: () => { v.resumeSession = j.session_id; renderConsole(); } }, "Continue this conversation") : null,
   );
+  if (j.action) {   // restart/stop of a tracked session: no conversation, just what the CLI said
+    el.append(head, h("div", { class: "muted", style: "font-size:12.5px" }, `${j.action} of ${j.target?.name || j.target?.key || "?"}${j.created_by ? " · by " + j.created_by : ""}`));
+    if (j.result) el.append(h("div", { class: "result-box" + (j.status === "failed" ? " err" : "") }, j.result));
+    else if (j.status === "queued") el.append(h("div", { class: "muted" }, "Waiting for the host's agent to pick this up…"));
+    if (j.error && j.error !== j.result) el.append(h("div", { class: "result-box err" }, j.error));
+    return;
+  }
   el.append(head, h("div", { class: "msg user" }, h("div", { class: "who" }, "prompt" + (j.created_by ? " · " + j.created_by : "")), h("div", { class: "body" }, j.prompt)));
   for (const ev of events) el.append(...eventNodes(ev));
   if (j.status === "running") el.append(h("div", { class: "msg assistant", "data-f": "live" }, h("div", { class: "body" }, h("span", { class: "cursor" }))));
@@ -313,6 +409,7 @@ function eventNodes(ev) {
 on("claude_job", (j) => {
   const prev = state.jobs.get(j.id);
   state.jobs.set(j.id, j);
+  if (j.action) redrawTracked();
   if (state.view === "agents" && state.agentsView) {
     renderAgentHosts(); renderJobs();
     if (state.agentsView.job === j.id && prev?.status !== j.status) renderTranscript();
@@ -331,6 +428,21 @@ on("claude_event", ({ job_id, event }) => {
   }
 });
 on("host", () => { if (state.view === "agents" && state.agentsView) renderAgentHosts(); });
+// Tracked sessions change rarely (start/stop, state, a new detail line): re-render the console, but never while
+// the user is typing a prompt (that would clear the box).
+let trackedRedraw = 0;
+function redrawTracked() {
+  if (state.view !== "agents" || !state.agentsView) return;
+  renderAgentHosts();
+  clearTimeout(trackedRedraw);
+  trackedRedraw = setTimeout(() => {
+    const ta = state.agentsView?.right?.querySelector("textarea");
+    if (ta && (ta.value.trim() || document.activeElement === ta)) return;
+    renderConsole();
+  }, 300);
+}
+on("claude_tracked", (row) => { if (!state.tracked) return; state.tracked.set(row.id, row); redrawTracked(); });
+on("claude_untracked", ({ id }) => { if (state.tracked?.delete(id)) redrawTracked(); });
 
 // ================================================================== alerts
 export function computeAlerts() {
@@ -350,7 +462,13 @@ export function computeAlerts() {
     if (t.status === "stalled") out.push({ level: "warn", what: `task stalled: ${t.name}`, why: `no heartbeat for ${fmt.dur(now - t.heartbeat)}`, host: t.host, go, ts: t.heartbeat, task: t.id });
     if (t.status === "lost") out.push({ level: "warn", what: `task lost: ${t.name}`, why: "its host went offline while it was running", host: t.host, go, ts: t.updated, task: t.id });
   }
-  for (const j of state.jobs.values()) if (j.status === "failed" && now - (j.ended || j.created) < 86400) out.push({ level: "warn", what: `claude prompt failed: ${j.title}`, why: (j.error || "").slice(0, 160), host: j.host, go: `#/agents/${encodeURIComponent(j.host)}`, ts: j.ended });
+  // a tracked agent whose process is gone while Claude still says it was working: it crashed or was killed
+  for (const t of state.tracked?.values() || []) {
+    if (t.live || t.state !== "working" || state.hosts.get(t.host)?.status !== "online") continue;
+    out.push({ level: "warn", what: `tracked agent stopped mid-task: ${t.name || t.key.slice(0, 8)}`, why: t.detail || "restart it from the Agents tab",
+      host: t.host, go: `#/agents/${encodeURIComponent(t.host)}`, ts: t.last_live || t.last_activity });
+  }
+  for (const j of state.jobs.values()) if (j.status === "failed" && now - (j.ended || j.created) < 86400) out.push({ level: "warn", what: `claude ${j.action || "prompt"} failed: ${j.title}`, why: (j.error || "").slice(0, 160), host: j.host, go: `#/agents/${encodeURIComponent(j.host)}`, ts: j.ended });
   return out.sort((a, b) => (a.level === "crit" ? 0 : 1) - (b.level === "crit" ? 0 : 1) || (b.ts || 0) - (a.ts || 0));
 }
 

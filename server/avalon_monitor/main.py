@@ -38,7 +38,7 @@ AGENT_COMMANDS = ("respawn",)
 
 from .core import (AGENT_SCRIPT, AgentBundle, LiveHub, agent_bundle, authz, client_ip, db, gpu_stall, hub,  # noqa: F401
                    require_agent, require_same_origin, require_viewer)
-from .routes_ops import router as ops_router, task_public
+from .routes_ops import router as ops_router, task_public, tracked_public
 from .routes_results import router as results_router
 
 
@@ -95,8 +95,11 @@ def _claude_summary(c: Optional[dict]) -> Optional[dict]:
     if not c:
         return None
     sessions = c.get("sessions") or []
+    agents = c.get("agents")
     return {"available": c.get("available"), "version": c.get("version"), "user": c.get("user"),
             "sessions": len(sessions), "active": sum(1 for x in sessions if x.get("active")),
+            "agents_live": sum(1 for x in agents if x.get("live")) if isinstance(agents, list) else None,
+            "actions": "agent_actions" in (c.get("features") or []),
             "processes": len(c.get("processes") or []), "running_job": c.get("running_job")}
 
 
@@ -260,7 +263,13 @@ async def ingest(request: Request):
     if agent_bundle.available:
         reply["agent"] = {"version": agent_bundle.version, "sha256": agent_bundle.sha256,
                           "auto_update": settings.agent_auto_update, "files": agent_bundle.companion_hashes()}
-    queued, cancel = await run_in_threadpool(db.jobs_pending_for, host.id)
+    claude = sample.claude if isinstance(sample.claude, dict) else {}
+    if isinstance(claude.get("agents"), list):   # agent 1.5+: refresh tracked sessions, tell the agent which ones they are
+        for row in await run_in_threadpool(db.tracked_sync, host.id, claude["agents"], now):
+            await hub.broadcast({"type": "claude_tracked", "row": tracked_public(row)})
+        tracked = await run_in_threadpool(db.tracked_list, host.id)
+        reply["claude_tracked"] = [{"key": t["key"], "session_id": t["session_id"], "kind": t["kind"]} for t in tracked]
+    queued, cancel = await run_in_threadpool(db.jobs_pending_for, host.id, "agent_actions" in (claude.get("features") or []))
     if queued:
         reply["claude_jobs"] = queued
     if cancel:

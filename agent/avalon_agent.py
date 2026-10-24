@@ -63,7 +63,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import psutil
@@ -71,7 +71,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.4.0"
+AGENT_VERSION = "1.5.0"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -895,9 +895,13 @@ def _systemd_check(item: str, kind: str) -> Dict[str, Any]:
 
 # ------------------------------------------------------------- claude code
 class ClaudeRunner:
-    """Runs dashboard-submitted prompts through `claude -p` and streams events back to the hub."""
+    """Runs dashboard-submitted prompts through `claude -p` and streams events back to the hub; also reports
+    Claude Code's own session list (`claude agents`) and runs restart/stop actions on tracked sessions."""
 
     MAX_EVENTS_PER_POST = 200
+    AGENTS_REFRESH_SEC = 30
+    AGENTS_MAX = 40
+    FEATURES = ["agent_actions"]   # tells the hub it may queue restart/stop jobs here (older agents would run them as prompts)
 
     def __init__(self, cfg: Dict[str, str]):
         self.cfg = cfg
@@ -910,6 +914,11 @@ class ClaudeRunner:
         self.seen: set = set()
         self.cancel_ids: set = set()
         self._version_checked = 0.0
+        self.job_sessions: set = set()       # session ids that dashboard jobs ran in
+        self.tracked: List[Dict[str, Any]] = []   # [{"key", "session_id"}] the hub tracks here (sent with each reply)
+        self._agents: List[Dict[str, Any]] = []
+        self._agents_at = -1e9
+        self._agents_busy = False
 
     def _find_claude(self) -> Optional[str]:
         """PATH first; then the usual install locations (service units often run with a minimal PATH)."""
@@ -971,7 +980,7 @@ class ClaudeRunner:
         for mtime, fp, slug, sid in files[:limit]:
             info = self._session_summary(fp)
             info.update({"session_id": sid, "project": slug, "last_activity": mtime, "active": now - mtime < 120,
-                         "dashboard_job": sid in self.seen})
+                         "dashboard_job": sid in self.job_sessions})
             out.append(info)
         return out
 
@@ -1032,6 +1041,107 @@ class ClaudeRunner:
         return {"cwd": cwd, "first_prompt": first_prompt, "last_user": last_user, "last_assistant": last_assistant,
                 "first_ts": first_ts, "last_ts": last_ts, "claude_version": version, "git_branch": branch}
 
+    def _env(self) -> Dict[str, str]:
+        """Environment for claude subprocesses: never inherit a parent Claude session; give it the user's tool dirs."""
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+        if not IS_WINDOWS and self.bin:  # service units start with a minimal PATH
+            extra = [os.path.join(self.home, ".local", "bin"), "/usr/local/bin", os.path.dirname(self.bin)]
+            env["PATH"] = os.pathsep.join([d for d in extra if d and os.path.isdir(d)] + [env.get("PATH", "/usr/bin:/bin")])
+        return env
+
+    def _claude(self, args: List[str], timeout: float, cwd: Optional[str] = None) -> Tuple[int, str]:
+        """Run the claude CLI once; (returncode, stdout+stderr). Never raises."""
+        try:
+            p = subprocess.run([self.bin] + args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                               cwd=cwd if cwd and os.path.isdir(cwd) else self.home, env=self._env(), stdin=subprocess.DEVNULL,
+                               **({"creationflags": 0x08000000} if IS_WINDOWS else {}))
+            return p.returncode, (p.stdout or "") + (p.stderr or "")
+        except (OSError, subprocess.SubprocessError) as e:
+            return -1, str(e)
+
+    def agents(self) -> List[Dict[str, Any]]:
+        """Claude Code's own session list (`claude agents --json --all`): background agents including stopped ones,
+        plus live interactive sessions. Subagents never appear there, so it stays small however busy a session is.
+        Refreshed in a background thread every AGENTS_REFRESH_SEC; returns the last good list."""
+        if self.bin and not self._agents_busy and time.monotonic() - self._agents_at > self.AGENTS_REFRESH_SEC:
+            self._agents_busy = True
+            threading.Thread(target=self._refresh_agents, daemon=True, name="claude-agents").start()
+        return self._agents
+
+    def _refresh_agents(self) -> None:
+        try:
+            rc, out = self._claude(["agents", "--json", "--all"], timeout=30)
+            try:
+                data = json.loads(out[out.index("["):]) if rc == 0 and "[" in out else None
+            except ValueError:
+                data = None
+            if isinstance(data, list):
+                self._agents = self._shape_agents([d for d in data if isinstance(d, dict)])
+            elif rc != 0:
+                log.debug("claude agents failed (rc=%s): %s", rc, out[-200:])
+        finally:
+            self._agents_at = time.monotonic()
+            self._agents_busy = False
+
+    def _transcript(self, session_id: str, hint: Optional[str] = None) -> Optional[str]:
+        """Path of a session's transcript: ~/.claude/projects/<slug>/<session_id>.jsonl."""
+        if hint and os.path.isfile(hint):
+            return hint
+        root = os.path.join(self.home, ".claude", "projects")
+        try:
+            for slug in os.listdir(root):
+                fp = os.path.join(root, slug, session_id + ".jsonl")
+                if os.path.isfile(fp):
+                    return fp
+        except OSError:
+            pass
+        return None
+
+    def _shape_agents(self, raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        tracked = {t.get("key") for t in self.tracked} | {t.get("session_id") for t in self.tracked}
+        out: List[Tuple[Dict[str, Any], Optional[str]]] = []
+        for s in raw:
+            sid = s.get("sessionId") or ""
+            key = s.get("id") or sid   # background agents have a stable short id; interactive sessions only a session id
+            if not key:
+                continue
+            a = {"key": key, "session_id": sid, "kind": s.get("kind") or "", "name": (s.get("name") or "")[:120],
+                 "cwd": s.get("cwd") or "", "live": bool(s.get("pid")), "pid": s.get("pid"), "state": s.get("state"),
+                 "status": s.get("status"), "started": (s["startedAt"] / 1000.0) if isinstance(s.get("startedAt"), (int, float)) else None}
+            hint = None
+            if s.get("id"):  # background job state: a one-line "what I'm doing" plus the transcript path
+                try:
+                    with open(os.path.join(self.home, ".claude", "jobs", s["id"], "state.json"), encoding="utf-8") as f:
+                        st = json.load(f)
+                    a["detail"] = str(st.get("detail") or "")[:240]
+                    hint = st.get("linkScanPath")
+                except (OSError, ValueError):
+                    pass
+            out.append((a, hint))
+        # tracked sessions Claude no longer lists (e.g. an interactive session that exited): report them from their transcript
+        listed = {a["key"] for a, _ in out} | {a["session_id"] for a, _ in out}
+        for t in self.tracked:
+            if t.get("key") not in listed and t.get("session_id") not in listed and (t.get("session_id") or t.get("key")):
+                out.append(({"key": t["key"], "session_id": t.get("session_id") or t["key"], "kind": t.get("kind") or "",
+                             "live": False, "state": "ended", "listed": False}, None))
+        out.sort(key=lambda x: (not x[0]["live"], x[0]["key"] not in tracked, -(x[0].get("started") or 0)))
+        shaped = []
+        for a, hint in out:
+            if len(shaped) >= self.AGENTS_MAX and a["key"] not in tracked and a["session_id"] not in tracked:
+                continue
+            fp = self._transcript(a["session_id"], hint) if a["session_id"] else None
+            if fp:
+                try:
+                    a["last_activity"] = os.stat(fp).st_mtime
+                except OSError:
+                    pass
+                summ = self._session_summary(fp)
+                a["last_said"] = summ.get("last_assistant") or ""
+                a["cwd"] = a.get("cwd") or summ.get("cwd") or ""
+                a["first_prompt"] = summ.get("first_prompt") or ""
+            shaped.append(a)
+        return shaped
+
     @staticmethod
     def processes() -> List[Dict[str, Any]]:
         out = []
@@ -1063,6 +1173,7 @@ class ClaudeRunner:
             queued = [q["id"] for q in self.queue]
         return {"available": bool(self.bin), "bin": self.bin, "version": self.check_version(), "user": _whoami(), "home": self.home,
                 "sessions": _safe(self.sessions, default=[]), "processes": _safe(self.processes, default=[]),
+                "agents": _safe(self.agents, default=[]), "features": self.FEATURES,
                 "running_job": running, "queued_jobs": queued}
 
     # ---- job execution
@@ -1118,6 +1229,10 @@ class ClaudeRunner:
             self._post("/claude/jobs/%d/finish" % jid, {"status": "failed", "error": "claude CLI not found on this host"})
             self._done()
             return
+        if job.get("action"):
+            self._run_action(job)
+            self._done()
+            return
         cwd = job.get("cwd") or self.home
         if not os.path.isdir(cwd):
             self._post("/claude/jobs/%d/finish" % jid, {"status": "failed", "error": "cwd does not exist: %s" % cwd})
@@ -1137,11 +1252,8 @@ class ClaudeRunner:
                  "You were started from the Avalon Monitor dashboard on host %s. When you launch anything long-running "
                  "(training, builds, services), wrap it as `avm run \"<name>\" -- <command>` so it is tracked; `avm --help` for details."
                  % socket.gethostname()]
-        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}  # never inherit a parent Claude session
+        env = self._env()
         env["AVM_CLAUDE_JOB"] = str(jid)
-        if not IS_WINDOWS:  # service units start with a minimal PATH; give the session the user's usual tool dirs
-            extra = [os.path.join(self.home, ".local", "bin"), "/usr/local/bin", os.path.dirname(self.bin)]
-            env["PATH"] = os.pathsep.join([d for d in extra if d and os.path.isdir(d)] + [env.get("PATH", "/usr/bin:/bin")])
         try:
             proc = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
@@ -1204,6 +1316,8 @@ class ClaudeRunner:
         flush()
         if jid in self.cancel_ids:
             cancelled = True
+        if final.get("session_id") or session_id:
+            self.job_sessions.add(final.get("session_id") or session_id)
         status = "cancelled" if cancelled else ("done" if rc == 0 and not final.get("is_error") else "failed")
         err = None
         if status == "failed":
@@ -1218,6 +1332,40 @@ class ClaudeRunner:
         with self.lock:
             self.current = None
         self._pump()
+
+    def _run_action(self, job: Dict[str, Any]) -> None:
+        """restart / stop a tracked session. Background agents restart in place (`claude respawn <id>`: same id, name and
+        conversation); anything else - or a failed respawn - resumes as a new background agent, whose id is sent back
+        as new_key so the hub's registration follows it."""
+        jid, action, t = job["id"], job["action"], job.get("target") or {}
+        key, sid, cwd = t.get("key") or "", t.get("session_id") or "", t.get("cwd") or None
+        self._post("/claude/jobs/%d/start" % jid, {})
+        new_key = None
+        if action == "stop":
+            rc, out = self._claude(["stop", key], timeout=60)
+            ok = rc == 0
+        elif action == "restart":
+            rc, out = (self._claude(["respawn", key], timeout=90) if t.get("kind") == "background" else (1, ""))
+            ok = rc == 0
+            if not ok and sid:
+                prompt = job.get("prompt") or "You were restarted from the Avalon Monitor dashboard. Pick up where you left off."
+                args = ["--bg", "--resume", sid] + (["-n", t["name"]] if t.get("name") else []) + [prompt]
+                rc2, out2 = self._claude(args, timeout=90, cwd=cwd)
+                out = (out + "\n" if out else "") + out2
+                m = re.search(r"backgrounded\W+([0-9a-f]{8})\b", out2)
+                ok = rc2 == 0
+                new_key = m.group(1) if (ok and m) else None
+        else:
+            ok, out = False, "unknown action %r" % action
+        out = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", out).strip()[-2000:]
+        self._agents_at = -1e9   # refresh the session list on the next report so the dashboard sees the change
+        body: Dict[str, Any] = {"status": "done" if ok else "failed", "result": out or None}
+        if not ok:
+            body["error"] = out[-800:] or "%s failed" % action
+        if new_key:
+            body["new_key"] = new_key
+        self._post("/claude/jobs/%d/finish" % jid, body)
+        log.info("claude %s of %s: %s%s", action, key or sid, "ok" if ok else "failed", " -> " + new_key if new_key else "")
 
 
 def _compact_event(ev: Dict[str, Any]) -> Dict[str, Any]:
@@ -1598,6 +1746,8 @@ def main(argv=None) -> int:
             failures = 0
             if remote.apply(reply):
                 log.info("applied remote settings rev %s: %s", remote.rev, ", ".join(sorted(remote.overrides)) or "(cleared)")
+            if _CLAUDE and isinstance(reply.get("claude_tracked"), list):
+                _CLAUDE.tracked = [t for t in reply["claude_tracked"] if isinstance(t, dict)][:200]
             if _CLAUDE and (reply.get("claude_jobs") or reply.get("claude_cancel")):
                 _CLAUDE.accept(reply.get("claude_jobs") or [], reply.get("claude_cancel") or [])
             if reply.get("command") == "respawn":

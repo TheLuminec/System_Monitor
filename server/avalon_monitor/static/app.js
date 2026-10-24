@@ -1,9 +1,9 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.6.0";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.7.0";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
-         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate } from "./core.js?v=1.6.0";
-import { renderResearch } from "./research.js?v=1.6.0";
-import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, taskAlerting, ackTasks } from "./views.js?v=1.6.0";
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate } from "./core.js?v=1.7.0";
+import { renderResearch } from "./research.js?v=1.7.0";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.7.0";
 
 // ------------------------------------------------------------------ shell
 const NAV = [
@@ -521,6 +521,8 @@ function onHostUpdate(host) {
 }
 on("task", (t) => { if (state.view === "fleet") { const card = $(`.host-card[data-host="${CSS.escape(t.host)}"]`); const host = state.hosts.get(t.host); if (card && host) updateCard(card, host); } renderNav(); renderFleetStats(); });
 on("claude_job", () => { renderNav(); });
+on("claude_tracked", () => { renderNav(); });
+on("claude_untracked", () => { renderNav(); });
 
 let wsRetry = 1000;
 function connectWs() {
@@ -537,6 +539,8 @@ function connectWs() {
     else if (msg.type === "task_deleted") emit("task_deleted", msg);
     else if (msg.type === "claude_job") emit("claude_job", msg.job);
     else if (msg.type === "claude_event") emit("claude_event", msg);
+    else if (msg.type === "claude_tracked") emit("claude_tracked", msg.row);
+    else if (msg.type === "claude_untracked") emit("claude_untracked", msg);
     else if (msg.type === "results") emit("results", msg);
   };
   ws.onclose = (ev) => {
@@ -593,7 +597,7 @@ async function init() {
     return;
   }
   await loadPrefs();
-  Promise.all([loadTasks(), loadJobs()]).then(() => { renderNav(); renderFleetStats(); }).catch(() => {});
+  Promise.all([loadTasks(), loadJobs(), loadTracked()]).then(() => { renderNav(); renderFleetStats(); }).catch(() => {});
   renderTopbar();
   renderFleetStats();
   window.addEventListener("hashchange", route);

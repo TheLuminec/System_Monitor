@@ -122,6 +122,30 @@ CREATE TABLE IF NOT EXISTS claude_jobs (
 );
 CREATE INDEX IF NOT EXISTS claude_jobs_host ON claude_jobs(host_id, status);
 
+-- Claude Code sessions the user chose to track on the Agents page. Kept when the session stops or its host goes
+-- offline, so it can still be seen and restarted. key = the background agent's id from `claude agents`
+-- (stable across restarts), or the session id for an interactive session. Updated from each agent report.
+CREATE TABLE IF NOT EXISTS claude_tracked (
+    id              INTEGER PRIMARY KEY,
+    host_id         INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+    key             TEXT NOT NULL,
+    session_id      TEXT,
+    name            TEXT,
+    cwd             TEXT,
+    kind            TEXT,
+    note            TEXT,
+    added           REAL NOT NULL,
+    added_by        TEXT,
+    live            INTEGER NOT NULL DEFAULT 0,
+    state           TEXT,                 -- working | blocked | done | ended (Claude's own task state)
+    status          TEXT,                 -- busy | idle while live
+    detail          TEXT,
+    last_said       TEXT,
+    last_activity   REAL,
+    last_live       REAL,
+    UNIQUE(host_id, key)
+);
+
 CREATE TABLE IF NOT EXISTS claude_events (
     job_id  INTEGER NOT NULL REFERENCES claude_jobs(id) ON DELETE CASCADE,
     seq     INTEGER NOT NULL,
@@ -255,6 +279,10 @@ class Database:
         for col, ddl in (("acked", "REAL"), ("acked_by", "TEXT")):
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(claude_jobs)")}
+        for col, ddl in (("action", "TEXT"), ("target", "TEXT")):   # action jobs: restart/stop a tracked session
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE claude_jobs ADD COLUMN {col} {ddl}")
 
     def close(self) -> None:
         with self._lock:
@@ -588,14 +616,16 @@ class Database:
 
     # ---------------------------------------------------------- claude jobs
     def job_create(self, host_id: int, prompt: str, cwd: str | None, mode: str, model: str | None,
-                   resume_session: str | None, created_by: str | None) -> dict:
+                   resume_session: str | None, created_by: str | None, action: str | None = None,
+                   target: dict | None = None, title: str | None = None) -> dict:
         now = time.time()
-        title = prompt.strip().splitlines()[0][:80] if prompt.strip() else "(empty)"
+        title = title or (prompt.strip().splitlines()[0][:80] if prompt.strip() else "(empty)")
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO claude_jobs(host_id, status, prompt, cwd, mode, model, resume_session, created, created_by, title)"
-                " VALUES (?,'queued',?,?,?,?,?,?,?,?)",
-                (host_id, prompt, cwd, mode, model, resume_session, now, created_by, title),
+                "INSERT INTO claude_jobs(host_id, status, prompt, cwd, mode, model, resume_session, created, created_by, title, action, target)"
+                " VALUES (?,'queued',?,?,?,?,?,?,?,?,?,?)",
+                (host_id, prompt, cwd, mode, model, resume_session, now, created_by, title, action,
+                 json.dumps(target) if target is not None else None),
             )
             return _row(self._conn.execute("SELECT * FROM claude_jobs WHERE id=?", (cur.lastrowid,)).fetchone())
 
@@ -610,11 +640,22 @@ class Database:
         with self._lock:
             return [dict(r) for r in self._conn.execute(sql, vals).fetchall()]
 
-    def jobs_pending_for(self, host_id: int) -> tuple[list[dict], list[int]]:
-        """(queued jobs to hand to the agent, ids of running jobs with cancel requested)."""
+    def jobs_pending_for(self, host_id: int, actions_ok: bool = False) -> tuple[list[dict], list[int]]:
+        """(queued jobs to hand to the agent, ids of running jobs with cancel requested).
+        Action jobs (restart/stop) wait until the agent says it understands them: an older agent would run them as prompts."""
         with self._lock:
-            queued = [dict(r) for r in self._conn.execute(
-                "SELECT id, prompt, cwd, mode, model, resume_session FROM claude_jobs WHERE host_id=? AND status='queued' ORDER BY id", (host_id,)).fetchall()]
+            queued = []
+            for r in self._conn.execute(
+                    "SELECT id, prompt, cwd, mode, model, resume_session, action, target FROM claude_jobs"
+                    " WHERE host_id=? AND status='queued' ORDER BY id", (host_id,)).fetchall():
+                j = dict(r)
+                if j["action"] and not actions_ok:
+                    continue
+                if not j["action"]:
+                    del j["action"], j["target"]   # prompt jobs look exactly as they did for older agents
+                else:
+                    j["target"] = json.loads(j["target"] or "{}")
+                queued.append(j)
             cancel = [r["id"] for r in self._conn.execute(
                 "SELECT id FROM claude_jobs WHERE host_id=? AND status IN ('queued','running') AND cancel=1", (host_id,)).fetchall()]
             return queued, cancel
@@ -667,6 +708,89 @@ class Database:
         now = now or time.time()
         with self._lock:
             return self._conn.execute("DELETE FROM claude_jobs WHERE status IN ('done','failed','cancelled') AND created < ?", (now - days * 86400,)).rowcount
+
+    # ------------------------------------------------------- tracked sessions
+    TRACK_SYNC = ("session_id", "name", "cwd", "kind", "live", "state", "status", "detail", "last_said", "last_activity")
+
+    def tracked_list(self, host_id: int | None = None) -> list[dict]:
+        sql = "SELECT * FROM claude_tracked" + (" WHERE host_id=?" if host_id is not None else "") + " ORDER BY live DESC, name COLLATE NOCASE"
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(sql, [host_id] if host_id is not None else []).fetchall()]
+
+    def tracked_get(self, tid: int) -> Optional[dict]:
+        with self._lock:
+            return _row(self._conn.execute("SELECT * FROM claude_tracked WHERE id=?", (tid,)).fetchone())
+
+    def tracked_add(self, host_id: int, key: str, info: dict, added_by: str | None) -> dict:
+        """Track a session (idempotent: re-tracking refreshes the given fields)."""
+        now = time.time()
+        fields = {k: info.get(k) for k in ("session_id", "name", "cwd", "kind", "note") if info.get(k) is not None}
+        with self._lock:
+            row = self._conn.execute("SELECT id FROM claude_tracked WHERE host_id=? AND key=?", (host_id, key)).fetchone()
+            if row is None:
+                cols = ["host_id", "key", "added", "added_by"] + list(fields)
+                cur = self._conn.execute(f"INSERT INTO claude_tracked({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                                         [host_id, key, now, added_by] + list(fields.values()))
+                tid = cur.lastrowid
+            else:
+                tid = row["id"]
+                if fields:
+                    self._conn.execute(f"UPDATE claude_tracked SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?", [*fields.values(), tid])
+            return _row(self._conn.execute("SELECT * FROM claude_tracked WHERE id=?", (tid,)).fetchone())
+
+    def tracked_delete(self, tid: int, host_id: int | None = None) -> bool:
+        with self._lock:
+            sql, vals = "DELETE FROM claude_tracked WHERE id=?", [tid]
+            if host_id is not None:
+                sql += " AND host_id=?"; vals.append(host_id)
+            return self._conn.execute(sql, vals).rowcount > 0
+
+    def tracked_find(self, host_id: int, key: str) -> Optional[dict]:
+        with self._lock:
+            return _row(self._conn.execute("SELECT * FROM claude_tracked WHERE host_id=? AND (key=? OR session_id=?)",
+                                           (host_id, key, key)).fetchone())
+
+    def tracked_rekey(self, host_id: int, old_key: str, new_key: str) -> Optional[dict]:
+        """A restart that came back as a new background agent: follow it (unless the new key is already tracked)."""
+        with self._lock:
+            if self._conn.execute("SELECT 1 FROM claude_tracked WHERE host_id=? AND key=?", (host_id, new_key)).fetchone():
+                return None
+            self._conn.execute("UPDATE claude_tracked SET key=?, kind='background' WHERE host_id=? AND key=?", (new_key, host_id, old_key))
+            return _row(self._conn.execute("SELECT * FROM claude_tracked WHERE host_id=? AND key=?", (host_id, new_key)).fetchone())
+
+    def tracked_sync(self, host_id: int, agents: list, now: float | None = None) -> list[dict]:
+        """Refresh tracked rows from an agent report's `claude.agents`; returns the rows that changed."""
+        now = now or time.time()
+        with self._lock:
+            rows = [dict(r) for r in self._conn.execute("SELECT * FROM claude_tracked WHERE host_id=?", (host_id,)).fetchall()]
+            if not rows:
+                return []
+            by_key = {a.get("key"): a for a in agents if isinstance(a, dict) and a.get("key")}
+            by_sid = {a.get("session_id"): a for a in agents if isinstance(a, dict) and a.get("session_id")}
+            changed = []
+            for r in rows:
+                a = by_key.get(r["key"]) or (by_sid.get(r["session_id"]) if r["session_id"] else None)
+                if a is None:
+                    upd = {"live": 0} if r["live"] else {}   # no longer reported at all: certainly not running
+                else:
+                    upd = {}
+                    for k in self.TRACK_SYNC:
+                        v = a.get(k)
+                        if k == "live":
+                            v = 1 if v else 0
+                        elif isinstance(v, str):
+                            v = v[:500]
+                        if v is None and k in ("name", "cwd", "session_id", "kind", "detail", "last_said"):
+                            continue   # keep what we knew
+                        if v != r[k]:
+                            upd[k] = v
+                    if a.get("live") and (not r["last_live"] or now - r["last_live"] > 60):
+                        upd["last_live"] = now   # throttled: a heartbeat, not a change worth broadcasting
+                if upd:
+                    self._conn.execute(f"UPDATE claude_tracked SET {', '.join(f'{k}=?' for k in upd)} WHERE id=?", [*upd.values(), r["id"]])
+                    if set(upd) - {"last_live", "last_activity"}:
+                        changed.append({**r, **upd})
+            return changed
 
     # ---------------------------------------------------------------- prefs
     def prefs_get(self, user: str) -> dict:

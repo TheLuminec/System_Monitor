@@ -20,6 +20,11 @@ One command when you set something off:
         Publishes a results document (JSON, "<name>-results/<n>" schema) to the project's
         Research page; every push is kept as history. Aggregates only - the hub renders what you send.
 
+    avm agent track [--name "XRSec Coordinator"] [--note "..."]
+        Run from inside a Claude Code session: registers that session on the dashboard's Agents page, where it
+        stays listed (and can be restarted) even after it stops or the machine goes offline.
+    avm agent untrack            (from inside the session)    avm agent list
+
 Needs the agent's config (server URL + host token). Looked up in order:
 AVM_CONFIG, ~/.config/avalon-agent/agent.conf, /etc/avalon-agent/agent.conf,
 %ProgramData%\\AvalonAgent\\agent.conf. Only one dependency: Python 3.8+.
@@ -42,7 +47,7 @@ import urllib.request
 from collections import deque
 from typing import Any, Dict, List, Optional
 
-AVM_VERSION = "1.4.0"
+AVM_VERSION = "1.5.0"
 IS_WINDOWS = sys.platform.startswith("win")
 
 
@@ -294,6 +299,53 @@ def cmd_results(args: argparse.Namespace, hub: Hub) -> int:
     return 0
 
 
+# ------------------------------------------------------------------- agent
+def _this_session() -> Dict[str, Any]:
+    """Identify the Claude Code session avm is running inside, from the environment Claude Code sets.
+    Background agents are keyed by their stable short id (the jobs dir name); interactive ones by session id."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    job_dir = os.environ.get("CLAUDE_JOB_DIR") or ""
+    info: Dict[str, Any] = {"session_id": sid or None, "cwd": os.getcwd()}
+    if job_dir:
+        info.update(key=os.path.basename(job_dir.rstrip("/\\")), kind="background")
+    elif sid:
+        info.update(key=sid, kind="interactive")
+    pid = os.environ.get("CLAUDE_PID")
+    if pid:  # Claude Code's own record of this session carries its display name and start directory
+        try:
+            with open(os.path.join(os.path.expanduser("~"), ".claude", "sessions", "%s.json" % int(pid)), encoding="utf-8") as f:
+                rec = json.load(f)
+            info["name"] = rec.get("name") or None
+            info["cwd"] = rec.get("cwd") or info["cwd"]
+        except (OSError, ValueError):
+            pass
+    return info
+
+
+def cmd_agent(args: argparse.Namespace, hub: Hub) -> int:
+    if args.op == "list":
+        for t in hub.call("/agent/claude/tracked", method="GET").get("tracked", []):
+            print("%s %-36s %-11s %-8s %s" % ("●" if t.get("live") else "○", (t.get("name") or "")[:36], t.get("kind") or "",
+                                             t.get("state") or "", t["key"]))
+        return 0
+    me = _this_session()
+    if not me.get("key"):
+        sys.stderr.write("avm: not inside a Claude Code session (no CLAUDE_CODE_SESSION_ID / CLAUDE_JOB_DIR)\n")
+        return 2
+    if args.op == "untrack":
+        hub.call("/agent/claude/untrack", {"key": me["key"]})
+        print("untracked %s" % me["key"])
+        return 0
+    if args.name:
+        me["name"] = args.name
+    if args.note:
+        me["note"] = args.note
+    r = hub.call("/agent/claude/track", {k: v for k, v in me.items() if v is not None})
+    row = r.get("row") or {}
+    print("tracking %s (%s) on the Agents page" % (row.get("name") or me["key"], me["key"]))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="avm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version="avm " + AVM_VERSION)
@@ -325,6 +377,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     rp = p.add_subparsers(dest="op", required=True)
     s = rp.add_parser("push"); s.add_argument("project", help="project slug, e.g. xrsec"); s.add_argument("file", help="results JSON")
 
+    p = sub.add_parser("agent", help="track this Claude Code session on the dashboard's Agents page")
+    ap2 = p.add_subparsers(dest="op", required=True)
+    s = ap2.add_parser("track"); s.add_argument("--name", help="display name (default: the session's own name)"); s.add_argument("--note")
+    ap2.add_parser("untrack")
+    ap2.add_parser("list")
+
     argv = list(sys.argv[1:] if argv is None else argv)
     command: List[str] = []
     if "--" in argv:  # everything after `--` is the command, untouched by argparse
@@ -335,7 +393,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.command = command or [c for c in (args.command or []) if c != "--"]
     hub = Hub(load_config())
     try:
-        return {"run": cmd_run, "watch": cmd_watch, "task": cmd_task, "results": cmd_results}[args.cmd](args, hub)
+        return {"run": cmd_run, "watch": cmd_watch, "task": cmd_task, "results": cmd_results, "agent": cmd_agent}[args.cmd](args, hub)
     except urllib.error.HTTPError as e:
         sys.stderr.write("avm: hub rejected the request: HTTP %s %s\n" % (e.code, e.read().decode(errors="replace")[:200]))
         return 1
