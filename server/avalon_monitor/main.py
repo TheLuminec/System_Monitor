@@ -91,6 +91,29 @@ def _summary_of(sample: Optional[dict]) -> dict[str, Any]:
     }
 
 
+_REPORTERS: dict[int, dict[tuple, list[float]]] = {}   # host id -> {(pid, user): [first, last, count]}
+
+
+def _duplicate_reporters(host_id: int, sample: Sample, now: float) -> Optional[str]:
+    """Two agents sharing one host token (e.g. a leftover SYSTEM agent next to a per-user one) make the dashboard
+    flip between their reports. Say so when two identities each reported twice within the last minute and are both
+    still reporting - a self-update respawn (new pid, old one gone) never satisfies that."""
+    c = sample.claude if isinstance(sample.claude, dict) else {}
+    ident = (sample.host.agent_pid, sample.host.agent_user or c.get("user") or "")
+    if ident == (None, ""):
+        return None   # agent too old to tell copies apart
+    seen = _REPORTERS.setdefault(host_id, {})
+    rec = seen.setdefault(ident, [now, now, 0])
+    rec[1], rec[2] = now, rec[2] + 1
+    for k in [k for k, (_, last, _) in seen.items() if now - last > 60]:
+        del seen[k]
+    live = [k for k, (_, last, n) in seen.items() if n >= 2 and now - last <= 20]
+    if len(live) < 2:
+        return None
+    who = ", ".join(f"{user or '?'}{f' (pid {pid})' if pid else ''}" for pid, user in sorted(live, key=str))
+    return f"{len(live)} agents are reporting as this host: {who}. Stop the extra one (Windows: re-run install-windows.ps1 -Upgrade [-AsCurrentUser])."
+
+
 def _claude_summary(c: Optional[dict]) -> Optional[dict]:
     if not c:
         return None
@@ -246,6 +269,9 @@ async def ingest(request: Request):
     verdict = gpu_stall.evaluate(host.id, sample, history)
     if verdict is not None:
         sample.checks.append(Check(**verdict))
+    dup = _duplicate_reporters(host.id, sample, now)
+    if dup:
+        sample.checks.append(Check(name="duplicate agent", kind="rule", ok=False, detail=dup))
 
     await run_in_threadpool(db.record_sample, host, sample, ip)
     updated = await run_in_threadpool(db.host_by_name, host.name)

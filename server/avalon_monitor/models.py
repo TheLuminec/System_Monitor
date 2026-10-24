@@ -20,6 +20,8 @@ class HostInfo(BaseModel):
     boot_time: Optional[float] = None
     uptime_sec: Optional[float] = None
     agent_version: str = ""
+    agent_pid: Optional[int] = None     # agent 1.6.1+: which process/user is reporting (duplicate-agent detection)
+    agent_user: str = ""
     cpu_model: str = ""
     cpu_count: Optional[int] = None
     cpu_count_physical: Optional[int] = None
