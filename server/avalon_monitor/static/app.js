@@ -1,9 +1,9 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.10.1";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.10.2";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
-         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct } from "./core.js?v=1.10.1";
-import { renderResearch } from "./research.js?v=1.10.1";
-import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.10.1";
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct } from "./core.js?v=1.10.2";
+import { renderResearch } from "./research.js?v=1.10.2";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.10.2";
 
 // ------------------------------------------------------------------ shell
 const NAV = [
@@ -433,6 +433,7 @@ async function renderChecksPanel(name, force = false) {
       try { const r = await post(`/api/v1/hosts/${encodeURIComponent(name)}/check-settings`, body, "PUT"); toast(`Saved revision ${r.rev}`); reload(); } catch (e) { toast(e.message, true); }
     } }, "Save settings"));
   const failing = cl.checks.filter((c) => c.state === "failing").length;
+  const settingsOpen = !!el.querySelector(".check-settings-wrap")?.open;   // the panel re-renders on every report: keep it open
   el.replaceChildren(...[
     h("h3", {}, "Checks", h("span", { class: "muted head-note" }, `${cl.checks.length} configured${failing ? ` · ${failing} failing` : ""}${status ? " · " + status : ""}`),
       h("span", { class: "spacer" }), h("button", { class: "btn small primary", onclick: () => { addRow.style.display = ""; addRow.dataset.open = "1"; addRow.querySelector("input")?.focus(); } }, "+ Add check")),
@@ -443,7 +444,7 @@ async function renderChecksPanel(name, force = false) {
       : h("div", { class: "muted", style: "padding:8px 0" }, "No checks on this host yet."),
     h("p", { class: "muted small check-help" }, "Agents can manage these themselves: ", h("code", {}, "avm check add file ~/run/heartbeat:600 --label \"R4 chain\" --notify self --ttl 12h"),
       ". A responder is prompted read-only when its check goes from ok to failing (cooldown, daily cap, one open alert until the check recovers); it investigates and reports, never acts."),
-    h("details", { class: "check-settings-wrap" }, h("summary", {}, "Host settings"), settings),
+    h("details", { class: "check-settings-wrap", open: settingsOpen ? "" : null }, h("summary", {}, "Host settings"), settings),
   ].filter(Boolean));
 }
 
