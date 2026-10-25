@@ -343,6 +343,9 @@ details[open] > summary .caret { transform: rotate(90deg); }
 .trk-dot.warn { background: var(--s-warn); }
 .trk-dot.bad { background: var(--s-crit); }
 .chip.trk { font-size: 10.5px; padding: 1px 7px; }
+.chip.reach { font-size: 10px; padding: 0 6px; }
+.chip.reach.ok { color: var(--s-good); border-color: color-mix(in srgb, var(--s-good) 35%, transparent); }
+.chip.reach.warn { color: var(--s-warn); border-color: color-mix(in srgb, var(--s-warn) 40%, transparent); }
 .chip.trk.online { color: var(--s-good); border-color: color-mix(in srgb, var(--s-good) 40%, transparent); }
 .chip.trk.busy { color: var(--c-blue); border-color: color-mix(in srgb, var(--c-blue) 40%, transparent); }
 .chip.trk.warn { color: var(--s-warn); border-color: color-mix(in srgb, var(--s-warn) 40%, transparent); }

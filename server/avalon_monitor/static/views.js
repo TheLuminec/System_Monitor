@@ -1,5 +1,5 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.10.3";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.10.4";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
@@ -286,6 +286,14 @@ function trackedState(t, host) {
   return { cls: "never", label: t.kind === "desktop" ? "closed" : t.state === "ended" ? "ended" : "stopped" };
 }
 const KIND_LABEL = { background: "background", interactive: "interactive", desktop: "Claude Desktop" };
+// Who can message a live session: this machine always (inbox socket); other machines only while it is linked to
+// Remote Control - a just-restarted session is up before its link is, and can't reach other machines either.
+function reachChip(x) {
+  if (!x.live || x.remote_control == null) return null;
+  return x.remote_control
+    ? h("span", { class: "chip reach ok", title: "Linked to Remote Control: sessions on other machines can message it, and it can reach them" }, "reachable from other machines")
+    : h("span", { class: "chip reach warn", title: "Not linked to Remote Control (yet): only sessions on this machine can message it, and it can't reach other machines. A restarted session links within a minute or so; otherwise run /remote-control in it." }, "this machine only");
+}
 // A Windows agent installed as SYSTEM looks in SYSTEM's profile and can't see the user's Claude sessions.
 const agentIsSystem = (c) => !!c && (/\$$/.test(c.user || "") || /systemprofile/i.test(c.home || ""));
 // Only Claude Desktop's bundled Claude Code here: it can list sessions but gets its login from the app, so no prompts.
@@ -423,6 +431,7 @@ async function renderConsole() {
     tbox.append(h("div", { class: "session tracked" },
       h("div", { class: "t" }, h("span", { class: "trk-dot " + st.cls, title: st.why || "" }), h("b", {}, t.name || t.key.slice(0, 8)),
         h("span", { class: "chip trk " + st.cls }, st.label), t.kind ? h("span", { class: "muted", style: "font-size:11px" }, KIND_LABEL[t.kind] || t.kind) : null,
+        reachChip(t),
         h("span", { class: "muted", style: "margin-left:auto;white-space:nowrap", title: t.last_live ? "last seen running " + fmt.when(t.last_live) : "" }, ago)),
       t.detail ? h("div", { class: "snip" }, h("b", {}, "doing: "), t.detail) : null,
       t.last_said ? h("div", { class: "snip" }, h("b", {}, "last said: "), t.last_said) : null,
@@ -447,6 +456,7 @@ async function renderConsole() {
       box.append(h("div", { class: "session compact" },
         h("div", { class: "t" }, h("span", { class: "trk-dot " + (a.live ? (a.status === "busy" ? "busy" : "online") : "never") }), h("b", {}, a.name || a.key.slice(0, 8)),
           h("span", { class: "muted", style: "font-size:11px" }, `${KIND_LABEL[a.kind] || a.kind || ""}${a.live ? "" : (a.kind === "desktop" ? " · closed" : " · stopped")}${a.state && a.state !== "done" ? " · " + a.state : ""}`),
+          reachChip(a),
           h("span", { class: "muted", style: "margin-left:auto;white-space:nowrap" }, a.last_activity ? fmt.ago(Date.now() / 1000 - a.last_activity) : ""),
           h("button", { class: "btn small", onclick: () => trackSession(host.name, a) }, "Track")),
         a.detail || a.last_said ? h("div", { class: "snip" }, a.detail || a.last_said) : null));

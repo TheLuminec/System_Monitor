@@ -71,7 +71,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.7.1"
+AGENT_VERSION = "1.7.2"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -1145,13 +1145,15 @@ class ClaudeRunner:
             a = {"key": key, "session_id": sid, "kind": s.get("kind") or "", "name": (s.get("name") or "")[:120],
                  "cwd": s.get("cwd") or "", "live": bool(s.get("pid")), "pid": s.get("pid"), "state": s.get("state"),
                  "status": s.get("status"), "started": (s["startedAt"] / 1000.0) if isinstance(s.get("startedAt"), (int, float)) else None}
-            if s.get("pid") and a["kind"] != "background":   # Claude Desktop's Code sessions: entrypoint is in ~/.claude/sessions/<pid>.json
-                try:
-                    with open(os.path.join(self.home, ".claude", "sessions", "%d.json" % int(s["pid"])), encoding="utf-8") as f:
-                        if json.load(f).get("entrypoint") == "claude-desktop":
-                            a["kind"] = "desktop"
-                except (OSError, ValueError, TypeError):
-                    pass
+            if s.get("pid"):   # Claude Code's own record of the live session: ~/.claude/sessions/<pid>.json
+                rec = self._session_record(s["pid"])
+                if rec.get("entrypoint") == "claude-desktop" and a["kind"] != "background":
+                    a["kind"] = "desktop"
+                # Messaging reach: sessions on this machine reach it through its inbox socket; sessions on OTHER
+                # machines only while it is linked to Remote Control (and they are too). A just-restarted session
+                # can be up before its link is.
+                a["messaging"] = bool(rec.get("messagingSocketPath") or rec.get("peerProtocol"))
+                a["remote_control"] = bool(rec.get("bridgeSessionId"))
             hint = None
             if s.get("id"):  # background job state: a one-line "what I'm doing" plus the transcript path
                 try:
@@ -1380,8 +1382,16 @@ class ClaudeRunner:
             self.current = None
         self._pump()
 
-    def _came_back(self, key: str, wait: float = 30.0) -> bool:
-        """After a respawn: is the background session actually running again (listed with a pid)?"""
+    def _session_record(self, pid: Any) -> Dict[str, Any]:
+        try:
+            with open(os.path.join(self.home, ".claude", "sessions", "%d.json" % int(pid)), encoding="utf-8") as f:
+                rec = json.load(f)
+            return rec if isinstance(rec, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _came_back(self, key: str, wait: float = 30.0) -> int:
+        """After a respawn: the pid of the background session if it is actually running again, else 0."""
         deadline = time.monotonic() + wait
         while True:
             rc, out = self._claude(["agents", "--json", "--all"], timeout=30)
@@ -1389,11 +1399,22 @@ class ClaudeRunner:
                 rows = json.loads(out[out.index("["):]) if rc == 0 and "[" in out else []
             except ValueError:
                 rows = []
-            if any(isinstance(r, dict) and r.get("id") == key and r.get("pid") for r in rows):
-                return True
+            pid = next((r.get("pid") for r in rows if isinstance(r, dict) and r.get("id") == key and r.get("pid")), None)
+            if pid:
+                return int(pid)
+            if time.monotonic() >= deadline:
+                return 0
+            time.sleep(3)
+
+    def _rc_linked(self, pid: int, wait: float = 60.0) -> bool:
+        """Wait for a (re)started session to link to Remote Control: until then, sessions on other machines can't see
+        or message it (and it can't see them), though sessions on this machine can."""
+        deadline = time.monotonic() + wait
+        while not self._session_record(pid).get("bridgeSessionId"):
             if time.monotonic() >= deadline:
                 return False
             time.sleep(3)
+        return True
 
     def _run_action(self, job: Dict[str, Any]) -> None:
         """restart / stop a tracked session. Background agents restart in place (`claude respawn <id>`: same id, name and
@@ -1410,9 +1431,14 @@ class ClaudeRunner:
             ok = rc == 0
         elif action == "restart":
             rc, out = (self._claude(["respawn", key], timeout=90) if t.get("kind") == "background" else (1, ""))
-            ok = rc == 0 and self._came_back(key)   # respawn has been seen to report success yet leave the session stopped
+            pid = self._came_back(key) if rc == 0 else 0   # respawn has been seen to report success yet leave it stopped
+            ok = bool(pid)
             if rc == 0 and not ok:
                 out += "\nrespawn reported success but the session did not come back within 30 s; resuming it as a new background agent"
+            elif ok:
+                out += ("\nRemote Control linked: sessions on other machines can message it." if self._rc_linked(pid) else
+                        "\nRemote Control NOT linked after 60 s: only sessions on this machine can message it (and it can't "
+                        "reach other machines) until it links; run /remote-control in it, or check the account's Remote Control.")
             if not ok and sid:
                 prompt = job.get("prompt") or "You were restarted from the Avalon Monitor dashboard. Pick up where you left off."
                 args = ["--bg", "--resume", sid] + (["-n", t["name"]] if t.get("name") else []) + [prompt]

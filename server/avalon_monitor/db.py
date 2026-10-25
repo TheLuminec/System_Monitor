@@ -310,6 +310,9 @@ class Database:
         for col, ddl in (("acked", "REAL"), ("acked_by", "TEXT")):
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(claude_tracked)")}
+        if "remote_control" not in cols:   # linked to Remote Control: reachable from sessions on other machines
+            self._conn.execute("ALTER TABLE claude_tracked ADD COLUMN remote_control INTEGER")
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(claude_jobs)")}
         for col, ddl in (("action", "TEXT"), ("target", "TEXT"), ("fork_session", "INTEGER NOT NULL DEFAULT 0")):
             if col not in cols:   # action: restart/stop a tracked session; fork_session: prompt a copy of a live session
@@ -828,7 +831,7 @@ class Database:
             return [dict(r) for r in self._conn.execute("SELECT * FROM host_checks WHERE expires IS NOT NULL AND expires < ?", (now,)).fetchall()]
 
     # ------------------------------------------------------- tracked sessions
-    TRACK_SYNC = ("session_id", "name", "cwd", "kind", "live", "state", "status", "detail", "last_said", "last_activity")
+    TRACK_SYNC = ("session_id", "name", "cwd", "kind", "live", "state", "status", "detail", "last_said", "last_activity", "remote_control")
 
     def tracked_list(self, host_id: int | None = None) -> list[dict]:
         sql = "SELECT * FROM claude_tracked" + (" WHERE host_id=?" if host_id is not None else "") + " ORDER BY live DESC, name COLLATE NOCASE"
@@ -894,7 +897,9 @@ class Database:
                     upd = {}
                     for k in self.TRACK_SYNC:
                         v = a.get(k)
-                        if k == "live":
+                        if k in ("live", "remote_control"):
+                            if k == "remote_control" and v is None:
+                                continue   # agent < 1.7.2: unknown, keep what we knew
                             v = 1 if v else 0
                         elif isinstance(v, str):
                             v = v[:500]
