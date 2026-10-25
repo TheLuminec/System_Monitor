@@ -71,7 +71,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.7.0"
+AGENT_VERSION = "1.7.1"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -1380,6 +1380,21 @@ class ClaudeRunner:
             self.current = None
         self._pump()
 
+    def _came_back(self, key: str, wait: float = 30.0) -> bool:
+        """After a respawn: is the background session actually running again (listed with a pid)?"""
+        deadline = time.monotonic() + wait
+        while True:
+            rc, out = self._claude(["agents", "--json", "--all"], timeout=30)
+            try:
+                rows = json.loads(out[out.index("["):]) if rc == 0 and "[" in out else []
+            except ValueError:
+                rows = []
+            if any(isinstance(r, dict) and r.get("id") == key and r.get("pid") for r in rows):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(3)
+
     def _run_action(self, job: Dict[str, Any]) -> None:
         """restart / stop a tracked session. Background agents restart in place (`claude respawn <id>`: same id, name and
         conversation); anything else - or a failed respawn - resumes as a new background agent, whose id is sent back
@@ -1395,7 +1410,9 @@ class ClaudeRunner:
             ok = rc == 0
         elif action == "restart":
             rc, out = (self._claude(["respawn", key], timeout=90) if t.get("kind") == "background" else (1, ""))
-            ok = rc == 0
+            ok = rc == 0 and self._came_back(key)   # respawn has been seen to report success yet leave the session stopped
+            if rc == 0 and not ok:
+                out += "\nrespawn reported success but the session did not come back within 30 s; resuming it as a new background agent"
             if not ok and sid:
                 prompt = job.get("prompt") or "You were restarted from the Avalon Monitor dashboard. Pick up where you left off."
                 args = ["--bg", "--resume", sid] + (["-n", t["name"]] if t.get("name") else []) + [prompt]

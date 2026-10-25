@@ -1,5 +1,5 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.10.2";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.10.3";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
@@ -399,7 +399,7 @@ async function renderConsole() {
   const continueIn = (sid, dir) => { resume.value = sid; if (dir) cwd.value = dir; ta.focus(); toast("Next prompt continues this session"); };
 
   // ---- tracked sessions (registered; kept when stopped or the host is offline)
-  const canAct = !!c?.actions;
+  const canAct = (c?.features || []).includes("agent_actions");   // c is the raw report: the summary's "actions" flag is not in it
   const trackedCard = h("div", { class: "card table-card" },
     h("h3", {}, `Tracked agents on ${host.display_name}`, h("span", { class: "muted", style: "font-weight:400;font-size:12px;margin-left:8px" },
       "stay listed when stopped · track one below, or run ", h("code", {}, "avm agent track"), " inside it")));
