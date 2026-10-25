@@ -1,5 +1,5 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.9.0";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.9.1";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
@@ -101,6 +101,93 @@ async function fillTaskDetail(el, id) {
   el.append(actions);
 }
 
+// ---- folders: the task list as  section (running / queued / one per day) -> folder -> time
+// A folder is tasks sharing a name prefix AND host, user and working dir. The prefix is the text before ": " / " - " /
+// " — " / " | " when the name has one ("Clean 360 rerun (AVALON): fold 4 seed 3"), else its first two words
+// ("hardening2 R4 ladder b2000 seed 1" -> "hardening2 R4"). A prefix seen only once stays a plain row.
+const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* private mode: not remembered */ } };
+const OPEN_KEY = "avm-task-open";   // remembered open/closed state of day sections and folders (this browser only)
+function namePrefix(name) {
+  const n = String(name || "").trim();
+  const cut = n.search(/:\s|\s[-–—|]\s/);
+  if (cut > 0) return n.slice(0, cut).trim();
+  return n.split(/\s+/).slice(0, 2).join(" ");
+}
+const folderKey = (t) => [namePrefix(t.name).toLowerCase(), t.host, t.user || "", t.cwd || ""].join("\u0001");
+const shortDir = (d) => (d ? d.replace(/[\\/]+$/, "").split(/[\\/]/).pop() : "");
+function dayLabel(ts) {
+  const d = new Date(ts * 1000), today = new Date();
+  const start = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diff = Math.round((start(today) - start(d)) / 86400000);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Yesterday";
+  return d.toLocaleDateString(undefined, { weekday: diff < 7 ? "long" : "short", month: "short", day: "numeric", year: d.getFullYear() === today.getFullYear() ? undefined : "numeric" });
+}
+const dayKey = (ts) => { const d = new Date(ts * 1000); return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`; };
+
+function taskTree(rows, openId) {
+  const opened = lsGet(OPEN_KEY, {});
+  const remember = (key, isOpen, dflt) => {
+    if (isOpen === dflt) delete opened[key]; else opened[key] = isOpen;
+    const keys = Object.keys(opened);
+    if (keys.length > 400) for (const k of keys.slice(0, keys.length - 400)) delete opened[k];
+    lsSet(OPEN_KEY, opened);
+  };
+  const collapsible = (cls, key, dflt, force, summary, body) => {
+    const el = h("details", { class: cls }, h("summary", {}, summary), body);
+    el.open = force || (key in opened ? opened[key] : dflt);
+    el.addEventListener("toggle", () => remember(key, el.open, dflt));
+    return el;
+  };
+  const sections = [];
+  const add = (key, label, list, dflt) => { if (list.length) sections.push({ key, label, list, dflt }); };
+  add("s:running", "Running", rows.filter((t) => TASK_ACTIVE.has(t.status)), true);
+  add("s:queued", "Queued", rows.filter((t) => t.status === "queued"), true);
+  const byDay = new Map();
+  for (const t of rows.filter((x) => !TASK_ACTIVE.has(x.status) && x.status !== "queued")) {
+    const k = dayKey(t.started);
+    if (!byDay.has(k)) byDay.set(k, []);
+    byDay.get(k).push(t);
+  }
+  for (const [k, list] of byDay) add("d:" + k, dayLabel(list[0].started), list, true);
+
+  const out = [];
+  for (const sec of sections) {
+    const groups = new Map();
+    for (const t of sec.list) { const k = folderKey(t); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(t); }
+    const body = h("div", { class: "task-day-body" });
+    const done = new Set();
+    for (const t of sec.list) {   // already in time order: a folder sits where its newest (or first-in-line) task would
+      const k = folderKey(t);
+      if (done.has(k)) continue;
+      done.add(k);
+      const members = groups.get(k);
+      if (members.length < 2) { body.append(taskRow(t, t.id === openId)); continue; }
+      const n = (s) => members.filter((x) => x.status === s).length;
+      const problems = members.filter((x) => taskAlerting(x)).length;   // only unacknowledged, recent problems force a folder open
+      const tally = [["running", n("running")], ["queued", n("queued")], ["failed", n("failed")], ["stalled", n("stalled")], ["lost", n("lost")], ["done", n("done")]]
+        .filter(([, c]) => c).map(([s, c]) => h("span", { class: "tally " + s }, `${c} ${s}`));
+      const times = members.map((x) => x.started), first = Math.min(...times), last = Math.max(...times);
+      const span = first === last ? fmt.when(last) : `${new Date(first * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}–${new Date(last * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+      const summary = [
+        h("span", { class: "caret" }),
+        h("div", { class: "fold-main" },
+          h("div", { class: "name" }, namePrefix(t.name), h("span", { class: "count" }, String(members.length))),
+          h("div", { class: "sub" }, h("span", {}, t.host), t.user ? h("span", {}, t.user) : null, t.cwd ? h("span", { class: "num", title: t.cwd }, shortDir(t.cwd)) : null, ...tally)),
+        h("div", { class: "right num" }, span),
+      ];
+      const rowsEl = h("div", { class: "folder-rows" }, members.map((x) => taskRow(x, x.id === openId)));
+      const hasOpen = members.some((x) => x.id === openId);
+      body.append(collapsible("task-folder" + (problems ? " has-problem" : ""), `${sec.key}|${k}`, problems > 0 || sec.key === "s:running" || sec.key === "s:queued", hasOpen, summary, rowsEl));
+    }
+    const failed = sec.list.filter((x) => x.status === "failed").length;
+    out.push(collapsible("task-day", sec.key, sec.dflt, sec.list.some((x) => x.id === openId),
+      [h("span", { class: "caret" }), h("b", {}, sec.label), h("span", { class: "muted" }, `${sec.list.length} task${sec.list.length === 1 ? "" : "s"}${failed ? ` · ${failed} failed` : ""}`)], body));
+  }
+  return out;
+}
+
 export async function renderTasks(params = {}) {
   const app = $("#app"); app.innerHTML = "";
   state.view = "tasks";
@@ -116,8 +203,13 @@ export async function renderTasks(params = {}) {
     const running = rows.filter((t) => t.status === "running").length, queued = rows.filter((t) => t.status === "queued").length;
     counts.textContent = `${running} running${queued ? ` · ${queued} queued` : ""} · ${rows.length} shown`;
     if (!rows.length) list.append(h("div", { class: "empty" }, "No tasks yet. Start one with the avm command below."));
-    for (const t of rows) list.append(taskRow(t, t.id === openId));
+    if (lsGet("avm-task-view", "folders") === "flat") for (const t of rows) list.append(taskRow(t, t.id === openId));
+    else list.append(...taskTree(rows, openId));
   };
+  const viewSel = h("select", { title: "Group tasks into day sections and folders (shared name prefix + host + user + dir)",
+    onchange: () => { lsSet("avm-task-view", viewSel.value); redraw(); } },
+    h("option", { value: "folders" }, "Folders"), h("option", { value: "flat" }, "Flat list"));
+  viewSel.value = lsGet("avm-task-view", "folders");
   const openId = params.open ? Number(params.open) : null;
   redraw();
   if (openId) setTimeout(() => list.querySelector(`.task[data-id="${openId}"]`)?.scrollIntoView({ block: "center" }), 0);
@@ -131,7 +223,7 @@ avm run "nymeria b4020" --exclusive --mem 19G --wait -- python train.py   # decl
 avm queue status    |    avm queue drain --wait    |    avm queue resume       # this host's queue`),
     h("div", { class: "muted", style: "margin-top:8px;font-size:12px" }, `A running task that stops heart-beating turns amber (stalled); a non-zero exit turns red. Both count as alerts until you acknowledge them (open the task, or dismiss it on the Alerts tab) or for ${state.config?.task_alert_hours ?? 24} h after they happen; the task itself stays here. Claude sessions started from the Agents tab are told to use avm run for long jobs.`),
   );
-  app.append(h("div", { class: "page-head" }, h("h2", {}, "Tasks"), counts, h("div", { class: "filters" }, hostSel, statusSel, h("button", { class: "btn small", onclick: async () => { await loadTasks(true); redraw(); } }, "Refresh"))), list, howto);
+  app.append(h("div", { class: "page-head" }, h("h2", {}, "Tasks"), counts, h("div", { class: "filters" }, hostSel, statusSel, viewSel, h("button", { class: "btn small", onclick: async () => { await loadTasks(true); redraw(); } }, "Refresh"))), list, howto);
   state.tasksView = { list, filter, redraw };
 }
 

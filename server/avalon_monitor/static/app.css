@@ -251,6 +251,24 @@ td .bar i { display: block; height: 100%; background: var(--c, var(--m-disk)); b
 
 /* ---------------------------------------------------------------- tasks */
 .task-list { display: flex; flex-direction: column; gap: 10px; }
+/* folders view: day sections -> folders -> tasks */
+.task-day > summary, .task-folder > summary { list-style: none; cursor: pointer; }
+.task-day > summary::-webkit-details-marker, .task-folder > summary::-webkit-details-marker { display: none; }
+.task-day > summary { display: flex; align-items: baseline; gap: 10px; padding: 6px 2px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-2); border-bottom: 1px solid var(--border); }
+.task-day > summary .muted { text-transform: none; letter-spacing: 0; font-size: 12px; }
+.task-day-body { display: flex; flex-direction: column; gap: 10px; padding-top: 10px; }
+.caret { display: inline-block; width: 0; height: 0; border-left: 5px solid var(--ink-3); border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform .15s; flex: none; }
+details[open] > summary .caret { transform: rotate(90deg); }
+.task-folder { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.task-folder.has-problem { border-color: color-mix(in srgb, var(--s-crit) 40%, var(--border)); }
+.task-folder > summary { display: grid; grid-template-columns: 12px 1fr auto; gap: 12px; align-items: center; padding: 12px 14px; }
+.task-folder .fold-main .name { font-weight: 600; font-size: 14px; }
+.task-folder .fold-main .name .count { margin-left: 8px; font-size: 11.5px; font-weight: 500; color: var(--ink-3); background: var(--surface-3); padding: 1px 7px; border-radius: 999px; }
+.task-folder .fold-main .sub { font-size: 12px; color: var(--ink-3); display: flex; gap: 10px; flex-wrap: wrap; margin-top: 2px; }
+.task-folder .right { font-size: 12.5px; color: var(--ink-2); }
+.tally.running { color: var(--c-blue); } .tally.queued, .tally.stalled { color: var(--s-warn); } .tally.failed { color: var(--s-crit); } .tally.done { color: var(--s-good); }
+.folder-rows { display: flex; flex-direction: column; gap: 8px; padding: 0 10px 10px 30px; }
+.folder-rows .task { background: var(--surface-2); }
 .task { padding: 12px 14px; display: grid; grid-template-columns: 12px 1fr auto; gap: 12px; align-items: center; cursor: pointer; }
 .task .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--s-offline); }
 .task.running .dot { background: var(--c-blue); box-shadow: 0 0 0 3px color-mix(in srgb, var(--c-blue) 25%, transparent); animation: pulse 2s infinite; }
