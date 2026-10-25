@@ -325,7 +325,7 @@ class Database:
                 continue
             cfg = json.loads(r["check_config"] or "{}")
             for key in CHECK_KEYS:
-                entries = [cfg[key]] if key == "AVM_MEM_AVAILABLE_WARN_GB" else (cfg.get(key) or "").split(",")
+                entries = [cfg.get(key) or ""] if key == "AVM_MEM_AVAILABLE_WARN_GB" else (cfg.get(key) or "").split(",")
                 for e in (x.strip() for x in entries if x):
                     if e:
                         self._conn.execute("INSERT OR IGNORE INTO host_checks(host_id, key, target, created, created_by) VALUES (?,?,?,?,?)",
