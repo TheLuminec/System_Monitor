@@ -283,8 +283,12 @@ async def ingest(request: Request):
         sample.checks.append(Check(name="duplicate agent", kind="rule", ok=False, detail=dup))
 
     await run_in_threadpool(db.record_sample, host, sample, ip)
-    try:   # checks: state per row, and responders on ok -> failing (never let this break ingest)
-        changed, jobs = await run_in_threadpool(checks_mod.evaluate, db, host, sample.model_dump(mode="json"), now)
+    try:   # checks: adopt agent.conf checks once, state per row, responders on ok -> failing (never break ingest)
+        dumped = sample.model_dump(mode="json")
+        if await run_in_threadpool(checks_mod.adopt, db, host, dumped) is not None:
+            log.info("checks on %s adopted from agent.conf; the hub now owns its watch lists", host.name)
+            host = await run_in_threadpool(db.host_by_name, host.name) or host
+        changed, jobs = await run_in_threadpool(checks_mod.evaluate, db, host, dumped, now)
         for row in changed:
             await hub.broadcast({"type": "check", "check": checks_mod.public(row, host.name)})
         for j in jobs:
@@ -447,6 +451,8 @@ async def put_checks(name: str, request: Request, ident: Identity = Depends(requ
             await run_in_threadpool(db.check_delete, r["id"])
     for key, target in wanted:
         await run_in_threadpool(db.check_add, h.id, key, target, {}, ident.subject)
+    if (h.check_config or {}).get(checks_mod.MANAGED):   # keep the host hub-managed (see checks.adopt)
+        settings_out[checks_mod.MANAGED] = "1"
     rev = await run_in_threadpool(db.set_check_config, name, checks_mod.render_settings(settings_out, await run_in_threadpool(db.checks_list, h.id)))
     log.info("%s updated checks for %s (rev %d)", ident.subject, name, rev)
     return {"ok": True, "rev": rev, "settings": settings_out}

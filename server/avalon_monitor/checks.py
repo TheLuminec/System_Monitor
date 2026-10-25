@@ -32,10 +32,24 @@ SINGLE_KEYS = ("AVM_MEM_AVAILABLE_WARN_GB",)   # one value, not a comma list
 MIN_COOLDOWN_MIN = 5.0
 
 
+MANAGED = "_checks_managed"   # marker in a host's settings: its watch lists are owned by the hub (agents ignore it)
+
+
+def _version(v: Optional[str]) -> tuple:
+    try:
+        return tuple(int(x) for x in str(v or "0").split(".")[:3])
+    except ValueError:
+        return (0,)
+
+
 def render_settings(current: dict, rows: list[dict], now: Optional[float] = None) -> dict:
-    """The host's remote settings with the AVM_WATCH_* lists rebuilt from its (unexpired) check rows."""
+    """The host's remote settings with the AVM_WATCH_* lists rebuilt from its (unexpired) check rows.
+    Hub settings replace the same keys in the agent's agent.conf. Once a host is managed (its agent.conf checks were
+    adopted as rows) every list is always sent, empty if need be, so a removed check can't fall back to agent.conf."""
     now = now or time.time()
     out = {k: v for k, v in (current or {}).items() if k not in CHECK_KEYS}
+    if out.get(MANAGED):
+        out.update({k: "" for k in CHECK_KEYS})
     for r in rows:
         if r.get("expires") and r["expires"] < now:
             continue
@@ -44,6 +58,22 @@ def render_settings(current: dict, rows: list[dict], now: Optional[float] = None
         else:
             out[r["key"]] = (out[r["key"]] + "," if out.get(r["key"]) else "") + r["target"]
     return out
+
+
+def adopt(db: Any, host: Any, sample: dict) -> Optional[int]:
+    """First report from an agent that tags its results (1.7+): make every check it runs from agent.conf a row, then
+    mark the host managed so the rendered lists are complete. Without this, adding one process check from the hub
+    would replace (and silently drop) agent.conf's whole process list. Returns the new settings revision, if any."""
+    cfg = host.check_config or {}
+    if cfg.get(MANAGED) or _version((sample.get("host") or {}).get("agent_version")) < (1, 7):
+        return None   # already managed, or an agent that can't say where its checks come from
+    results = [c for c in (sample.get("checks") or []) if c.get("key") in CHECK_KEYS and c.get("src") not in (None, "")]
+    have = {(r["key"], r["target"]) for r in db.checks_list(host.id)}
+    for c in results:
+        if (c["key"], c["src"]) not in have:
+            db.check_add(host.id, c["key"], str(c["src"]), {}, "agent.conf")
+    db.set_check_config(host.name, render_settings({**cfg, MANAGED: "1"}, db.checks_list(host.id)))
+    return host.check_rev + 1
 
 
 def _base(p: str) -> str:

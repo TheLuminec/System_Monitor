@@ -1,9 +1,9 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.10.0";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.10.1";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
-         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct } from "./core.js?v=1.10.0";
-import { renderResearch } from "./research.js?v=1.10.0";
-import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.10.0";
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct } from "./core.js?v=1.10.1";
+import { renderResearch } from "./research.js?v=1.10.1";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.10.1";
 
 // ------------------------------------------------------------------ shell
 const NAV = [
@@ -418,7 +418,7 @@ async function renderChecksPanel(name, force = false) {
     tbody.append(h("tr", { class: "check-row rule" },
       h("td", {}, h("span", { class: "chip " + (r.ok ? (r.level === "info" ? "" : "ok") : r.level === "warning" ? "warn" : "bad") }, r.ok ? (r.level === "info" ? "info" : "ok") : "failing")),
       h("td", {}, h("div", {}, h("b", {}, r.kind === "rule" ? "hub rule" : r.kind), " ", h("code", {}, r.name))),
-      h("td", { class: "muted" }, r.detail || ""), h("td", { class: "muted small" }, "built in"), h("td", {}), h("td", {})));
+      h("td", { class: "muted" }, r.detail || ""), h("td", { class: "muted small" }, r.kind === "rule" ? "built in" : "from agent.conf (editable here once the agent updates to 1.7)"), h("td", {}), h("td", {})));
   }
   const addRow = h("div", { class: "check-add", style: "display:none" });
   const closeAdd = () => { addRow.style.display = "none"; addRow.dataset.open = ""; };
