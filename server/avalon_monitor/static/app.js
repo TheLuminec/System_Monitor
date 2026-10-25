@@ -1,9 +1,9 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.9.1";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.9.2";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
-         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct } from "./core.js?v=1.9.1";
-import { renderResearch } from "./research.js?v=1.9.1";
-import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.9.1";
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct } from "./core.js?v=1.9.2";
+import { renderResearch } from "./research.js?v=1.9.2";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.9.2";
 
 // ------------------------------------------------------------------ shell
 const NAV = [

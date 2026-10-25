@@ -1,5 +1,5 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.9.1";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.9.2";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
@@ -207,9 +207,15 @@ export async function renderTasks(params = {}) {
     else list.append(...taskTree(rows, openId));
   };
   const viewSel = h("select", { title: "Group tasks into day sections and folders (shared name prefix + host + user + dir)",
-    onchange: () => { lsSet("avm-task-view", viewSel.value); redraw(); } },
+    onchange: () => { lsSet("avm-task-view", viewSel.value); syncFoldButtons(); redraw(); } },
     h("option", { value: "folders" }, "Folders"), h("option", { value: "flat" }, "Flat list"));
   viewSel.value = lsGet("avm-task-view", "folders");
+  // Open or close every day section and folder at once; each <details> remembers it through its own toggle handler.
+  const setAll = (open) => { for (const d of list.querySelectorAll("details.task-day, details.task-folder")) d.open = open; };
+  const expandBtn = h("button", { class: "btn small", title: "Open every day section and folder", onclick: () => setAll(true) }, "Expand all");
+  const collapseBtn = h("button", { class: "btn small", title: "Close every day section and folder", onclick: () => setAll(false) }, "Collapse all");
+  const syncFoldButtons = () => { for (const b of [expandBtn, collapseBtn]) b.style.display = viewSel.value === "flat" ? "none" : ""; };
+  syncFoldButtons();
   const openId = params.open ? Number(params.open) : null;
   redraw();
   if (openId) setTimeout(() => list.querySelector(`.task[data-id="${openId}"]`)?.scrollIntoView({ block: "center" }), 0);
@@ -223,7 +229,7 @@ avm run "nymeria b4020" --exclusive --mem 19G --wait -- python train.py   # decl
 avm queue status    |    avm queue drain --wait    |    avm queue resume       # this host's queue`),
     h("div", { class: "muted", style: "margin-top:8px;font-size:12px" }, `A running task that stops heart-beating turns amber (stalled); a non-zero exit turns red. Both count as alerts until you acknowledge them (open the task, or dismiss it on the Alerts tab) or for ${state.config?.task_alert_hours ?? 24} h after they happen; the task itself stays here. Claude sessions started from the Agents tab are told to use avm run for long jobs.`),
   );
-  app.append(h("div", { class: "page-head" }, h("h2", {}, "Tasks"), counts, h("div", { class: "filters" }, hostSel, statusSel, viewSel, h("button", { class: "btn small", onclick: async () => { await loadTasks(true); redraw(); } }, "Refresh"))), list, howto);
+  app.append(h("div", { class: "page-head" }, h("h2", {}, "Tasks"), counts, h("div", { class: "filters" }, hostSel, statusSel, viewSel, expandBtn, collapseBtn, h("button", { class: "btn small", onclick: async () => { await loadTasks(true); redraw(); } }, "Refresh"))), list, howto);
   state.tasksView = { list, filter, redraw };
 }
 
