@@ -207,6 +207,28 @@ td .bar i { display: block; height: 100%; background: var(--c, var(--m-disk)); b
 .btn { border: 1px solid var(--border-strong); background: var(--surface-2); color: var(--ink); border-radius: 999px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
 .btn:hover { border-color: var(--ink-3); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.checks-panel { margin-top: 16px; padding: 14px 16px; }
+.checks-panel h3 { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.checks-panel .head-note { font-weight: 400; font-size: 12px; }
+.checks-table td { vertical-align: top; white-space: normal; }
+.checks-table code { font-size: 12px; word-break: break-all; }
+.checks-table .small, .checks-panel .small { font-size: 11.5px; }
+.checks-table .nowrap { white-space: nowrap; }
+.checks-table td.nowrap > * { display: inline-flex; vertical-align: middle; margin-left: 4px; }
+.checks-table tr.failing td:first-child .chip { font-weight: 600; }
+.checks-table tr.rule { opacity: 0.85; }
+.checks-table tr.check-edit td { background: var(--surface-2); }
+.check-form { display: flex; flex-direction: column; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); margin-bottom: 10px; }
+.check-form .row1 { display: grid; grid-template-columns: 170px 2fr 1fr; gap: 8px; }
+.check-form .row2 { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 12.5px; color: var(--ink-2); }
+.check-form .row2 > input.mono { flex: 1; min-width: 180px; }
+.check-form select, .check-form input[type=text], .check-form input[type=number], .check-settings input { font: inherit; font-size: 12.5px; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px; min-width: 0; }
+.check-form .mono { font-family: var(--mono); }
+@media (max-width: 700px) { .check-form .row1 { grid-template-columns: 1fr; } }
+.check-help { margin: 10px 0 6px; }
+.check-settings-wrap > summary { cursor: pointer; font-size: 12.5px; color: var(--ink-2); }
+.check-settings { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; padding-top: 8px; }
+.check-settings label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-3); }
 .editor { margin-top: 16px; }
 .editor h3 { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 .editor-status { font-weight: 400; font-size: 12px; }

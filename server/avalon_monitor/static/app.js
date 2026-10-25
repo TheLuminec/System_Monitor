@@ -1,9 +1,9 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.9.2";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.10.0";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
-         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct } from "./core.js?v=1.9.2";
-import { renderResearch } from "./research.js?v=1.9.2";
-import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.9.2";
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct } from "./core.js?v=1.10.0";
+import { renderResearch } from "./research.js?v=1.10.0";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.10.0";
 
 // ------------------------------------------------------------------ shell
 const NAV = [
@@ -250,7 +250,7 @@ const CHARTS = [
   { id: "temp", title: "Temperature", yMax: null, format: (v) => Math.round(v) + "°C", series: [{ key: "cpu_temp", label: "CPU", color: "--c-blue" }, { key: "gpu_temp", label: "GPU", color: "--c-orange" }, { key: "temp_max", label: "hottest sensor", color: "--c-aqua" }] },
 ];
 const PANELS = [...CHARTS.map((c) => ({ id: c.id, title: c.title })), { id: "cores", title: "Per-core load" }, { id: "storage", title: "Storage" }, { id: "gpus", title: "GPUs" }, { id: "procs", title: "Top processes" },
-  { id: "checks", title: "Checks" }, { id: "net-if", title: "Network interfaces" }, { id: "sensors", title: "Sensors" }, { id: "hostinfo", title: "Host" }, { id: "editor", title: "Checks editor" }];
+  { id: "net-if", title: "Network interfaces" }, { id: "sensors", title: "Sensors" }, { id: "hostinfo", title: "Host" }];
 
 async function renderDetail(name) {
   const app = $("#app"); app.innerHTML = "";
@@ -298,13 +298,12 @@ async function renderDetail(name) {
   charts.append(panelCard("cores", "Per-core load", cores, "card chart-card cores-card"));
 
   const tables = h("div", { class: "tables", "data-f": "tables" });
-  for (const id of ["storage", "gpus", "procs", "checks", "net-if", "sensors", "hostinfo"]) tables.append(panelCard(id, PANELS.find((p) => p.id === id).title, h("div", { "data-f": "body" }), "card table-card"));
-  const editor = panelCard("editor", "Checks editor", h("div", { "data-f": "body" }), "card table-card editor");
-  tables.append(editor);
+  for (const id of ["storage", "gpus", "procs", "net-if", "sensors", "hostinfo"]) tables.append(panelCard(id, PANELS.find((p) => p.id === id).title, h("div", { "data-f": "body" }), "card table-card"));
+  const checksPanel = h("div", { class: "card checks-panel", "data-f": "checks-panel" }, h("h3", {}, "Checks"));
 
-  app.append(head, hiddenBar, kpis, charts, tables);
+  app.append(head, hiddenBar, kpis, charts, tables, checksPanel);
   app.classList.toggle("customizing", state.customizing);
-  state.detail = { name: host.name, charts: chartObjs, els: { head, kpis, cores, tables, charts, editor: editor.querySelector('[data-f="body"]'), hiddenBar }, panels: panelEls, hidden };
+  state.detail = { name: host.name, charts: chartObjs, els: { head, kpis, cores, tables, charts, checks: checksPanel, hiddenBar }, panels: panelEls, hidden };
 
   // apply saved order + hidden
   const applyOrder = (container) => {
@@ -329,28 +328,16 @@ async function renderDetail(name) {
   }
   renderHiddenBar();
   updateDetail(host);
-  renderEditor(host);
+  renderChecksPanel(host.name, true);
   await loadDetailSeries();
 }
 
-// ---------------------------------------------------------- checks editor
-const CHECK_KINDS = [
-  { key: "AVM_WATCH_PROCESSES", label: "process running", hint: "name or command-line substring, e.g. nginx" },
-  { key: "AVM_WATCH_FILES", label: "file fresh", hint: "path:max-age-seconds, e.g. /srv/heartbeat:120" },
-  { key: "AVM_WATCH_TCP", label: "tcp port open", hint: "host:port, e.g. 127.0.0.1:11434" },
-  { key: "AVM_WATCH_MOUNTS", label: "volume mounted", hint: "mount point, e.g. /mnt/data" },
-  { key: "AVM_WATCH_CONTENT", label: "show file line", hint: "small text file, e.g. /srv/queue/current.txt" },
-  { key: "AVM_WATCH_MARKERS", label: "no marker files", hint: "glob, or glob::regex for content match" },
-  { key: "AVM_WATCH_NONEMPTY", label: "queue not empty", hint: "file that should have pending lines" },
-  { key: "AVM_WATCH_UNITS", label: "systemd unit", hint: "[system:|user:]unit, e.g. user:xrsec-queue.service" },
-  { key: "AVM_WATCH_JOBS", label: "job scope active", hint: "[user:]glob, e.g. user:xrsec-*.scope" },
-];
-const CHECK_SINGLE = [
-  { key: "AVM_MEM_AVAILABLE_WARN_GB", label: "Warn when free memory below (GB)", hint: "e.g. 8" },
-  { key: "AVM_COMMIT_WARN_PCT", label: "Warn when memory commit above (%)", hint: "85 (default) · off" },
-  { key: "AVM_PROCESSES", label: "Top processes reported", hint: "8" },
-  { key: "AVM_TAGS", label: "Tags", hint: "comma-separated chips" },
-];
+// ----------------------------------------------------------- checks panel
+// One full-width panel: every check with its live result, its responder (a Claude agent on this host that is
+// prompted, read-only, when the check starts failing) and expiry; adding and editing checks; and the few other host
+// settings. Agents manage the same rows with `avm check ...`. Saved on the hub, pushed to the agent on its next report.
+const TTL_OPTS = [["", "no expiry"], ["3600", "1 h"], ["21600", "6 h"], ["43200", "12 h"], ["86400", "1 day"], ["259200", "3 days"], ["604800", "7 days"]];
+const SETTING_LABELS = { AVM_COMMIT_WARN_PCT: ["Warn when memory commit above (%)", "85 (default) · off"], AVM_PROCESSES: ["Top processes reported", "8"], AVM_TAGS: ["Tags", "comma-separated chips"] };
 
 async function sendCommand(name, cmd) {
   try {
@@ -359,48 +346,105 @@ async function sendCommand(name, cmd) {
   } catch (e) { toast(`Failed: ${e.message}`, true); }
 }
 
-function renderEditor(host) {
-  const d = state.detail; if (!d || !d.els.editor) return;
-  const el = d.els.editor; el.innerHTML = "";
-  const cfg = host.check_config || {};
-  const rows = [];
-  for (const k of CHECK_KINDS) for (const v of (cfg[k.key] || "").split(",").map((x) => x.trim()).filter(Boolean)) rows.push({ key: k.key, value: v });
-  const agentRev = host.agent_rev, hubRev = host.check_rev || 0;
-  const status = agentRev == null
-    ? (host.status === "online" ? "agent predates remote checks (1.1+) - it updates itself on its next report once the hub is upgraded" : "")
-    : agentRev === hubRev ? `agent is running revision ${hubRev}` : `revision ${hubRev} saved - agent still on ${agentRev}, applies on its next push`;
-  const list = h("div", { class: "editor-rows" });
-  const rowEl = (r) => {
-    const sel = h("select", {}, ...CHECK_KINDS.map((k) => h("option", { value: k.key, selected: k.key === r.key ? "" : null }, k.label)));
-    const inp = h("input", { type: "text", value: r.value, placeholder: CHECK_KINDS.find((k) => k.key === r.key)?.hint || "", spellcheck: "false" });
-    sel.onchange = () => { r.key = sel.value; inp.placeholder = CHECK_KINDS.find((k) => k.key === r.key)?.hint || ""; };
-    inp.oninput = () => (r.value = inp.value);
-    const row = h("div", { class: "editor-row" }, sel, inp, h("button", { class: "iconbtn small", title: "remove", onclick: () => { rows.splice(rows.indexOf(r), 1); row.remove(); } }, "×"));
-    return row;
+function checkForm(cl, c, submit, cancel) {
+  const kind = h("select", { disabled: c ? "" : null }, ...cl.kinds.map((k) => h("option", { value: k.kind }, k.label)));
+  kind.value = c?.kind || "file";
+  const hint = () => cl.kinds.find((k) => k.kind === kind.value)?.hint || "";
+  const target = h("input", { type: "text", value: c?.target || "", placeholder: hint(), spellcheck: "false", class: "mono" });
+  kind.onchange = () => { target.placeholder = hint(); };
+  const label = h("input", { type: "text", value: c?.label || "", placeholder: "label, e.g. R4 chain (optional)" });
+  const ttl = h("select", { title: "remove the check by itself after" }, ...TTL_OPTS.map(([v, l]) => h("option", { value: v }, l)));
+  const resp = h("select", { title: "prompted (read-only) when the check goes from ok to failing" },
+    h("option", { value: "none" }, "no responder"), ...cl.responders.map((r) => h("option", { value: r.value }, `wake ${r.label}`)), h("option", { value: "new" }, "new read-only session"));
+  resp.value = c?.notify || "none";
+  const cwd = h("input", { type: "text", value: c?.notify_cwd || "", placeholder: "working dir for a new session", spellcheck: "false", class: "mono" });
+  const withLog = h("input", { type: "checkbox" }); withLog.checked = !!c?.notify_log;
+  const cooldown = h("input", { type: "number", min: "5", value: c?.cooldown_min ?? 30, title: "minutes between alerts", style: "width:70px" });
+  const cap = h("input", { type: "number", min: "1", max: "48", value: c?.daily_cap ?? 6, title: "alerts per day at most", style: "width:60px" });
+  const go = async () => {
+    const body = { target: target.value.trim(), label: label.value.trim(), notify: resp.value, notify_cwd: cwd.value.trim(), notify_log: withLog.checked,
+      cooldown_min: Number(cooldown.value) || 30, daily_cap: Number(cap.value) || 6 };
+    if (ttl.value) body.ttl_sec = Number(ttl.value); else if (c?.expires) body.ttl_sec = 0;
+    if (!c) body.kind = kind.value;
+    if (!body.target) { target.focus(); return; }
+    await submit(body);
   };
-  for (const r of rows) list.append(rowEl(r));
-  const singles = h("div", { class: "editor-singles" }, ...CHECK_SINGLE.map((k) => h("label", {}, h("span", {}, k.label), h("input", { type: "text", value: cfg[k.key] ?? "", placeholder: k.hint, "data-key": k.key, spellcheck: "false" }))));
-  const save = async () => {
-    const out = {};
-    for (const r of rows) if (r.value.trim()) out[r.key] = (out[r.key] ? out[r.key] + "," : "") + r.value.trim();
-    for (const inp of singles.querySelectorAll("input")) if (inp.value.trim()) out[inp.dataset.key] = inp.value.trim();
-    try {
-      const r = await post(`/api/v1/hosts/${encodeURIComponent(host.name)}/checks`, out, "PUT");
-      toast(`Saved revision ${r.rev}; the agent applies it on its next push`);
-      const full = await api(`/api/v1/hosts/${encodeURIComponent(host.name)}`); state.hosts.set(full.name, full); renderEditor(full);
-    } catch (e) { toast(`Save failed: ${e.message}`, true); }
-  };
-  el.append(
-    h("div", { class: "muted editor-status", style: "margin-bottom:6px" }, status),
-    h("p", { class: "muted editor-help" }, "Settings saved here are pushed to the agent with its next report and override the same keys in its agent.conf. One target per row."),
-    list,
-    h("div", { class: "editor-actions" },
-      h("button", { class: "btn", onclick: () => { const r = { key: "AVM_WATCH_PROCESSES", value: "" }; rows.push(r); list.append(rowEl(r)); list.lastChild.querySelector("input").focus(); } }, "+ Add check"),
-      h("span", { class: "spacer" }),
-      h("button", { class: "btn primary", onclick: save }, "Save to agent"),
-    ),
-    singles,
-  );
+  target.onkeydown = (e) => { if (e.key === "Enter") go(); };
+  return h("div", { class: "check-form" },
+    h("div", { class: "row1" }, kind, target, label),
+    h("div", { class: "row2" }, h("label", {}, "expires ", ttl), h("label", {}, "responder ", resp), cwd,
+      h("label", { title: "add related avm task log tails to the alert prompt (leave off for data-use-agreement data)" }, withLog, " with log tails"),
+      h("label", {}, "cooldown ", cooldown, " min"), h("label", {}, "cap ", cap, "/day"), h("span", { class: "spacer" }),
+      cancel ? h("button", { class: "btn small", onclick: cancel }, "Cancel") : null,
+      h("button", { class: "btn small primary", onclick: go }, c ? "Save" : "Add check")));
+}
+
+async function renderChecksPanel(name, force = false) {
+  const d = state.detail; if (!d || !d.els.checks || d.name !== name) return;
+  const el = d.els.checks;
+  const ae = document.activeElement;
+  if (!force && el.contains(ae) && ae.matches("input, select, textarea")) return;   // never clobber an edit in progress
+  if (!force && el.querySelector('.check-edit[data-open="1"], .check-add[data-open="1"]')) return;
+  let cl;
+  try { cl = await api(`/api/v1/hosts/${encodeURIComponent(name)}/checklist`); }
+  catch (e) { el.replaceChildren(h("h3", {}, "Checks"), h("div", { class: "muted" }, e.message)); return; }
+  if (state.detail !== d) return;
+  const now = Date.now() / 1000;
+  const status = cl.agent_rev == null ? "" : cl.agent_rev === cl.rev ? `agent is running revision ${cl.rev}` : `revision ${cl.rev} saved · applies on the agent's next report (it runs ${cl.agent_rev})`;
+  const reload = () => renderChecksPanel(name, true);
+  const patch = async (id, body) => { try { await post(`/api/v1/checklist/${id}`, body, "PATCH"); toast("Saved"); reload(); } catch (e) { toast(e.message, true); } };
+  const tbody = h("tbody");
+  for (const c of cl.checks) {
+    const r = c.result, st = c.state || (r ? (r.ok ? "ok" : "failing") : "unknown");
+    const cls = st === "ok" ? "ok" : st === "failing" ? (r?.level === "warning" ? "warn" : "bad") : "";
+    const respName = !c.notify ? "—" : c.notify === "new" ? "new read-only session" : (cl.responders.find((x) => x.value === c.notify)?.label || "tracked agent (gone)");
+    const alert = c.open_job ? h("a", { class: "chip warn", href: `#/agents/${encodeURIComponent(name)}?job=${c.open_job}`, title: "the responder prompt sent for this failure" }, `alert #${c.open_job}`)
+      : c.pending ? h("span", { class: "chip", title: "fires when the target session is idle and the cooldown is over" }, "alert pending") : null;
+    const editTr = h("tr", { class: "check-edit", style: "display:none" });
+    const closeEdit = () => { editTr.style.display = "none"; editTr.dataset.open = ""; };
+    editTr.append(h("td", { colspan: 6 }, checkForm(cl, c, (body) => patch(c.id, body), closeEdit)));
+    tbody.append(h("tr", { class: "check-row" + (st === "failing" ? " failing" : "") },
+      h("td", {}, h("span", { class: "chip " + cls }, st)),
+      h("td", {}, h("div", {}, h("b", {}, c.kind_label), " ", h("code", { title: c.target }, c.kind === "memory" ? `${c.target} GB` : c.target)), c.label ? h("div", { class: "muted small" }, c.label) : null),
+      h("td", {}, h("div", { class: "muted" }, (r?.detail ?? c.detail ?? "") || "—"), c.since ? h("div", { class: "small muted" }, `${st} for ${fmt.dur(now - c.since)}`) : null),
+      h("td", {}, h("div", {}, respName), c.notify ? h("div", { class: "small muted" }, `cooldown ${c.cooldown_min} min · ≤${c.daily_cap}/day${c.notify_log ? " · with logs" : ""}`) : null, alert),
+      h("td", { class: "small muted" }, c.expires ? `expires in ${fmt.dur(c.expires - now)}` : "", h("div", {}, c.created_by ? `added by ${c.created_by}` : "")),
+      h("td", { class: "r nowrap" },
+        h("button", { class: "btn small", onclick: () => { const open = editTr.style.display === "none"; editTr.style.display = open ? "" : "none"; editTr.dataset.open = open ? "1" : ""; } }, "Edit"),
+        h("button", { class: "iconbtn small", title: "remove this check", onclick: async () => { if (!confirm(`Remove the ${c.kind_label} check on ${c.target}?`)) return; try { await post(`/api/v1/checklist/${c.id}`, undefined, "DELETE"); reload(); } catch (e) { toast(e.message, true); } } }, "×"))));
+    tbody.append(editTr);
+  }
+  for (const r of cl.other_results) {
+    tbody.append(h("tr", { class: "check-row rule" },
+      h("td", {}, h("span", { class: "chip " + (r.ok ? (r.level === "info" ? "" : "ok") : r.level === "warning" ? "warn" : "bad") }, r.ok ? (r.level === "info" ? "info" : "ok") : "failing")),
+      h("td", {}, h("div", {}, h("b", {}, r.kind === "rule" ? "hub rule" : r.kind), " ", h("code", {}, r.name))),
+      h("td", { class: "muted" }, r.detail || ""), h("td", { class: "muted small" }, "built in"), h("td", {}), h("td", {})));
+  }
+  const addRow = h("div", { class: "check-add", style: "display:none" });
+  const closeAdd = () => { addRow.style.display = "none"; addRow.dataset.open = ""; };
+  addRow.append(checkForm(cl, null, async (body) => {
+    try { await post(`/api/v1/hosts/${encodeURIComponent(name)}/checklist`, body); toast("Check added; the agent picks it up on its next report"); addRow.dataset.open = ""; reload(); }
+    catch (e) { toast(e.message, true); }
+  }, closeAdd));
+  const settings = h("div", { class: "check-settings" }, ...Object.entries(SETTING_LABELS).map(([k, [lbl, hint]]) =>
+    h("label", {}, h("span", {}, lbl), h("input", { type: "text", value: cl.settings[k] || "", placeholder: hint, "data-key": k, spellcheck: "false" }))),
+    h("button", { class: "btn small", onclick: async () => {
+      const body = {}; for (const i of settings.querySelectorAll("input")) body[i.dataset.key] = i.value.trim();
+      try { const r = await post(`/api/v1/hosts/${encodeURIComponent(name)}/check-settings`, body, "PUT"); toast(`Saved revision ${r.rev}`); reload(); } catch (e) { toast(e.message, true); }
+    } }, "Save settings"));
+  const failing = cl.checks.filter((c) => c.state === "failing").length;
+  el.replaceChildren(...[
+    h("h3", {}, "Checks", h("span", { class: "muted head-note" }, `${cl.checks.length} configured${failing ? ` · ${failing} failing` : ""}${status ? " · " + status : ""}`),
+      h("span", { class: "spacer" }), h("button", { class: "btn small primary", onclick: () => { addRow.style.display = ""; addRow.dataset.open = "1"; addRow.querySelector("input")?.focus(); } }, "+ Add check")),
+    !cl.can_prompt ? h("div", { class: "chip", style: "margin-bottom:8px;white-space:normal" }, "Responders can't run on this host: it has no Claude Code CLI (Claude Desktop's built-in copy only runs inside the app).") : null,
+    addRow,
+    cl.checks.length || cl.other_results.length
+      ? h("div", { class: "table-wrap" }, h("table", { class: "checks-table" }, h("thead", {}, h("tr", {}, h("th", {}, "State"), h("th", {}, "Check"), h("th", {}, "Result"), h("th", {}, "Responder"), h("th", {}, "Expiry"), h("th", {}))), tbody))
+      : h("div", { class: "muted", style: "padding:8px 0" }, "No checks on this host yet."),
+    h("p", { class: "muted small check-help" }, "Agents can manage these themselves: ", h("code", {}, "avm check add file ~/run/heartbeat:600 --label \"R4 chain\" --notify self --ttl 12h"),
+      ". A responder is prompted read-only when its check goes from ok to failing (cooldown, daily cap, one open alert until the check recovers); it investigates and reports, never acts."),
+    h("details", { class: "check-settings-wrap" }, h("summary", {}, "Host settings"), settings),
+  ].filter(Boolean));
 }
 
 async function loadDetailSeries() {
@@ -455,7 +499,7 @@ function updateDetail(host) {
   d.panels.cores.classList.toggle("hidden", d.hidden.has("cores") || !(cpu.per_core || []).length);
 
   const body = (id) => { const el = d.panels[id].querySelector('[data-f="body"]'); el.innerHTML = ""; return el; };
-  const show = (id, yes) => d.panels[id].classList.toggle("hidden", d.hidden.has(id) || !yes);
+  const show = (id, yes) => d.panels[id]?.classList.toggle("hidden", d.hidden.has(id) || !yes);
   const table = (head, rows) => h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...head.map((x) => h("th", { class: x.startsWith("r:") ? "r" : "" }, x.replace(/^r:/, ""))))), h("tbody", {}, ...rows)));
   const bar = (p, c = "var(--m-disk)") => h("span", { class: "bar" }, h("i", { style: `width:${p ?? 0}%; background:${levelFor(p) === "crit" ? "var(--s-crit)" : levelFor(p) === "warn" ? "var(--s-warn)" : c}` }));
   show("storage", (s.disks || []).length);
@@ -470,9 +514,6 @@ function updateDetail(host) {
   show("procs", (s.processes || []).length);
   if ((s.processes || []).length) body("procs").append(table(["PID", "Name", "User", "r:CPU", "r:Memory"], s.processes.map((p) => h("tr", {},
     h("td", { class: "num muted" }, p.pid), h("td", {}, p.name), h("td", { class: "muted" }, p.user || ""), h("td", { class: "r num" }, fmt.pct(p.cpu_percent, 1)), h("td", { class: "r num" }, `${fmt.bytes(p.mem_rss, 0)} · ${fmt.pct(p.mem_percent, 1)}`)))));
-  show("checks", (s.checks || []).length);
-  if ((s.checks || []).length) body("checks").append(table(["Check", "Kind", "State", "Detail"], s.checks.map((c) => h("tr", {},
-    h("td", {}, c.name), h("td", { class: "muted" }, c.kind), h("td", {}, h("span", { class: "chip " + (c.ok ? (c.level === "info" ? "" : "ok") : c.level === "warning" ? "warn" : "bad"), html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + (c.ok ? (c.level === "info" ? "info" : "ok") : c.level === "warning" ? "warning" : "failing") })), h("td", { class: "muted" }, c.detail || "")))));
   show("net-if", (s.network?.interfaces || []).length);
   if ((s.network?.interfaces || []).length) body("net-if").append(table(["Interface", "r:Receive", "r:Transmit", "r:Link"], s.network.interfaces.map((i) => h("tr", {},
     h("td", {}, i.name), h("td", { class: "r num" }, fmt.bps(i.rx_bps)), h("td", { class: "r num" }, fmt.bps(i.tx_bps)), h("td", { class: "r num muted" }, i.speed_mbps ? i.speed_mbps + " Mb/s" : (i.up ? "up" : "down"))))));
@@ -485,7 +526,6 @@ function updateDetail(host) {
       ["Booted", hi.boot_time ? new Date(hi.boot_time * 1000).toLocaleString() : null], ["Agent", hi.agent_version ? "v" + hi.agent_version : null], ["Agent update", host.agent_update_error ? "FAILED: " + host.agent_update_error : null], ["Agent IP", host.last_ip], ["Interval", s.interval ? s.interval + " s" : null],
       ["Claude", s.claude ? (s.claude.available ? `${s.claude.version || "?"} as ${s.claude.user}` : "cli not found") : null], ["Notes", host.notes]]
       .filter(([, v]) => v).flatMap(([k2, v]) => [h("dt", {}, k2), h("dd", {}, v)])));
-  show("editor", true);
 }
 
 function appendLive(host) {
@@ -518,7 +558,7 @@ function onHostUpdate(host) {
     if (host.summary?.ts !== prev?.summary?.ts) {
       api(`/api/v1/hosts/${encodeURIComponent(host.name)}`).then((full) => {
         state.hosts.set(full.name, full); updateDetail(full);
-        if ((prev?.agent_rev ?? null) !== (full.agent_rev ?? null) && !document.activeElement?.closest?.(".editor")) renderEditor(full);
+        renderChecksPanel(full.name);   // live results; skipped while an input in the panel has focus
       }).catch(() => {});
       appendLive(host);
     } else updateDetail({ ...(state.hosts.get(host.name)), status: host.status, age_sec: host.age_sec });
@@ -527,6 +567,8 @@ function onHostUpdate(host) {
 }
 on("task", (t) => { if (state.view === "fleet") { const card = $(`.host-card[data-host="${CSS.escape(t.host)}"]`); const host = state.hosts.get(t.host); if (card && host) updateCard(card, host); } renderNav(); renderFleetStats(); });
 on("claude_job", () => { renderNav(); });
+on("check", (c) => { if (state.view === "detail" && state.detail?.name === c.host) renderChecksPanel(c.host); });
+on("check_deleted", (m) => { if (state.view === "detail" && state.detail && (!m.host || state.detail.name === m.host)) renderChecksPanel(state.detail.name); });
 on("claude_tracked", () => { renderNav(); });
 on("claude_untracked", () => { renderNav(); });
 
@@ -546,6 +588,8 @@ function connectWs() {
     else if (msg.type === "claude_job") emit("claude_job", msg.job);
     else if (msg.type === "claude_event") emit("claude_event", msg);
     else if (msg.type === "claude_tracked") emit("claude_tracked", msg.row);
+    else if (msg.type === "check") emit("check", msg.check);
+    else if (msg.type === "check_deleted") emit("check_deleted", msg);
     else if (msg.type === "claude_untracked") emit("claude_untracked", msg);
     else if (msg.type === "results") emit("results", msg);
   };

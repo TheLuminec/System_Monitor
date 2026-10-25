@@ -39,7 +39,9 @@ AGENT_COMMANDS = ("respawn",)
 
 from .core import (AGENT_SCRIPT, AgentBundle, LiveHub, agent_bundle, authz, client_ip, db, gpu_stall, hub,  # noqa: F401
                    require_agent, require_same_origin, require_viewer)
-from .routes_ops import router as ops_router, task_public, tracked_public
+from . import checks as checks_mod
+from .routes_checks import router as checks_router
+from .routes_ops import job_public, router as ops_router, task_public, tracked_public
 from .routes_results import router as results_router
 
 
@@ -191,6 +193,11 @@ async def presence_loop() -> None:
                     if not online:
                         for t in await run_in_threadpool(db.task_mark_lost, h.id):
                             await hub.broadcast({"type": "task", "task": task_public(t)})
+            for r in await run_in_threadpool(db.checks_expired):   # avm check add --ttl
+                await run_in_threadpool(db.check_delete, r["id"])
+                await run_in_threadpool(checks_mod.sync_config, db, r["host_id"])
+                log.info("check #%d (%s) expired", r["id"], r["target"])
+                await hub.broadcast({"type": "check_deleted", "id": r["id"]})
             for t in await run_in_threadpool(db.task_mark_stalled):
                 log.warning("task #%d '%s' stalled (no heartbeat)", t["id"], t["name"])
                 await hub.broadcast({"type": "task", "task": task_public(t)})
@@ -276,6 +283,15 @@ async def ingest(request: Request):
         sample.checks.append(Check(name="duplicate agent", kind="rule", ok=False, detail=dup))
 
     await run_in_threadpool(db.record_sample, host, sample, ip)
+    try:   # checks: state per row, and responders on ok -> failing (never let this break ingest)
+        changed, jobs = await run_in_threadpool(checks_mod.evaluate, db, host, sample.model_dump(mode="json"), now)
+        for row in changed:
+            await hub.broadcast({"type": "check", "check": checks_mod.public(row, host.name)})
+        for j in jobs:
+            log.warning("check responder job #%d queued on %s: %s", j["id"], host.name, j["title"])
+            await hub.broadcast({"type": "claude_job", "job": job_public(j)})
+    except Exception:
+        log.exception("check evaluation failed for %s", host.name)
     updated = await run_in_threadpool(db.host_by_name, host.name)
     reply: dict[str, Any] = {"ok": True, "server_time": now}
     if updated:
@@ -415,10 +431,23 @@ async def put_checks(name: str, request: Request, ident: Identity = Depends(requ
     if bad:
         raise HTTPException(422, f"not remotely settable: {', '.join(bad)}")
     settings_out = {k: str(v).strip() for k, v in body.items() if v is not None}
-    try:
-        rev = await run_in_threadpool(db.set_check_config, name, settings_out)
-    except KeyError:
+    h = await run_in_threadpool(db.host_by_name, name)
+    if not h:
         raise HTTPException(404, "no such host")
+    # Older editors / manage.py send the whole config: check entries become rows (labels/responders of unchanged
+    # entries are kept), everything else is stored as before; the AVM_WATCH_* lists are then re-rendered from rows.
+    wanted = set()
+    for key in checks_mod.CHECK_KEYS:
+        raw = settings_out.pop(key, "")
+        for e in ([raw] if key in checks_mod.SINGLE_KEYS else raw.split(",")):
+            if e.strip():
+                wanted.add((key, e.strip()))
+    for r in await run_in_threadpool(db.checks_list, h.id):
+        if (r["key"], r["target"]) not in wanted:
+            await run_in_threadpool(db.check_delete, r["id"])
+    for key, target in wanted:
+        await run_in_threadpool(db.check_add, h.id, key, target, {}, ident.subject)
+    rev = await run_in_threadpool(db.set_check_config, name, checks_mod.render_settings(settings_out, await run_in_threadpool(db.checks_list, h.id)))
     log.info("%s updated checks for %s (rev %d)", ident.subject, name, rev)
     return {"ok": True, "rev": rev, "settings": settings_out}
 
@@ -486,6 +515,7 @@ async def index(request: Request):
 
 
 app.include_router(ops_router)
+app.include_router(checks_router)
 app.include_router(results_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

@@ -71,7 +71,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.6.1"
+AGENT_VERSION = "1.7.0"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -762,7 +762,7 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
                     running[w].append(p.info["pid"])
         for w in watch_procs:
             pids = running[w]
-            checks.append({"name": w, "kind": "process", "ok": bool(pids),
+            checks.append({"name": w, "kind": "process", "ok": bool(pids), "key": "AVM_WATCH_PROCESSES", "src": w,
                            "detail": ("pid " + ",".join(str(x) for x in pids[:3])) if pids else "not running",
                            "value": float(len(pids))})
     for item in _csv(cfg["AVM_WATCH_FILES"]):
@@ -773,16 +773,16 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
             path, max_age = m.group(1), float(m.group(2))
         try:
             age = time.time() - os.stat(path).st_mtime
-            checks.append({"name": os.path.basename(path) or path, "kind": "file", "ok": age <= max_age,
+            checks.append({"name": os.path.basename(path) or path, "kind": "file", "ok": age <= max_age, "key": "AVM_WATCH_FILES", "src": item,
                            "detail": "updated %ds ago (max %ds)" % (age, max_age), "value": round(age, 1)})
         except OSError:
-            checks.append({"name": os.path.basename(path) or path, "kind": "file", "ok": False, "detail": "missing"})
+            checks.append({"name": os.path.basename(path) or path, "kind": "file", "ok": False, "detail": "missing", "key": "AVM_WATCH_FILES", "src": item})
     for path in _csv(cfg["AVM_WATCH_MOUNTS"]):
         try:
             mounted = os.path.ismount(path)
         except OSError:
             mounted = False
-        checks.append({"name": os.path.basename(path.rstrip("/\\")) or path, "kind": "mount", "ok": mounted,
+        checks.append({"name": os.path.basename(path.rstrip("/\\")) or path, "kind": "mount", "ok": mounted, "key": "AVM_WATCH_MOUNTS", "src": path,
                        "detail": ("mounted at " + path) if mounted else ("NOT mounted: " + path)})
     for path in _csv(cfg["AVM_WATCH_CONTENT"]):
         name = os.path.basename(path) or path
@@ -790,9 +790,9 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 line = f.readline().strip()
             age = time.time() - os.stat(path).st_mtime
-            checks.append({"name": name, "kind": "content", "ok": True, "detail": line[:160] or "(empty)", "value": round(age, 1)})
+            checks.append({"name": name, "kind": "content", "ok": True, "detail": line[:160] or "(empty)", "value": round(age, 1), "key": "AVM_WATCH_CONTENT", "src": path})
         except OSError as e:
-            checks.append({"name": name, "kind": "content", "ok": False, "detail": "unreadable: %s" % e.strerror})
+            checks.append({"name": name, "kind": "content", "ok": False, "detail": "unreadable: %s" % e.strerror, "key": "AVM_WATCH_CONTENT", "src": path})
     for item in _csv(cfg["AVM_WATCH_MARKERS"]):
         import glob as _glob
         pattern, _, regex = item.partition("::")
@@ -804,7 +804,7 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
             try:
                 rx = re.compile(regex)
             except re.error as e:
-                checks.append({"name": os.path.basename(pattern), "kind": "marker", "ok": False, "detail": "bad regex: %s" % e})
+                checks.append({"name": os.path.basename(pattern), "kind": "marker", "ok": False, "detail": "bad regex: %s" % e, "key": "AVM_WATCH_MARKERS", "src": item})
                 continue
             failed = []
             for f in matches[:200]:
@@ -820,37 +820,38 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
             newest = matches[0]
             age = time.time() - os.stat(newest).st_mtime
             names = ", ".join(os.path.basename(m) for m in matches[:3]) + (" ..." if len(matches) > 3 else "")
-            checks.append({"name": label, "kind": "marker", "ok": False, "value": float(len(matches)),
+            checks.append({"name": label, "kind": "marker", "ok": False, "value": float(len(matches)), "key": "AVM_WATCH_MARKERS", "src": item,
                            "detail": "%d file%s: %s (newest %s ago)" % (len(matches), "s" if len(matches) != 1 else "", names, _fmt_age(age))})
         else:
-            checks.append({"name": label, "kind": "marker", "ok": True, "value": 0.0, "detail": "none"})
+            checks.append({"name": label, "kind": "marker", "ok": True, "value": 0.0, "detail": "none", "key": "AVM_WATCH_MARKERS", "src": item})
     for kind, key in (("unit", "AVM_WATCH_UNITS"), ("job", "AVM_WATCH_JOBS")):
         for item in _csv(cfg[key]):
-            checks.append(_systemd_check(item, kind))
+            checks.append(dict(_systemd_check(item, kind), key=key, src=item))
     warn_gb = _num(cfg["AVM_MEM_AVAILABLE_WARN_GB"])
     if warn_gb:
         avail = psutil.virtual_memory().available
         checks.append({"name": "mem available", "kind": "memory", "ok": avail >= warn_gb * 1024 ** 3, "level": "warning",
+                       "key": "AVM_MEM_AVAILABLE_WARN_GB", "src": cfg["AVM_MEM_AVAILABLE_WARN_GB"],
                        "value": round(avail / 1024 ** 3, 2), "detail": "%.1f GB available (warn below %g GB)" % (avail / 1024 ** 3, warn_gb)})
     for path in _csv(cfg["AVM_WATCH_NONEMPTY"]):
         name = os.path.basename(path) or path
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 n = sum(1 for line in f if line.strip() and not line.lstrip().startswith("#"))
-            checks.append({"name": name, "kind": "queue", "ok": n > 0, "value": float(n), "level": "warning",
+            checks.append({"name": name, "kind": "queue", "ok": n > 0, "value": float(n), "level": "warning", "key": "AVM_WATCH_NONEMPTY", "src": path,
                            "detail": ("%d pending" % n) if n else "EMPTY - nothing queued"})
         except OSError as e:
-            checks.append({"name": name, "kind": "queue", "ok": False, "detail": "unreadable: %s" % e.strerror})
+            checks.append({"name": name, "kind": "queue", "ok": False, "detail": "unreadable: %s" % e.strerror, "key": "AVM_WATCH_NONEMPTY", "src": path})
     for item in _csv(cfg["AVM_WATCH_TCP"]):
         host, _, port = item.rpartition(":")
         t0 = time.monotonic()
         try:
             with socket.create_connection((host or "127.0.0.1", int(port)), timeout=2):
                 pass
-            checks.append({"name": item, "kind": "tcp", "ok": True,
+            checks.append({"name": item, "kind": "tcp", "ok": True, "key": "AVM_WATCH_TCP", "src": item,
                            "detail": "open (%.0f ms)" % ((time.monotonic() - t0) * 1000), "value": round((time.monotonic() - t0) * 1000, 1)})
         except (OSError, ValueError) as e:
-            checks.append({"name": item, "kind": "tcp", "ok": False, "detail": str(e)[:80]})
+            checks.append({"name": item, "kind": "tcp", "ok": False, "detail": str(e)[:80], "key": "AVM_WATCH_TCP", "src": item})
     return checks
 
 
@@ -903,7 +904,7 @@ class ClaudeRunner:
     MAX_EVENTS_PER_POST = 200
     AGENTS_REFRESH_SEC = 30
     AGENTS_MAX = 40
-    FEATURES = ["agent_actions"]   # tells the hub it may queue restart/stop jobs here (older agents would run them as prompts)
+    FEATURES = ["agent_actions", "fork_session"]   # fork_session: may run a prompt on a copy of a live session   # tells the hub it may queue restart/stop jobs here (older agents would run them as prompts)
 
     def __init__(self, cfg: Dict[str, str]):
         self.cfg = cfg
@@ -1292,6 +1293,8 @@ class ClaudeRunner:
             args += ["--model", job["model"]]
         if job.get("resume_session"):
             args += ["--resume", job["resume_session"]]
+            if job.get("fork_session"):   # the session is live: work on a copy of its context, never write into it
+                args.append("--fork-session")
         args += ["--append-system-prompt",
                  "You were started from the Avalon Monitor dashboard on host %s. When you launch anything long-running "
                  "(training, builds, services), wrap it as `avm run \"<name>\" -- <command>` so it is tracked; `avm --help` for details."

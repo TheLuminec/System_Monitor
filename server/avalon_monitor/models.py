@@ -126,6 +126,8 @@ class Check(BaseModel):
     detail: str = ""
     value: Optional[float] = None   # e.g. heartbeat age in seconds
     level: str = ""                 # "" (failure is red) | "warning" (amber) | "info" (never alerts)
+    key: Optional[str] = None       # agent 1.7+: the AVM_WATCH_* setting and entry this result came from,
+    src: Optional[str] = None       # so the hub can pair it with its check row (older agents: matched by kind+name)
 
 
 class Sample(BaseModel):

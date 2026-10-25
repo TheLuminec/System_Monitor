@@ -122,6 +122,37 @@ CREATE TABLE IF NOT EXISTS claude_jobs (
 );
 CREATE INDEX IF NOT EXISTS claude_jobs_host ON claude_jobs(host_id, status);
 
+-- Checks, one row per watched thing (the source of truth for the AVM_WATCH_* settings pushed to agents, which
+-- are rendered from these rows). Each may carry a label, an owner session (`avm check add` from inside it), an
+-- expiry, and a responder: on an ok -> failing transition the hub prompts a Claude agent on that host
+-- (read-only, guard-railed: cooldown, daily cap, one open alert until the check recovers).
+CREATE TABLE IF NOT EXISTS host_checks (
+    id              INTEGER PRIMARY KEY,
+    host_id         INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+    key             TEXT NOT NULL,        -- AVM_WATCH_* list it renders into (or AVM_MEM_AVAILABLE_WARN_GB)
+    target          TEXT NOT NULL,        -- the entry, e.g. "/srv/heartbeat:600"
+    label           TEXT,
+    owner           TEXT,                 -- tracked-session key of the session that added it (avm check add)
+    created         REAL NOT NULL,
+    created_by      TEXT,
+    expires         REAL,                 -- removed after this (avm check add --ttl)
+    notify          TEXT,                 -- NULL | "tracked:<claude_tracked.id>" | "new"
+    notify_cwd      TEXT,                 -- working dir for a "new" responder session
+    notify_log      INTEGER NOT NULL DEFAULT 0,   -- include related task log tails in the alert (off: paths/ids only)
+    cooldown_min    REAL NOT NULL DEFAULT 30,
+    daily_cap       INTEGER NOT NULL DEFAULT 6,
+    state           TEXT,                 -- ok | failing | unknown (from the agent's reports)
+    since           REAL,
+    last_ok         REAL,
+    detail          TEXT,
+    last_fired      REAL,
+    fires_day       TEXT,
+    fires_n         INTEGER NOT NULL DEFAULT 0,
+    open_job        INTEGER,              -- responder job of the current failure (cleared when the check recovers)
+    pending         INTEGER NOT NULL DEFAULT 0,   -- failure seen but the target session was mid-turn: fire when idle
+    UNIQUE(host_id, key, target)
+);
+
 -- Claude Code sessions the user chose to track on the Agents page. Kept when the session stops or its host goes
 -- offline, so it can still be seen and restarted. key = the background agent's id from `claude agents`
 -- (stable across restarts), or the session id for an interactive session. Updated from each agent report.
@@ -280,9 +311,25 @@ class Database:
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(claude_jobs)")}
-        for col, ddl in (("action", "TEXT"), ("target", "TEXT")):   # action jobs: restart/stop a tracked session
-            if col not in cols:
+        for col, ddl in (("action", "TEXT"), ("target", "TEXT"), ("fork_session", "INTEGER NOT NULL DEFAULT 0")):
+            if col not in cols:   # action: restart/stop a tracked session; fork_session: prompt a copy of a live session
                 self._conn.execute(f"ALTER TABLE claude_jobs ADD COLUMN {col} {ddl}")
+        self._import_legacy_checks()
+
+    def _import_legacy_checks(self) -> None:
+        """One-time: hosts whose AVM_WATCH_* settings predate host_checks get one row per entry."""
+        from .checks import CHECK_KEYS   # local import: checks.py imports nothing from db
+        now = time.time()
+        for r in self._conn.execute("SELECT id, check_config FROM hosts WHERE check_config IS NOT NULL").fetchall():
+            if self._conn.execute("SELECT 1 FROM host_checks WHERE host_id=? LIMIT 1", (r["id"],)).fetchone():
+                continue
+            cfg = json.loads(r["check_config"] or "{}")
+            for key in CHECK_KEYS:
+                entries = [cfg[key]] if key == "AVM_MEM_AVAILABLE_WARN_GB" else (cfg.get(key) or "").split(",")
+                for e in (x.strip() for x in entries if x):
+                    if e:
+                        self._conn.execute("INSERT OR IGNORE INTO host_checks(host_id, key, target, created, created_by) VALUES (?,?,?,?,?)",
+                                           (r["id"], key, e, now, "imported"))
 
     def close(self) -> None:
         with self._lock:
@@ -333,6 +380,11 @@ class Database:
     def host_by_name(self, name: str) -> Optional[HostRow]:
         with self._lock:
             row = self._conn.execute("SELECT * FROM hosts WHERE name=?", (name,)).fetchone()
+        return HostRow.from_row(row) if row else None
+
+    def host_by_id(self, host_id: int) -> Optional[HostRow]:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM hosts WHERE id=?", (host_id,)).fetchone()
         return HostRow.from_row(row) if row else None
 
     def list_hosts(self) -> list[HostRow]:
@@ -629,15 +681,15 @@ class Database:
     # ---------------------------------------------------------- claude jobs
     def job_create(self, host_id: int, prompt: str, cwd: str | None, mode: str, model: str | None,
                    resume_session: str | None, created_by: str | None, action: str | None = None,
-                   target: dict | None = None, title: str | None = None) -> dict:
+                   target: dict | None = None, title: str | None = None, fork_session: bool = False) -> dict:
         now = time.time()
         title = title or (prompt.strip().splitlines()[0][:80] if prompt.strip() else "(empty)")
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO claude_jobs(host_id, status, prompt, cwd, mode, model, resume_session, created, created_by, title, action, target)"
-                " VALUES (?,'queued',?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO claude_jobs(host_id, status, prompt, cwd, mode, model, resume_session, created, created_by, title, action, target, fork_session)"
+                " VALUES (?,'queued',?,?,?,?,?,?,?,?,?,?,?)",
                 (host_id, prompt, cwd, mode, model, resume_session, now, created_by, title, action,
-                 json.dumps(target) if target is not None else None),
+                 json.dumps(target) if target is not None else None, 1 if fork_session else 0),
             )
             return _row(self._conn.execute("SELECT * FROM claude_jobs WHERE id=?", (cur.lastrowid,)).fetchone())
 
@@ -658,11 +710,13 @@ class Database:
         with self._lock:
             queued = []
             for r in self._conn.execute(
-                    "SELECT id, prompt, cwd, mode, model, resume_session, action, target FROM claude_jobs"
+                    "SELECT id, prompt, cwd, mode, model, resume_session, action, target, fork_session FROM claude_jobs"
                     " WHERE host_id=? AND status='queued' ORDER BY id", (host_id,)).fetchall():
                 j = dict(r)
                 if j["action"] and not actions_ok:
                     continue
+                if not j["fork_session"]:
+                    del j["fork_session"]
                 if not j["action"]:
                     del j["action"], j["target"]   # prompt jobs look exactly as they did for older agents
                 else:
@@ -720,6 +774,58 @@ class Database:
         now = now or time.time()
         with self._lock:
             return self._conn.execute("DELETE FROM claude_jobs WHERE status IN ('done','failed','cancelled') AND created < ?", (now - days * 86400,)).rowcount
+
+    # ------------------------------------------------------------- checks
+    CHECK_EDITABLE = ("label", "expires", "notify", "notify_cwd", "notify_log", "cooldown_min", "daily_cap", "target", "owner")
+    CHECK_STATE = ("state", "since", "last_ok", "detail", "last_fired", "fires_day", "fires_n", "open_job", "pending")
+
+    def checks_list(self, host_id: int | None = None) -> list[dict]:
+        sql = "SELECT * FROM host_checks" + (" WHERE host_id=?" if host_id is not None else "") + " ORDER BY host_id, key, target"
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(sql, [host_id] if host_id is not None else []).fetchall()]
+
+    def check_get(self, cid: int) -> Optional[dict]:
+        with self._lock:
+            return _row(self._conn.execute("SELECT * FROM host_checks WHERE id=?", (cid,)).fetchone())
+
+    def check_add(self, host_id: int, key: str, target: str, fields: dict, created_by: str | None) -> dict:
+        """Add a check (or, if this host already has key+target, update its editable fields)."""
+        fields = {k: v for k, v in fields.items() if k in self.CHECK_EDITABLE and k != "target"}
+        with self._lock:
+            row = self._conn.execute("SELECT id FROM host_checks WHERE host_id=? AND key=? AND target=?", (host_id, key, target)).fetchone()
+            if row is None:
+                cols = ["host_id", "key", "target", "created", "created_by"] + list(fields)
+                cur = self._conn.execute(f"INSERT INTO host_checks({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                                         [host_id, key, target, time.time(), created_by, *fields.values()])
+                cid = cur.lastrowid
+            else:
+                cid = row["id"]
+                if fields:
+                    self._conn.execute(f"UPDATE host_checks SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?", [*fields.values(), cid])
+            return _row(self._conn.execute("SELECT * FROM host_checks WHERE id=?", (cid,)).fetchone())
+
+    def check_update(self, cid: int, fields: dict, host_id: int | None = None) -> Optional[dict]:
+        fields = {k: v for k, v in fields.items() if k in self.CHECK_EDITABLE + self.CHECK_STATE}
+        with self._lock:
+            row = self._conn.execute("SELECT host_id FROM host_checks WHERE id=?", (cid,)).fetchone()
+            if row is None or (host_id is not None and row["host_id"] != host_id):
+                return None
+            if fields:
+                self._conn.execute(f"UPDATE host_checks SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?", [*fields.values(), cid])
+            return _row(self._conn.execute("SELECT * FROM host_checks WHERE id=?", (cid,)).fetchone())
+
+    def check_delete(self, cid: int, host_id: int | None = None) -> Optional[dict]:
+        with self._lock:
+            row = _row(self._conn.execute("SELECT * FROM host_checks WHERE id=?", (cid,)).fetchone())
+            if row is None or (host_id is not None and row["host_id"] != host_id):
+                return None
+            self._conn.execute("DELETE FROM host_checks WHERE id=?", (cid,))
+            return row
+
+    def checks_expired(self, now: float | None = None) -> list[dict]:
+        now = now or time.time()
+        with self._lock:
+            return [dict(r) for r in self._conn.execute("SELECT * FROM host_checks WHERE expires IS NOT NULL AND expires < ?", (now,)).fetchall()]
 
     # ------------------------------------------------------- tracked sessions
     TRACK_SYNC = ("session_id", "name", "cwd", "kind", "live", "state", "status", "detail", "last_said", "last_activity")

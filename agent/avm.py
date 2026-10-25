@@ -25,6 +25,20 @@ One command when you set something off:
         stays listed (and can be restarted) even after it stops or the machine goes offline.
     avm agent untrack            (from inside the session)    avm agent list
 
+Checks on this host (shown on its dashboard page; agents may manage their own):
+
+    avm check list [--json]
+    avm check add KIND TARGET [--label "R4 chain"] [--ttl 12h] [--notify self|new|none] [--cwd DIR] [--with-log]
+                              [--cooldown 30m] [--daily-cap 6]
+        KIND: process | file (path:max-age-s) | tcp (host:port) | mount | content | marker (glob[::regex])
+              | nonempty | unit ([user:]name) | job ([user:]glob scope) | memory (free-GB floor, one per host)
+        --notify self   when it goes ok -> failing, wake THIS Claude session (resumed, read-only) with an alert;
+                        new = a fresh read-only session in --cwd. Guard-railed: cooldown, daily cap, one open alert
+                        until it recovers, held while the session is mid-turn. Alerts carry paths/ids/exit codes,
+                        never file contents; --with-log adds related avm task log tails (leave off for DUA data).
+        --ttl 12h       remove the check by itself afterwards (e.g. when a chain will be finished).
+    avm check set ID [same options] [--target T] [--no-log]       avm check rm ID | KIND TARGET
+
 Resources and the wait queue (host-local; opt-in - plain `avm run` behaves exactly as before):
 
     avm run "nymeria b4020" --gpu --exclusive --mem 19G --wait [--max-wait 8h] -- python train.py
@@ -65,7 +79,7 @@ import urllib.request
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
-AVM_VERSION = "1.7.0"
+AVM_VERSION = "1.8.0"
 IS_WINDOWS = sys.platform.startswith("win")
 
 
@@ -668,6 +682,95 @@ def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, re
         q.release()
 
 
+# ------------------------------------------------------------------- check
+def _check_body(args: argparse.Namespace) -> Dict[str, Any]:
+    body: Dict[str, Any] = {}
+    if getattr(args, "label", None) is not None:
+        body["label"] = args.label
+    if getattr(args, "ttl", None) is not None:
+        body["ttl_sec"] = _duration(args.ttl)
+    if getattr(args, "notify", None) is not None:
+        body["notify"] = args.notify
+        if args.notify == "self":
+            me = _this_session()
+            if not me.get("key"):
+                raise ValueError("--notify self only works inside a Claude Code session")
+            body["session"] = {k: v for k, v in me.items() if v is not None}
+    if getattr(args, "cwd", None) is not None:
+        body["notify_cwd"] = os.path.abspath(os.path.expanduser(args.cwd))
+    if getattr(args, "with_log", False):
+        body["notify_log"] = True
+    if getattr(args, "no_log", False):
+        body["notify_log"] = False
+    if getattr(args, "cooldown", None) is not None:
+        body["cooldown_min"] = (_duration(args.cooldown) or 0) / 60
+    if getattr(args, "daily_cap", None) is not None:
+        body["daily_cap"] = args.daily_cap
+    return body
+
+
+def _check_line(c: Dict[str, Any]) -> str:
+    state = c.get("state") or "?"
+    mark = {"ok": "✓", "failing": "✗", "unknown": "?"}.get(state, " ")
+    resp = c.get("notify") or "-"
+    if c.get("open_job"):
+        resp += " (alert #%s open)" % c["open_job"]
+    elif c.get("pending"):
+        resp += " (pending)"
+    exp = (" · expires in %s" % _fmt_dur(c["expires"] - time.time())) if c.get("expires") else ""
+    detail = ((c.get("result") or {}).get("detail") or c.get("detail") or "")[:60]
+    return "%s %4d  %-9s %-36s %-18s %-22s %s%s" % (mark, c["id"], c["kind"], c["target"][:36], (c.get("label") or "")[:18],
+                                                  resp[:22], detail, exp)
+
+
+def cmd_check(args: argparse.Namespace, hub: Hub) -> int:
+    try:
+        if args.op == "list":
+            rows = hub.call("/agent/checks", method="GET").get("checks", [])
+            if args.json:
+                print(json.dumps(rows, indent=1))
+                return 0
+            if not rows:
+                print("no checks on this host (avm check add KIND TARGET)")
+            for c in rows:
+                print(_check_line(c))
+            return 0
+        if args.op == "add":
+            body = dict(_check_body(args), kind=args.kind, target=os.path.expanduser(args.target) if args.kind in ("file", "mount", "content", "nonempty") else args.target)
+            c = hub.call("/agent/checks", body)["check"]
+            print("check #%d: %s %s%s" % (c["id"], c["kind"], c["target"], " -> notifies %s" % c["notify"] if c.get("notify") else ""))
+            return 0
+        if args.op == "set":
+            body = _check_body(args)
+            if args.target is not None:
+                body["target"] = args.target
+            if not body:
+                sys.stderr.write("avm check set: nothing to change\n")
+                return 2
+            c = hub.call("/agent/checks/%d" % args.id, body, method="PATCH")["check"]
+            print(_check_line(c))
+            return 0
+        if args.op == "rm":
+            cid = None
+            if len(args.what) == 1 and args.what[0].isdigit():
+                cid = int(args.what[0])
+            elif len(args.what) == 2:
+                kind, target = args.what
+                for c in hub.call("/agent/checks", method="GET").get("checks", []):
+                    if c["kind"] == kind and c["target"] in (target, os.path.expanduser(target)):
+                        cid = c["id"]
+            if cid is None:
+                sys.stderr.write("avm check rm: no such check (give its ID, or KIND TARGET)\n")
+                return 1
+            hub.call("/agent/checks/%d" % cid, method="DELETE")
+            print("removed check #%d" % cid)
+            return 0
+    except ValueError as e:
+        sys.stderr.write("avm check: %s\n" % e)
+        return 2
+    return 2
+
+
 def cmd_queue(args: argparse.Namespace, cfg: Dict[str, str]) -> int:
     q = Queue(cfg)
     flag = os.path.join(q.dir, "DRAIN")
@@ -902,6 +1005,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap2.add_parser("untrack")
     ap2.add_parser("list")
 
+    p = sub.add_parser("check", help="this host's checks (and responders): list / add / set / rm")
+    cp = p.add_subparsers(dest="op", required=True)
+    s = cp.add_parser("list"); s.add_argument("--json", action="store_true")
+
+    def check_opts(s: argparse.ArgumentParser) -> None:
+        s.add_argument("--label")
+        s.add_argument("--ttl", help="remove it after this long, e.g. 12h")
+        s.add_argument("--notify", choices=("self", "new", "none"), help="who is prompted when it starts failing")
+        s.add_argument("--cwd", help="working dir for a --notify new session")
+        s.add_argument("--with-log", action="store_true", help="include related avm task log tails in the alert")
+        s.add_argument("--cooldown", help="minimum time between alerts, e.g. 30m (default 30m)")
+        s.add_argument("--daily-cap", type=int, help="alerts per day at most (default 6)")
+    s = cp.add_parser("add"); s.add_argument("kind", choices=("process", "file", "tcp", "mount", "content", "marker", "nonempty", "unit", "job", "memory"))
+    s.add_argument("target"); check_opts(s)
+    s = cp.add_parser("set"); s.add_argument("id", type=int); s.add_argument("--target"); s.add_argument("--no-log", action="store_true"); check_opts(s)
+    s = cp.add_parser("rm"); s.add_argument("what", nargs="+", help="ID, or KIND TARGET")
+
     p = sub.add_parser("queue", help="this host's resource queue: status / drain / resume")
     qp = p.add_subparsers(dest="op", required=True)
     s = qp.add_parser("status"); s.add_argument("--json", action="store_true")
@@ -921,7 +1041,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_queue(args, load_config(required=False))
     hub = Hub(load_config())
     try:
-        return {"run": cmd_run, "watch": cmd_watch, "task": cmd_task, "results": cmd_results, "agent": cmd_agent}[args.cmd](args, hub)
+        return {"run": cmd_run, "watch": cmd_watch, "task": cmd_task, "results": cmd_results, "agent": cmd_agent, "check": cmd_check}[args.cmd](args, hub)
     except urllib.error.HTTPError as e:
         sys.stderr.write("avm: hub rejected the request: HTTP %s %s\n" % (e.code, e.read().decode(errors="replace")[:200]))
         return 1
