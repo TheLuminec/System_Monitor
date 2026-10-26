@@ -33,6 +33,7 @@ REMOTE_KEYS = (
     "AVM_WATCH_MARKERS", "AVM_WATCH_NONEMPTY", "AVM_WATCH_UNITS", "AVM_WATCH_JOBS",
     "AVM_MEM_AVAILABLE_WARN_GB", "AVM_PROCESSES", "AVM_TAGS",
     "AVM_COMMIT_WARN_PCT",   # hub/dashboard only (memory-commit warning threshold); agents ignore keys they don't know
+    "AVM_TAILSCALE_MIN",     # hub only: lowest acceptable Tailscale version on this host (default checks.TAILSCALE_MIN)
 )
 AGENT_COMMANDS = ("respawn",)
 
@@ -281,6 +282,8 @@ async def ingest(request: Request):
     dup = _duplicate_reporters(host.id, sample, now)
     if dup:
         sample.checks.append(Check(name="duplicate agent", kind="rule", ok=False, detail=dup))
+    for c in checks_mod.tailscale_checks(sample.tailscale, (host.check_config or {}).get("AVM_TAILSCALE_MIN")):
+        sample.checks.append(Check(**c))
 
     await run_in_threadpool(db.record_sample, host, sample, ip)
     try:   # checks: adopt agent.conf checks once, state per row, responders on ok -> failing (never break ingest)

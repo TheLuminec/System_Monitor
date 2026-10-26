@@ -71,7 +71,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.7.2"
+AGENT_VERSION = "1.7.3"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -1526,6 +1526,55 @@ def _safe(fn, *args, default=None):
         return default
 
 
+_TS_CACHE: Dict[str, Any] = {"at": -1e9, "value": None}
+
+
+def collect_tailscale() -> Optional[Dict[str, Any]]:
+    """Tailscale's security-relevant state, for checking the fleet against advisories: version, whether Tailscale SSH /
+    app connectors are on, the control server, and any `serve` targets that are Unix sockets. Read-only CLI calls,
+    refreshed every 10 minutes. None when Tailscale isn't installed."""
+    if time.monotonic() - _TS_CACHE["at"] < 600:
+        return _TS_CACHE["value"]
+    _TS_CACHE["at"] = time.monotonic()
+    exe = shutil.which("tailscale") or next((p for p in (r"C:\Program Files\Tailscale\tailscale.exe",
+                                                        "/Applications/Tailscale.app/Contents/MacOS/Tailscale") if os.path.isfile(p)), None)
+    if not exe:
+        _TS_CACHE["value"] = None
+        return None
+    out: Dict[str, Any] = {}
+    ver = _run([exe, "version"], timeout=10)
+    out["version"] = ver.strip().splitlines()[0].strip() if ver else None
+    prefs = _run([exe, "debug", "prefs"], timeout=10)
+    try:
+        p = json.loads(prefs) if prefs else None
+    except ValueError:
+        p = None
+    if isinstance(p, dict):
+        out.update(ssh=bool(p.get("RunSSH")), app_connector=bool((p.get("AppConnector") or {}).get("Advertise")),
+                   control=p.get("ControlURL"), routes=len(p.get("AdvertiseRoutes") or []))
+    serve = _run([exe, "serve", "status", "--json"], timeout=10)
+    try:
+        sv = json.loads(serve) if serve and serve.strip().startswith("{") else {}
+    except ValueError:
+        sv = {}
+    targets: List[str] = []
+
+    def walk(x: Any) -> None:
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k in ("Proxy", "TCPForward") and isinstance(v, str):
+                    targets.append(v)
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(sv)
+    out["serve_targets"] = len(targets)
+    out["serve_unix"] = [t for t in targets if t.startswith("unix:") or t.startswith("/")]
+    _TS_CACHE["value"] = out
+    return out
+
+
 def collect_sample(cfg: Dict[str, str], interval: float) -> Dict[str, Any]:
     exclude_fs = [x.lower() for x in _csv(cfg["AVM_DISK_EXCLUDE_FS"])]
     lhm = _safe(gpus_lhm, cfg["AVM_LHM_URL"], default={"gpus": [], "cpu_temp": None})
@@ -1547,6 +1596,7 @@ def collect_sample(cfg: Dict[str, str], interval: float) -> Dict[str, Any]:
         "battery": _safe(collect_battery),
         "checks": _safe(collect_checks, cfg, default=[]),
         "claude": _safe(_CLAUDE.report) if _CLAUDE else None,
+        "tailscale": _safe(collect_tailscale),
     }
 
 

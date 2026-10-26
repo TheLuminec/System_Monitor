@@ -19,7 +19,7 @@ from .routes_ops import tracked_public
 log = logging.getLogger("avalon.checks")
 router = APIRouter(prefix="/api/v1")
 
-SETTING_KEYS = ("AVM_COMMIT_WARN_PCT", "AVM_PROCESSES", "AVM_TAGS")   # the non-check host settings the panel edits
+SETTING_KEYS = ("AVM_COMMIT_WARN_PCT", "AVM_TAILSCALE_MIN", "AVM_PROCESSES", "AVM_TAGS")   # the non-check host settings the panel edits
 
 
 class CheckIn(BaseModel):

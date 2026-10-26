@@ -35,6 +35,30 @@ MIN_COOLDOWN_MIN = 5.0
 MANAGED = "_checks_managed"   # marker in a host's settings: its watch lists are owned by the hub (agents ignore it)
 
 
+# Lowest Tailscale version without a known advisory: TS-2026-013 (leaked eMudhra TLS intermediates) is fixed in
+# 1.104.2. Raise it when a new bulletin lands; a host's AVM_TAILSCALE_MIN setting overrides it.
+TAILSCALE_MIN = "1.104.2"
+
+
+def tailscale_checks(ts: Optional[dict], minimum: Optional[str]) -> list[dict]:
+    """Advisory checks from the agent's Tailscale report. The 'Tailworm' findings (Oct 2026, no fix released yet) need
+    Tailscale SSH, app connectors or serve forwarding to a Unix socket - warn while any of those is on."""
+    if not isinstance(ts, dict) or not ts.get("version"):
+        return []
+    floor = (minimum or TAILSCALE_MIN).strip()
+    ver = str(ts["version"])
+    out = [{"name": "tailscale version", "kind": "rule", "ok": _version(ver) >= _version(floor),
+            "detail": f"{ver}" + (f" - below {floor}: update Tailscale (TS-2026-013 and later bulletins)" if _version(ver) < _version(floor) else f" (needs ≥ {floor})")}]
+    risky = [(ts.get("ssh"), "Tailscale SSH is on", "tailscale set --ssh=false if this host doesn't need it"),
+             (ts.get("app_connector"), "app connector is advertised", "remove the connector capability if unused"),
+             (ts.get("serve_unix"), f"serve forwards to a Unix socket ({', '.join(ts.get('serve_unix') or [])[:120]})", "remove forwards to privileged sockets")]
+    for on, what, fix in risky:
+        if on:
+            out.append({"name": "tailscale exposure", "kind": "rule", "ok": False, "level": "warning",
+                        "detail": f"{what}: exposed to the unpatched 'Tailworm' findings - {fix}"})
+    return out
+
+
 def _version(v: Optional[str]) -> tuple:
     try:
         return tuple(int(x) for x in str(v or "0").split(".")[:3])
