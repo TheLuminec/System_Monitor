@@ -128,7 +128,8 @@ hub, the dashboard and a modified hub can't raise them:
 `AVM_AUTO_UPDATE=false` stops self-updates on a host entirely.
 
 The hub may set only `AVM_WATCH_*`, `AVM_MEM_AVAILABLE_WARN_GB`, `AVM_PROCESSES` and `AVM_TAGS` on an agent. Responder
-alerts from checks are always plan-mode prompts and never include a content check's file line.
+alerts from checks are always plan-mode prompts, never include a content check's file line, and are held (not
+queued, the reason shown on the check) when the host's agent policy would refuse a plan prompt.
 
 ## Hosts with data-use agreements
 

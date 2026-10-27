@@ -80,6 +80,9 @@ AVM_AUTO_UPDATE=true
 # Extra Ed25519 release public keys (hex, comma list) a self-update may be signed with, on top of the keys built
 # into the agent (RELEASE_PUBKEYS) - never instead of them, so key rotations shipped in releases still arrive.
 #AVM_UPDATE_PUBKEYS=
+# Install a signed release whose version is LOWER than the one installed (a deliberate rollback). Off, the hub can't
+# replay an older signed release onto this host. Set it only for the rollback, then remove it.
+#AVM_ALLOW_DOWNGRADE=false
 # Where remote-config.json (the hub's last settings, kept across restarts) is written. Default: beside this file, if
 # writable, else beside the agent script (a root Linux install's unit makes /etc read-only: /opt/avalon-agent is used).
 #AVM_STATE_DIR=
@@ -88,7 +91,9 @@ AVM_AUTO_UPDATE=true
 # off = no output lines, command line or working directory of avm tasks leave this host (name, status, rc, timing and
 # note still do). "off" in any agent.conf avm can read wins. Per run: avm run --log / --no-log.
 #AVM_TASK_LOG=on
-# Same, only for runs whose working directory is inside one of these (comma list).
+# Same, only for runs whose working directory is inside one of these (comma list). The agent applies it too: Claude
+# sessions working inside one report no snippets, and a dashboard prompt run inside one sends at most a summary
+# transcript (the agent reads its own agent.conf only, so list them here, not just in another avm config).
 #AVM_TASK_LOG_OFF_DIRS=
 # Queue (`avm run --wait`, --gpu/--mem/--vram): free-RAM headroom in GB, how long a started job's declared
 # reservation counts, and the shared queue directory (default /run/avm-queue if it exists, else /tmp/avm-queue).

@@ -12,7 +12,8 @@ Ready-to-use `agent.conf` contents for the current fleet. Tokens come from
 > `AVM_WATCH_*` lines below are what seeds a freshly enrolled host.
 >
 > **Local policy stays local.** `AVM_MAX_JOB_MODE` (default `plan`), `AVM_ALLOW_ACTIONS`, `AVM_ALLOW_ROOT_JOBS`,
-> `AVM_JOB_TRANSCRIPT`, `AVM_CONTENT_ROOTS`, `AVM_UPDATE_PUBKEYS` and `AVM_STATE_DIR` are read only from the host's own
+> `AVM_JOB_TRANSCRIPT`, `AVM_SESSION_SNIPPETS`, `AVM_TASK_LOG_OFF_DIRS`, `AVM_CONTENT_ROOTS`, `AVM_UPDATE_PUBKEYS`,
+> `AVM_ALLOW_DOWNGRADE` and `AVM_STATE_DIR` are read only from the host's own
 > `agent.conf` (or the agent's environment); the hub can't set them ([SECURITY.md](SECURITY.md#agent-local-policy)). An agent running as root or
 > SYSTEM refuses dashboard prompts, responder alerts and session restart/stop unless `AVM_ALLOW_ROOT_JOBS=true`.
 
@@ -164,7 +165,8 @@ AVM_TOKEN=avm_…
 AVM_HOSTNAME=avalon
 AVM_INTERVAL=5
 AVM_TAGS=hub, data + coordination
-# shared host: keep task output from data-use-agreement projects on this machine (see below)
+# shared host: keep task output, session snippets and full prompt transcripts from data-use-agreement projects on
+# this machine (see below)
 #AVM_TASK_LOG_OFF_DIRS=<project dir>
 ```
 

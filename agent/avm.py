@@ -101,7 +101,7 @@ import urllib.request
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
-AVM_VERSION = "1.9.1"
+AVM_VERSION = "1.10.0"
 IS_WINDOWS = sys.platform.startswith("win")
 
 
