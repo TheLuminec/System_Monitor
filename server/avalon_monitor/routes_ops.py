@@ -117,9 +117,9 @@ async def task_start(body: TaskStart, host: HostRow = Depends(require_agent)):
 
 @router.post("/tasks/{task_id}/beat")
 async def task_beat(task_id: int, body: TaskUpdate, host: HostRow = Depends(require_agent)):
-    t = await run_in_threadpool(db.task_update, task_id, host.id, progress=body.progress, note=body.note, pid=body.pid,
-                                log_lines=None if datause.restricted(host) else body.log,
-                                status=body.status, meta=body.meta)
+    hide = datause.restricted(host)   # data-use host: no output lines, and no notes (free text: `avm ... --note`)
+    t = await run_in_threadpool(db.task_update, task_id, host.id, progress=body.progress, note=None if hide else body.note,
+                                pid=body.pid, log_lines=None if hide else body.log, status=body.status, meta=body.meta)
     if t is None:
         raise HTTPException(404, "no such task on this host")
     await _emit_task(t)
@@ -130,8 +130,9 @@ async def task_beat(task_id: int, body: TaskUpdate, host: HostRow = Depends(requ
 async def task_finish(task_id: int, body: TaskFinish, host: HostRow = Depends(require_agent)):
     if body.status not in ("done", "failed"):
         raise HTTPException(422, "status must be done or failed")
-    t = await run_in_threadpool(db.task_update, task_id, host.id, status=body.status, rc=body.rc, note=body.note,
-                                log_lines=None if datause.restricted(host) else body.log)
+    hide = datause.restricted(host)   # as for beats: the exit code stays, output lines and the note don't
+    t = await run_in_threadpool(db.task_update, task_id, host.id, status=body.status, rc=body.rc,
+                                note=None if hide else body.note, log_lines=None if hide else body.log)
     if t is None:
         raise HTTPException(404, "no such task on this host")
     (log.warning if body.status == "failed" else log.info)("task #%d '%s' %s on %s (rc=%s)", t["id"], t["name"], body.status, host.name, body.rc)
@@ -230,10 +231,12 @@ class JobFinish(BaseModel):
 MODE_RANK = {"plan": 0, "acceptEdits": 1, "full": 2}
 
 
-def host_policy_refusal(h: HostRow, mode: Optional[str] = None, action: Optional[str] = None) -> Optional[str]:
+def host_policy_refusal(h: HostRow, mode: Optional[str] = None, action: Optional[str] = None,
+                        sample: Optional[dict] = None) -> Optional[str]:
     """The hub's check of what a host's agent says it will accept (agent 1.9+ reports claude.policy): refuse up front
-    what it would refuse anyway - and everything for agents that report no policy, which enforce no local cap."""
-    policy = ((h.last_sample or {}).get("claude") or {}).get("policy")
+    what it would refuse anyway - and everything for agents that report no policy, which enforce no local cap.
+    `sample`: the report being ingested (check responders, checks.evaluate), else the host's last stored one."""
+    policy = (((sample if sample is not None else h.last_sample) or {}).get("claude") or {}).get("policy")
     if not isinstance(policy, dict):
         return (f"{h.name}'s agent reports no local policy (older than 1.9), so it enforces no limits of its own: "
                 "prompts and restarts are refused until it updates")

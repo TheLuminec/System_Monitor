@@ -19,7 +19,9 @@ from .routes_ops import tracked_public
 log = logging.getLogger("avalon.checks")
 router = APIRouter(prefix="/api/v1")
 
-SETTING_KEYS = ("AVM_COMMIT_WARN_PCT", "AVM_TAILSCALE_MIN", "AVM_PROCESSES", "AVM_TAGS")   # the non-check host settings the panel edits
+# The non-check host settings the panel edits (every key of the UI's SETTING_LABELS: the panel sends them all, and the
+# checklist must show the current AVM_DATA_USE, or saving another setting would erase a sticky data-use flag).
+SETTING_KEYS = ("AVM_COMMIT_WARN_PCT", "AVM_TAILSCALE_MIN", "AVM_DATA_USE", "AVM_PROCESSES", "AVM_TAGS")
 
 
 class CheckIn(BaseModel):
@@ -206,7 +208,8 @@ async def checklist_delete(cid: int, request: Request, ident: Identity = Depends
 
 @router.put("/hosts/{name}/check-settings")
 async def check_settings(name: str, request: Request, ident: Identity = Depends(require_operator)):
-    """The few non-check host settings (commit warning %, top processes, tags); check rows are untouched."""
+    """The few non-check host settings (commit warning %, Tailscale floor, data-use, top processes, tags); check rows
+    are untouched. "" removes a setting (for AVM_DATA_USE that means auto: see datause.py; "off" lifts it)."""
     require_same_origin(request)
     body = await request.json()
     if not isinstance(body, dict) or any(k not in SETTING_KEYS for k in body):

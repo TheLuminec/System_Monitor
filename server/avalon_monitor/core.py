@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import socket
+import subprocess
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
@@ -135,6 +136,32 @@ def require_viewer(request: Request) -> Identity:
 
 _HOSTNAME = socket.gethostname().lower()
 _PUBLIC_HOST = (urlsplit(settings.public_url).hostname or "").lower() if settings.public_url else ""
+_tailnet: Optional[str] = None   # this hub's MagicDNS suffix ("" = unknown); None = not resolved yet (see tailnet())
+
+
+def _detect_tailnet() -> str:
+    """MagicDNSSuffix from `tailscale status --json` (e.g. "tail1234.ts.net"); "" on any failure."""
+    try:
+        out = subprocess.run(["tailscale", "status", "--json"], capture_output=True, timeout=3, check=False)
+        suffix = json.loads(out.stdout or b"{}").get("MagicDNSSuffix") if out.returncode == 0 else ""
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+        return ""
+    return str(suffix or "").strip().lower().strip(".")
+
+
+def tailnet() -> str:
+    """The tailnet whose <hostname>.<tailnet> names are this hub: AVM_TAILNET, else detected once (at startup, from
+    the lifespan; lazily if a request comes first). "" = neither: any <hostname>.*.ts.net passes, as before, with one
+    warning - a device on another tailnet sharing this hostname could then rebind to the hub."""
+    global _tailnet
+    if _tailnet is None:
+        _tailnet = settings.tailnet or _detect_tailnet()
+        if _tailnet:
+            log.info("Host allowlist: MagicDNS name %s.%s%s", _HOSTNAME, _tailnet, "" if settings.tailnet else " (detected)")
+        else:
+            log.warning("Host allowlist: tailnet unknown (AVM_TAILNET unset, `tailscale status --json` gave no MagicDNSSuffix):"
+                        " accepting %s.<any tailnet>.ts.net - set AVM_TAILNET to pin it", _HOSTNAME)
+    return _tailnet
 
 
 def host_allowed(host_header: str, headers=None) -> bool:
@@ -160,7 +187,10 @@ def host_allowed(host_header: str, headers=None) -> bool:
         pass
     if host in ("localhost", _HOSTNAME) or host == _PUBLIC_HOST or host in settings.allowed_hosts:
         return True
-    parts = host.split(".")   # MagicDNS name of this machine: <hostname>.<tailnet>.ts.net
+    pinned = tailnet()   # MagicDNS name of this machine: <hostname>.<tailnet>.ts.net - only this hub's tailnet if known
+    if pinned:
+        return host == f"{_HOSTNAME}.{pinned}"
+    parts = host.split(".")
     return len(parts) == 4 and parts[0] == _HOSTNAME and parts[2:] == ["ts", "net"]
 
 

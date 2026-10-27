@@ -3,27 +3,69 @@
 The agent's own switches (AVM_TASK_LOG, AVM_JOB_TRANSCRIPT, AVM_SESSION_SNIPPETS, AVM_CONTENT_ROOTS) keep data on the
 host; this makes a forgotten agent.conf line fail safe. A host is restricted when its hub setting AVM_DATA_USE is
 "restricted" (set on the host page, kept by the hub) OR its agent reports a transcript level below "full". For a
-restricted host the hub drops, before anything is stored or broadcast: task output lines, commands and working
-directories; prompt tool inputs/results and intermediate text; Claude session snippets and process arguments; and
-content-check text.
+restricted host the hub drops, before anything is stored or broadcast: task output lines, commands, working
+directories and notes; prompt tool inputs/results and intermediate text; Claude session snippets and process
+arguments; and content-check text.
+
+Sticky: the first report whose policy is restricted, from a host whose AVM_DATA_USE is unset (empty, or a value that
+is neither on nor off), makes the hub store AVM_DATA_USE=restricted for it (see `sticky`) - so an agent.conf that
+later loses its lines doesn't quietly un-restrict the host: the hub raises a "data-use policy" alert instead and keeps
+scrubbing. Only an operator lifts it, by setting an explicit off value (OFF) on the host page; the hub never
+overwrites that (while the agent still reports a restricted policy, the host stays restricted through it anyway).
 """
 from __future__ import annotations
 
 from typing import Any, Optional
 
 KEY = "AVM_DATA_USE"
+ON = ("restricted", "on", "true", "1", "yes")
+OFF = ("off", "normal", "none", "false", "0", "no")   # an operator lifted it: never auto-set over this
 SNIPPET_KEYS = ("first_prompt", "last_user", "last_assistant", "last_said", "detail", "args")
 WITHHELD = "(withheld: data-use host)"
+CHECK_NAME = "data-use policy"   # hub rule check, failing while the agent's policy no longer matches AVM_DATA_USE
+
+
+def setting(host: Any) -> str:
+    """The host's AVM_DATA_USE, normalised ("" = unset)."""
+    return str(((getattr(host, "check_config", None) or {}).get(KEY) or "")).strip().lower()
+
+
+def policy_restricted(policy: Any) -> Optional[bool]:
+    """What an agent's claude.policy (agent 1.9+) says: True = it keeps transcripts/snippets on the host; None = no
+    policy reported (older agent, or no claude block)."""
+    if not isinstance(policy, dict):
+        return None
+    return policy.get("transcript") in ("summary", "off") or policy.get("snippets") is False
+
+
+def _policy(s: Any) -> Any:
+    return ((s or {}).get("claude") or {}).get("policy") if isinstance(s, dict) else None
 
 
 def restricted(host: Any, sample: Optional[dict] = None) -> bool:
-    if str(((getattr(host, "check_config", None) or {}).get(KEY) or "")).strip().lower() in ("restricted", "on", "true", "1", "yes"):
+    if setting(host) in ON:
         return True
     for s in (sample, getattr(host, "last_sample", None)):
-        policy = ((s or {}).get("claude") or {}).get("policy") if isinstance(s, dict) else None
-        if isinstance(policy, dict):
-            return policy.get("transcript") in ("summary", "off") or policy.get("snippets") is False
+        verdict = policy_restricted(_policy(s))
+        if verdict is not None:
+            return verdict
     return False
+
+
+def sticky(host: Any, claude: Optional[dict]) -> tuple[bool, Optional[str]]:
+    """For one report's claude block: (store AVM_DATA_USE=restricted now, alert text if the agent's policy no longer
+    matches the host's setting). Only a report that carries a policy counts: an older agent's (none) changes nothing."""
+    reported = policy_restricted(_policy({"claude": claude}))
+    flag = setting(host)
+    if reported and flag not in ON + OFF:
+        return True, None
+    if reported is False and flag in ON:
+        pol = (claude or {}).get("policy") or {}
+        return False, (f"data-use host ({KEY}={flag}), but its agent now reports transcript={pol.get('transcript')}, "
+                       f"snippets {'off' if pol.get('snippets') is False else 'on'}: did its agent.conf lose AVM_JOB_TRANSCRIPT / "
+                       "AVM_SESSION_SNIPPETS? The hub keeps scrubbing. Restore those lines, or set "
+                       f"{KEY}=off in the host settings if it no longer holds agreement data")
+    return False, None
 
 
 def scrub_claude(claude: Optional[dict]) -> Optional[dict]:

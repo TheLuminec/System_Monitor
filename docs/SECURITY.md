@@ -27,7 +27,10 @@ Every route and the rule it uses: [README → API](../README.md#api).
 
 * **Host allowlist** (all HTTP and WebSocket requests, before anything else). Accepted `Host` values: IP literals,
   `localhost`, the machine's hostname, `<hostname>.<tailnet>.ts.net`, the host of `AVM_PUBLIC_URL`, and anything in
-  `AVM_ALLOWED_HOSTS`. Anything else gets `421 unexpected Host header` (WebSocket: close code 4421). Requests carrying
+  `AVM_ALLOWED_HOSTS`. The tailnet is pinned: `AVM_TAILNET` (e.g. `tail1234.ts.net`), else the `MagicDNSSuffix` that
+  `tailscale status --json` gives once at startup, so `<hostname>.<another tailnet>.ts.net` - a same-named device on
+  a tailnet someone else controls - is refused. If neither is available the hub accepts `<hostname>.<any>.ts.net` as
+  before and logs a warning; set `AVM_TAILNET` then. Anything else gets `421 unexpected Host header` (WebSocket: close code 4421). Requests carrying
   Cloudflare's `cf-*` headers pass this check, but such a request never gets trusted-network access: it needs a valid
   Access JWT. If an agent or your browser uses another name for AVALON (a DNS alias, a Tailscale machine name that
   differs from the OS hostname), add it to `AVM_ALLOWED_HOSTS`.
@@ -116,6 +119,12 @@ alerts from checks are always plan-mode prompts and never include a content chec
 ## Hosts with data-use agreements
 
 What can leave a host and end up in the hub's database (which AVALON's nightly backup keeps for months): `avm` task
-output tails, command lines and working directories; prompt transcripts (tool inputs and results); content-check
-first lines; and, for checks created with `--with-log`, task log tails inside responder prompts. The local switches that
-stop each of these are in [HOSTS.md → Hosts with data-use agreements](HOSTS.md#hosts-with-data-use-agreements).
+output tails, command lines, working directories and notes; prompt transcripts (tool inputs and results);
+content-check first lines; and, for checks created with `--with-log`, task log tails inside responder prompts. The
+local switches that stop each of these are in [HOSTS.md → Hosts with data-use agreements](HOSTS.md#hosts-with-data-use-agreements).
+
+The hub drops all of these itself for a host marked `AVM_DATA_USE=restricted` or whose agent reports a restricted
+policy (`datause.py`). The mark is sticky: a restricted policy on a host with no `AVM_DATA_USE` stores `restricted`,
+so an agent.conf that later loses its lines can't un-restrict the host - the hub keeps scrubbing and shows a failing
+`data-use policy` check instead. Only an operator lifts it, with `AVM_DATA_USE=off` (also `normal`/`none`), which the
+hub never overwrites.

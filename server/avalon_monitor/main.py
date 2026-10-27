@@ -34,13 +34,15 @@ REMOTE_KEYS = (
     "AVM_MEM_AVAILABLE_WARN_GB", "AVM_PROCESSES", "AVM_TAGS",
     "AVM_COMMIT_WARN_PCT",   # hub/dashboard only (memory-commit warning threshold); agents ignore keys they don't know
     "AVM_TAILSCALE_MIN",     # hub only: lowest acceptable Tailscale version on this host (default checks.TAILSCALE_MIN)
-    "AVM_DATA_USE",          # hub only: "restricted" = data-use host, the hub drops file/conversation text (see datause.py)
+    "AVM_DATA_USE",          # hub only: "restricted" = data-use host, the hub drops file/conversation text; "off" lifts
+                             # it; empty = set to restricted by the first restricted agent policy (see datause.py)
 )
 AGENT_COMMANDS = ("respawn",)
 
 
 from .core import (AGENT_SCRIPT, AgentBundle, LiveHub, agent_bundle, authz, client_ip, db, gpu_stall, hub,  # noqa: F401
                    host_allowed, may_change, require_agent, require_operator, require_same_origin, require_viewer, same_origin)
+from .core import tailnet as core_tailnet
 from . import checks as checks_mod
 from . import datause
 from .routes_checks import router as checks_router
@@ -102,6 +104,7 @@ def _summary_of(sample: Optional[dict]) -> dict[str, Any]:
 
 
 _REPORTERS: dict[int, dict[tuple, list[float]]] = {}   # host id -> {(pid, user): [first, last, count]}
+_DATA_USE_MISMATCH: set[int] = set()   # hosts whose "data-use policy" check is failing (logged once per episode)
 
 
 def _duplicate_reporters(host_id: int, sample: Sample, now: float) -> Optional[str]:
@@ -216,6 +219,7 @@ async def presence_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Avalon Monitor %s starting on %s:%s (db=%s)", __version__, settings.bind_host, settings.bind_port, settings.db_path)
+    await run_in_threadpool(core_tailnet)   # pin the Host allowlist's MagicDNS name now (AVM_TAILNET or detected)
     tasks = [asyncio.create_task(maintenance_loop()), asyncio.create_task(presence_loop())]
     try:
         yield
@@ -312,6 +316,23 @@ async def ingest(request: Request):
         sample.checks.append(Check(name="duplicate agent", kind="rule", ok=False, detail=dup))
     for c in checks_mod.tailscale_checks(sample.tailscale, (host.check_config or {}).get("AVM_TAILSCALE_MIN")):
         sample.checks.append(Check(**c))
+    # Data-use stickiness (datause.sticky): a restricted policy from a host with AVM_DATA_USE unset stores
+    # AVM_DATA_USE=restricted (the host-settings storage), so a later agent.conf that lost its lines can't un-restrict it;
+    # a non-restricted policy on a restricted host raises a failing "data-use policy" check while the hub keeps scrubbing.
+    persist, mismatch = datause.sticky(host, sample.claude if isinstance(sample.claude, dict) else None)
+    if persist:
+        await run_in_threadpool(checks_mod.put_settings, db, host, {datause.KEY: "restricted"}, "data-use policy")
+        log.warning("%s reports a restricted data-use policy: %s=restricted stored for it (an operator lifts it with %s=off)",
+                    host.name, datause.KEY, datause.KEY)
+        host = await run_in_threadpool(db.host_by_name, host.name) or host   # adopt/evaluate below must see the new settings
+    if mismatch:
+        sample.checks.append(Check(name=datause.CHECK_NAME, kind="rule", ok=False, detail=mismatch))
+        if host.id not in _DATA_USE_MISMATCH:
+            log.warning("%s: %s", host.name, mismatch)
+        _DATA_USE_MISMATCH.add(host.id)
+    elif host.id in _DATA_USE_MISMATCH:
+        _DATA_USE_MISMATCH.discard(host.id)
+        log.info("%s: agent data-use policy matches %s again", host.name, datause.KEY)
     if datause.restricted(host, {"claude": sample.claude}):   # data-use host: keep conversation and file text off the hub
         sample.claude = datause.scrub_claude(sample.claude)
         for c in sample.checks:
