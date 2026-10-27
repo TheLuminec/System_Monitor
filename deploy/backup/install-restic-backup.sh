@@ -78,7 +78,7 @@ WantedBy=timers.target
 EOF
 systemctl daemon-reload
 systemctl enable --now "$UNIT.timer"
-systemctl list-timers "$UNIT.timer" --no-pager | head -2
+systemctl list-timers "$UNIT.timer" --no-pager --no-legend || true   # no `| head`: under pipefail its SIGPIPE ended the script
 
 echo "== status file"
 "/usr/local/sbin/$UNIT" --seed || echo "(no snapshot yet - the card fills in after the first run)"
