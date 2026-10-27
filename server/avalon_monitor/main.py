@@ -348,8 +348,10 @@ async def ingest(request: Request):
     if agent_bundle.available:
         reply["agent"] = {"version": agent_bundle.version, "sha256": agent_bundle.sha256,
                           "auto_update": settings.agent_auto_update, "files": agent_bundle.companion_hashes(),
-                          "sig": agent_bundle.signature("avalon_agent.py"),
-                          "file_sigs": {n: agent_bundle.signature(n) for n in agent_bundle.COMPANIONS}}
+                          "sig": agent_bundle.signature("avalon_agent.py"),          # v1: agents <= 1.9.x
+                          "file_sigs": {n: agent_bundle.signature(n) for n in agent_bundle.COMPANIONS},
+                          "sig2": agent_bundle.signature("avalon_agent.py", ".sig2"),  # v2 (version-bound): 1.10+
+                          "file_sigs2": {n: agent_bundle.signature(n, ".sig2") for n in agent_bundle.COMPANIONS}}
     claude = sample.claude if isinstance(sample.claude, dict) else {}
     if isinstance(claude.get("agents"), list):   # agent 1.5+: refresh tracked sessions, tell the agent which ones they are
         for row in await run_in_threadpool(db.tracked_sync, host.id, claude["agents"], now):

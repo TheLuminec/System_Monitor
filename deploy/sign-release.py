@@ -5,19 +5,24 @@ Agents (1.9+) only self-update to code - the agent script and avm.py - that carr
 they already trust (RELEASE_PUBKEYS in agent/avalon_agent.py, or AVM_UPDATE_PUBKEYS in a host's agent.conf). The
 private key is encrypted with a passphrase only the owner knows.
 
-What gets signed is a pushed commit, never the working tree (audit F-02): the files are read from the commit on
-origin/main, every git object on the way from the commit sha to the file is re-hashed here, the sha, subject, file
-sha256s, versions and the agent/ diffstat since the last signed release are printed BEFORE the passphrase is asked
-for, and the working tree's agent/*.py must equal that commit. Run the committed copy of this script with the system
-Python (root-owned, apt's python3-cryptography), so nothing from the user-writable checkout or its .venv runs while
-the passphrase is in memory:
+What gets signed is a pushed commit, never the working tree (audit F-02): main is fetched from the canonical URL
+(ORIGIN_URL, or --origin-url) into a fresh scratch repository - never through the checkout's own git config, remotes
+or hooks (G-05) - the files are read from the commit there, every git object on the way from the commit sha to the
+file is re-hashed here, the sha, subject, fetched URL, file sha256s, versions and the agent/ diffstat since the last
+signed release are printed BEFORE the passphrase is asked for, and the working tree's agent/*.py must equal that
+commit. Each file gets two signatures: agent/<name>.sig2 (v2: name, version and content - what agents 1.10+ require,
+so an older release can't be replayed onto them, F-12) and agent/<name>.sig (v1: name and content only, for agents
+<= 1.9.x, which know nothing else; drop it once no host runs those).
+
+Run the committed copy of this script with the system Python (root-owned, apt's python3-cryptography), so nothing
+from the user-writable checkout or its .venv runs while the passphrase is in memory:
 
     git fetch origin && git show origin/main:deploy/sign-release.py | /usr/bin/python3 -I -              # sign origin/main
     git fetch origin && git show origin/main:deploy/sign-release.py | /usr/bin/python3 -I - --commit SHA # sign SHA (on origin/main)
     git fetch origin && git show origin/main:deploy/sign-release.py | /usr/bin/python3 -I - --init       # once: create the key
     .venv/bin/python deploy/sign-release.py --check [--commit REF]   # verify signatures (no passphrase; any Python)
 
-Run it from the checkout (or pass --repo). Commit the .sig files it writes on top of the signed commit and push.
+Run it from the checkout (or pass --repo). Commit the .sig/.sig2 files it writes on top of the signed commit and push.
 tests/test_release.py fails while a signature is missing or stale, and deploy-hub.sh runs the tests, so an unsigned
 agent change cannot be deployed by accident. See docs/RELEASING.md and docs/SECURITY.md for what this does and does
 not protect against.
@@ -30,17 +35,27 @@ import importlib.util
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 FILES = ("avalon_agent.py", "avm.py")
 FETCH_TIMEOUT = 60
 GIT = "/usr/bin/git" if os.path.exists("/usr/bin/git") else "git"
 SAFE_PYTHON = "/usr/bin/python3"
+# The repository releases come from. Fetched by this URL into a scratch repository, never by the checkout's
+# remote.origin.url (G-05); --origin-url overrides it (the tests point it at a local bare repository).
+ORIGIN_URL = "git@github.com:TheLuminec/avalon-monitor.git"
+MAIN_REF = "refs/remotes/origin/main"   # where the scratch repository keeps the fetched main
 # repo-location overrides that would make git read another repository than --repo
 _GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
                  "GIT_COMMON_DIR", "GIT_NAMESPACE")
+# Forced on every git call (command-line config beats the repository's): no program, hook or credential helper named
+# in a .git/config runs while the signer works (G-05). Global and system config are off via the environment (git()).
+_GIT_HARDEN = ("-c", "core.sshCommand=ssh", "-c", "credential.helper=", "-c", "core.fsmonitor=false",
+               "-c", "core.hooksPath=" + os.devnull, "-c", "log.showSignature=false")
 
 
 class Refused(Exception):
@@ -48,10 +63,37 @@ class Refused(Exception):
 
 
 # ----------------------------------------------------------------- the release format (kept byte-identical to the agent)
-def release_message(name: str, data: bytes) -> bytes:
-    """What a release signature covers. MUST stay byte-identical to release_message() in agent/avalon_agent.py
-    (tests/test_sign_release.py compares them); inlined so signing never imports working-tree code."""
+# Inlined so signing never imports working-tree code; tests/test_sign_release.py and tests/test_round_h.py hold these
+# identical to the agent's release_version() / release_message().
+RELEASE_VERSION_VARS = {"avalon_agent.py": "AGENT_VERSION", "avm.py": "AVM_VERSION"}
+
+
+def release_version(name: str, data: bytes):
+    """The version a release file declares: its single `<VAR> = "1.2.3"` line, dotted integers only; None when the line
+    is missing, repeated or not dotted integers. Same as release_version() in agent/avalon_agent.py."""
+    var = RELEASE_VERSION_VARS.get(name)
+    if not var:
+        return None
+    found = re.findall(rb'^' + re.escape(var.encode()) + rb'\s*=\s*"([^"]+)"', data.replace(b"\r\n", b"\n"), re.M)
+    if len(found) != 1 or not re.fullmatch(rb"[0-9]+(?:\.[0-9]+)*", found[0]):
+        return None
+    return found[0].decode()
+
+
+def release_message(name: str, version: str, data: bytes) -> bytes:
+    """v2 (agent/<name>.sig2): name, declared version and content hash. Byte-identical to release_message() in
+    agent/avalon_agent.py, which accepts only this."""
+    return ("avalon-release:v2:%s:%s:%s" % (name, version, hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest())).encode()
+
+
+def release_message_v1(name: str, data: bytes) -> bytes:
+    """v1 (agent/<name>.sig): name and content hash, no version - the only format agents <= 1.9.x verify, so a release
+    still reaches them. Frozen; drop it (and the .sig files) once no host runs 1.9.x."""
     return ("avalon-release:v1:%s:%s" % (name, hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest())).encode()
+
+
+# (file suffix, message) of every signature a release carries
+SIGNATURES = ((".sig", lambda name, version, data: release_message_v1(name, data)), (".sig2", release_message))
 
 
 def embedded_keys(agent_src: str) -> list:
@@ -78,8 +120,9 @@ def verify(pub_hex: str, msg: bytes, sig: bytes) -> bool:
 # ----------------------------------------------------------------- git, trusting nothing it returns without a hash check
 def git(repo: Path, *args: str, check: bool = True, timeout: float = 60, binary: bool = False):
     env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP}
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    r = subprocess.run([GIT, "-C", str(repo), *args], capture_output=True, env=env, timeout=timeout,
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0",
+               GIT_ALLOW_PROTOCOL="ssh:https:file")   # overrides any protocol.*.allow: no ext:: / fd:: transports
+    r = subprocess.run([GIT, "-C", str(repo), *_GIT_HARDEN, *args], capture_output=True, env=env, timeout=timeout,
                        stdin=subprocess.DEVNULL)
     if check and r.returncode != 0:
         raise Refused("git %s failed: %s" % (" ".join(args), r.stderr.decode(errors="replace").strip()[:300]))
@@ -136,11 +179,21 @@ def committed_file(repo: Path, tree: str, rel: str):
     return read_object(repo, "blob", ent[1])
 
 
-def fetch(repo: Path) -> None:
+def fetch(url: str) -> Path:
+    """main of `url`, fetched into a new private scratch repository (returned; the caller removes it). The checkout's
+    .git/config - its remotes, url.*.insteadOf rewrites, sshCommand, hooks, includes - is never read for the fetch:
+    the scratch repository has only the config `git init` writes, and global/system config are off (G-05)."""
+    d = Path(tempfile.mkdtemp(prefix="avm-sign-"))
     try:
-        git(repo, "fetch", "--quiet", "origin", timeout=FETCH_TIMEOUT)
+        git(d, "init", "--quiet", "--bare", "--template=")
+        git(d, "fetch", "--quiet", "--no-tags", "--", url, "+refs/heads/main:" + MAIN_REF, timeout=FETCH_TIMEOUT)
     except subprocess.TimeoutExpired:
-        raise Refused("git fetch origin did not finish in %ds" % FETCH_TIMEOUT)
+        shutil.rmtree(d, ignore_errors=True)
+        raise Refused("git fetch %s did not finish in %ds" % (url, FETCH_TIMEOUT))
+    except BaseException:
+        shutil.rmtree(d, ignore_errors=True)
+        raise
+    return d
 
 
 def resolve(repo: Path, ref: str) -> str:
@@ -150,8 +203,27 @@ def resolve(repo: Path, ref: str) -> str:
     return sha
 
 
+def resolve_in(repos, ref: str):
+    """(repo, sha) for `ref` in the first of `repos` that resolves it: a name the owner typed (HEAD, a branch, a short
+    sha) means what it means in the checkout; a sha only the fetched main has still resolves there."""
+    for repo in repos:
+        if repo is None:
+            continue
+        try:
+            return repo, resolve(repo, ref)
+        except Refused:
+            continue
+    raise Refused("cannot resolve %r to a commit" % ref)
+
+
+def has_commit(repo: Path, sha: str) -> bool:
+    return git(repo, "cat-file", "-e", sha + "^{commit}", check=False, binary=True).returncode == 0
+
+
 def on_origin_main(repo: Path, sha: str) -> bool:
-    r = git(repo, "merge-base", "--is-ancestor", sha, "refs/remotes/origin/main", check=False, binary=True)
+    """Is `sha` main of the fetched origin or behind it? `repo` is the scratch repository (or, for --check when the
+    fetch failed, the checkout with its own refs/remotes/origin/main)."""
+    r = git(repo, "merge-base", "--is-ancestor", sha, MAIN_REF, check=False, binary=True)
     return r.returncode == 0
 
 
@@ -238,22 +310,36 @@ def key_path() -> Path:
 
 
 # ----------------------------------------------------------------- modes
-def check(repo: Path, ref) -> int:
-    if ref:
-        try:
-            fetch(repo)
-        except Refused as e:
-            print("warning: %s - checking the local refs" % e)
-        sha = resolve(repo, ref)
-        tree, subject = commit_info(repo, sha)
-        print("commit %s  %s%s" % (sha, subject, "" if on_origin_main(repo, sha) else "  (NOT on origin/main)"))
-        get = lambda rel: committed_file(repo, tree, rel)   # noqa: E731
-    else:
-        def get(rel):
+def check(repo: Path, ref, url: str) -> int:
+    mirror = None
+    try:
+        if ref:
             try:
-                return (repo / rel).read_bytes()
-            except OSError:
-                return None
+                mirror = fetch(url)
+            except Refused as e:
+                print("warning: %s - checking against the checkout's own refs/remotes/origin/main" % e)
+            src, sha = resolve_in((repo, mirror), ref)
+            if mirror is not None and not has_commit(src, sha):
+                src = mirror
+            tree, subject = commit_info(src, sha)
+            on_main = on_origin_main(mirror if mirror is not None else repo, sha)
+            print("commit %s  %s%s" % (sha, subject, "" if on_main else "  (NOT on origin/main)"))
+            if mirror is not None:
+                print("fetched %s" % url)
+            get = lambda rel: committed_file(src, tree, rel)   # noqa: E731
+        else:
+            def get(rel):
+                try:
+                    return (repo / rel).read_bytes()
+                except OSError:
+                    return None
+        return _check_files(get)
+    finally:
+        if mirror is not None:
+            shutil.rmtree(mirror, ignore_errors=True)
+
+
+def _check_files(get) -> int:
     src = get("agent/avalon_agent.py")
     keys = embedded_keys(src.decode("utf-8", "replace")) if src else []
     if not keys:
@@ -261,19 +347,26 @@ def check(repo: Path, ref) -> int:
         return 1
     bad = 0
     for name in FILES:
-        rel = "agent/%s.sig" % name
-        raw, data = get(rel), get("agent/" + name)
-        try:
-            sig = base64.b64decode((raw or b"").decode().strip(), validate=True)
-        except (ValueError, UnicodeDecodeError):
-            sig = b""
-        if not sig or data is None:
-            print("MISSING  %s" % rel)
-            bad += 1
-            continue
-        ok = any(verify(k, release_message(name, data), sig) for k in keys)
-        print("%s  %s" % ("ok      " if ok else "STALE   ", rel))
-        bad += not ok
+        data = get("agent/" + name)
+        version = release_version(name, data) if data is not None else None
+        for ext, message in SIGNATURES:
+            rel = "agent/%s%s" % (name, ext)
+            raw = get(rel)
+            try:
+                sig = base64.b64decode((raw or b"").decode().strip(), validate=True)
+            except (ValueError, UnicodeDecodeError):
+                sig = b""
+            if not sig or data is None:
+                print("MISSING  %s" % rel)
+                bad += 1
+                continue
+            if version is None:
+                print("NOVERSION %s (agent/%s needs one %s = \"N.N.N\" line)" % (rel, name, RELEASE_VERSION_VARS[name]))
+                bad += 1
+                continue
+            ok = any(verify(k, message(name, version, data), sig) for k in keys)
+            print("%s  %s" % ("ok      " if ok else "STALE   ", rel))
+            bad += not ok
     return 1 if bad else 0
 
 
@@ -302,17 +395,34 @@ def init(ask) -> int:
     return 0
 
 
-def sign(repo: Path, ref: str, ask) -> int:
-    fetch(repo)
-    sha = resolve(repo, ref)
-    if not on_origin_main(repo, sha):
-        raise Refused("%s (%s) is not on origin/main: push it first; only pushed, reviewed commits are signed" % (ref, sha))
-    tree, subject = commit_info(repo, sha)
-    content = {}
+def sign(repo: Path, ref, ask, url: str) -> int:
+    mirror = fetch(url)
+    try:
+        return _sign(repo, mirror, ref, ask, url)
+    finally:
+        shutil.rmtree(mirror, ignore_errors=True)
+
+
+def _sign(repo: Path, mirror: Path, ref, ask, url: str) -> int:
+    """Everything is read from `mirror` (the scratch repository holding the fetched main); `repo`, the checkout, only
+    names --commit and is compared with what gets signed."""
+    if ref is None:
+        ref, sha = "origin/main", resolve(mirror, MAIN_REF)
+    else:
+        sha = resolve_in((repo, mirror), ref)[1]
+    if not on_origin_main(mirror, sha):
+        raise Refused("%s (%s) is not on origin/main (main of %s): push it first; only pushed, reviewed commits are "
+                      "signed" % (ref, sha, url))
+    tree, subject = commit_info(mirror, sha)
+    content, versions = {}, {}
     for name in FILES:
-        data = committed_file(repo, tree, "agent/" + name)
+        data = committed_file(mirror, tree, "agent/" + name)
         if data is None:
             raise Refused("agent/%s is not in commit %s" % (name, sha))
+        versions[name] = release_version(name, data)
+        if versions[name] is None:   # the v2 signature covers it: agents compare it with what they run (F-12)
+            raise Refused("agent/%s in %s has no single %s = \"<dotted integers>\" line: a release must declare its "
+                          "version once" % (name, sha[:12], RELEASE_VERSION_VARS[name]))
         content[name] = data
     # the working tree must hold exactly what is signed, so the .sig commit on top of it ships these bytes
     on_disk = sorted({p.name for p in (repo / "agent").glob("*.py")} | set(FILES))
@@ -322,7 +432,7 @@ def sign(repo: Path, ref: str, ask) -> int:
             wt = (repo / "agent" / name).read_bytes()
         except OSError:
             wt = None
-        committed = content.get(name) if name in content else committed_file(repo, tree, "agent/" + name)
+        committed = content.get(name) if name in content else committed_file(mirror, tree, "agent/" + name)
         if wt != committed:
             dirty.append("agent/" + name)
     if dirty:
@@ -331,18 +441,18 @@ def sign(repo: Path, ref: str, ask) -> int:
     agent_src = content["avalon_agent.py"].decode("utf-8", "replace")
     keys = embedded_keys(agent_src)
 
-    last = git(repo, "log", "-1", "--format=%H", sha, "--", *("agent/%s.sig" % n for n in FILES))
+    last = git(mirror, "log", "-1", "--format=%H", sha, "--",
+               *("agent/%s%s" % (n, ext) for n in FILES for ext, _ in SIGNATURES))
     print("Signing commit %s" % sha)
     print("  subject:   %s" % subject)
-    print("  origin:    %s" % git(repo, "remote", "get-url", "origin", check=False))
-    print("  versions:  agent %s, avm %s" % (version_of(agent_src, "AGENT_VERSION"),
-                                             version_of(content["avm.py"].decode("utf-8", "replace"), "AVM_VERSION")))
+    print("  origin:    %s (fetched by this URL into a scratch repository; the checkout's git config is not used)" % url)
+    print("  versions:  agent %s, avm %s" % (versions["avalon_agent.py"], versions["avm.py"]))
     for name in FILES:
         print("  sha256     %s  agent/%s" % (hashlib.sha256(content[name]).hexdigest(), name))
     if last:
         print("  agent/ since the last signed release (%s):" % last[:12])
-        stat = git(repo, "diff", "--stat", "--no-ext-diff", "--no-textconv", "--no-color", last, sha, "--", "agent/")
-        log = git(repo, "log", "--oneline", "--no-color", "%s..%s" % (last, sha), "--", "agent/")
+        stat = git(mirror, "diff", "--stat", "--no-ext-diff", "--no-textconv", "--no-color", last, sha, "--", "agent/")
+        log = git(mirror, "log", "--oneline", "--no-color", "%s..%s" % (last, sha), "--", "agent/")
         for line in (stat or "(no changes)").splitlines() + ["  commits:"] + (log or "(none)").splitlines()[:30]:
             print("    " + line)
     else:
@@ -369,17 +479,18 @@ def sign(repo: Path, ref: str, ask) -> int:
     if pub not in keys:
         print("warning: this key (%s...) is not in RELEASE_PUBKEYS - agents running this release would refuse the next one" % pub[:16])
     for name in FILES:
-        msg = release_message(name, content[name])
-        sig = key.sign(msg)
-        if not verify(pub, msg, sig):
-            raise Refused("signature for agent/%s does not verify" % name)
-        out = repo / "agent" / (name + ".sig")
-        if out.is_symlink():
-            out.unlink()
-        out.write_text(base64.b64encode(sig).decode() + "\n")
-        print("signed  agent/%s" % name)
-    print("Now commit agent/*.sig on top of %s and push, e.g.: git add agent/*.sig && git commit -m 'Release signatures' && git push"
-          % sha[:12])
+        for ext, message in SIGNATURES:   # v1 .sig for agents <= 1.9.x, v2 .sig2 (version-bound) for 1.10+
+            msg = message(name, versions[name], content[name])
+            sig = key.sign(msg)
+            if not verify(pub, msg, sig):
+                raise Refused("signature for agent/%s%s does not verify" % (name, ext))
+            out = repo / "agent" / (name + ext)
+            if out.is_symlink():
+                out.unlink()
+            out.write_text(base64.b64encode(sig).decode() + "\n")
+            print("signed  agent/%s%s" % (name, ext))
+    print("Now commit agent/*.sig agent/*.sig2 on top of %s and push, e.g.: git add agent/*.sig agent/*.sig2 && "
+          "git commit -m 'Release signatures' && git push" % sha[:12])
     return 0
 
 
@@ -389,8 +500,9 @@ def main(argv=None) -> int:
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--init", action="store_true", help="create the release key")
     g.add_argument("--check", action="store_true", help="verify signatures (working tree, or --commit)")
-    ap.add_argument("--commit", default=None, help="commit to sign (default origin/main; must be on origin/main) or check")
+    ap.add_argument("--commit", default=None, help="commit to sign (default: main as fetched now; must be on it) or check")
     ap.add_argument("--repo", default=None, help="the checkout (default: the git toplevel of the current directory)")
+    ap.add_argument("--origin-url", default=ORIGIN_URL, help="the repository whose main is signed (default %(default)s)")
     ap.add_argument("--passphrase-fd", type=int, default=None, help=argparse.SUPPRESS)   # tests only
     a = ap.parse_args(argv)
     repo = None
@@ -401,14 +513,14 @@ def main(argv=None) -> int:
             if not a.init:
                 raise
         if a.check:
-            return check(repo, a.commit)
+            return check(repo, a.commit, a.origin_url)
         problem = interpreter_problem(repo)
         if problem:
             print("refusing to handle the release key: %s.\nRun the committed copy with the system Python instead:\n  %s"
                   % (problem, safe_command(repo, argv)), file=sys.stderr)
             return 1
         ask = Asker(a.passphrase_fd)
-        return init(ask) if a.init else sign(repo, a.commit or "origin/main", ask)
+        return init(ask) if a.init else sign(repo, a.commit, ask, a.origin_url)
     except Refused as e:
         print("refused: %s - nothing signed" % e, file=sys.stderr)
         return 1

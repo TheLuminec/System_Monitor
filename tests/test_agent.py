@@ -48,15 +48,17 @@ def release_key():
     return Ed25519PrivateKey.generate()
 
 
-def _sign(key, name, data):
-    return base64.b64encode(key.sign(a.release_message(name, data))).decode()
+def _sign(key, name, data, version=None):
+    """A v2 (version-bound) release signature, as deploy/sign-release.py writes to agent/<name>.sig2."""
+    version = version or a.release_version(name, data)
+    return base64.b64encode(key.sign(a.release_message(name, version, data))).decode()
 
 
 def test_signature_policy(release_key):
     cfg = _cfg(AVM_UPDATE_PUBKEYS=_pub(release_key).hex())
-    data = b"print('new agent')\n"
+    data = b'AGENT_VERSION = "9.0.0"\nAVM_VERSION = "9.0.0"\nprint("new agent")\n'
     assert a.signature_ok(cfg, "avalon_agent.py", data, _sign(release_key, "avalon_agent.py", data)) is None
-    assert "no signature" in a.signature_ok(cfg, "avalon_agent.py", data, None)
+    assert "not version-signed" in a.signature_ok(cfg, "avalon_agent.py", data, None)
     assert "bad signature" in a.signature_ok(cfg, "avalon_agent.py", data + b"#", _sign(release_key, "avalon_agent.py", data))
     # a signature for avm.py can't be replayed onto the agent script, and CRLF copies verify the same
     assert "bad signature" in a.signature_ok(cfg, "avalon_agent.py", data, _sign(release_key, "avm.py", data))
@@ -87,13 +89,13 @@ def _self_update(monkeypatch, tmp_path, key, data, sig):
     monkeypatch.setattr(a, "_refresh_companion", lambda *x: None)
     monkeypatch.setattr(a.urllib.request, "urlopen", lambda req, timeout=0: _Resp(data))
     import hashlib
-    info = {"sha256": hashlib.sha256(data).hexdigest(), "version": "9.9", "sig": sig}
+    info = {"sha256": hashlib.sha256(data).hexdigest(), "version": "9.9", "sig2": sig}
     cfg = _cfg(AVM_UPDATE_PUBKEYS=_pub(key).hex(), AVM_AUTO_UPDATE="true")
     return a.self_update(cfg, info), target.read_bytes(), a._UPDATE_STATE["error"]
 
 
 def test_self_update_installs_signed_code(monkeypatch, tmp_path, release_key):
-    data = b"NEW = 2\n"
+    data = b'AGENT_VERSION = "99.0"\nNEW = 2\n'
     ok, content, err = _self_update(monkeypatch, tmp_path, release_key, data, _sign(release_key, "avalon_agent.py", data))
     assert ok and content == data and err is None
 
@@ -101,16 +103,16 @@ def test_self_update_installs_signed_code(monkeypatch, tmp_path, release_key):
 @pytest.mark.parametrize("why", ["unsigned", "wrong key", "tampered"])
 def test_self_update_refuses_unsigned_or_forged_code(monkeypatch, tmp_path, release_key, why):
     """E-04: the hub (or whoever controls it) cannot push code - the hash it sends proves nothing on its own."""
-    data = b"EVIL = 1\n"
+    data = b'AGENT_VERSION = "99.0"\nEVIL = 1\n'
     sig = {"unsigned": None, "wrong key": _sign(Ed25519PrivateKey.generate(), "avalon_agent.py", data),
-           "tampered": _sign(release_key, "avalon_agent.py", b"GOOD = 1\n")}[why]
+           "tampered": _sign(release_key, "avalon_agent.py", b'AGENT_VERSION = "99.0"\nGOOD = 1\n')}[why]
     ok, content, err = _self_update(monkeypatch, tmp_path, release_key, data, sig)
-    assert not ok and content == b"OLD = 1\n" and ("signature" in err)
+    assert not ok and content == b"OLD = 1\n" and ("signature" in err or "signed" in err)
 
 
 def test_companion_refresh_refuses_unsigned(monkeypatch, tmp_path, release_key):
     monkeypatch.setattr(a, "_SELF_PATH", str(tmp_path / "avalon_agent.py"))
-    data = b"AVM = 1\n"
+    data = b'AVM_VERSION = "1.0"\nAVM = 1\n'
     monkeypatch.setattr(a.urllib.request, "urlopen", lambda req, timeout=0: _Resp(data))
     cfg = _cfg(AVM_UPDATE_PUBKEYS=_pub(release_key).hex())
     a._refresh_companion(cfg, "avm.py", None)

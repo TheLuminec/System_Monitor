@@ -49,6 +49,11 @@ Local policy - only this file sets these; the hub can never override them:
     AVM_CONTENT_ROOTS   (none)  directories a hub-added content check may read from; content checks listed in this
                                 file are always allowed, any other target must resolve (symlinks followed) inside one
     AVM_UPDATE_PUBKEYS  (built-in) Ed25519 public keys (hex, comma list) whose signature a self-update must carry
+    AVM_ALLOW_DOWNGRADE false   install a signed release whose version is LOWER than the one installed (a deliberate
+                                rollback); off, the hub cannot replay an older signed release onto this host
+    AVM_TASK_LOG_OFF_DIRS (none) directories (comma list) whose work stays here: avm task logs from them are off, Claude
+                                sessions whose cwd is inside one report no snippets (see AVM_SESSION_SNIPPETS), and a
+                                dashboard prompt run inside one sends at most a summary transcript (AVM_JOB_TRANSCRIPT)
     AVM_STATE_DIR       directory for state kept across restarts (default: beside the config file)
 
 The hub may override the AVM_WATCH_* / AVM_PROCESSES / AVM_TAGS / AVM_MEM_AVAILABLE_WARN_GB
@@ -129,6 +134,7 @@ DEFAULTS = {
     "AVM_SESSION_SNIPPETS": "auto",
     "AVM_CONTENT_ROOTS": "",
     "AVM_UPDATE_PUBKEYS": "",
+    "AVM_ALLOW_DOWNGRADE": "false",
     "AVM_STATE_DIR": "",
 }
 
@@ -440,6 +446,12 @@ _CPU_TEMP_KEYS = ("k10temp", "coretemp", "cpu_thermal", "cpu-thermal", "zenpower
 _CPU_TEMP_LABELS = ("tctl", "tdie", "package id 0", "package", "cpu", "core 0", "physical id 0")
 
 
+def _temp_limit(x: Optional[float]) -> Optional[float]:
+    """A sensor's high/critical limit, or None when unset. Unset limits come back as 0 or as an all-ones register read
+    as Kelvin (NVMe: 0xFFFF K - 273.15 = "65261.85 degC"), so anything at or above 200 degC is no limit at all."""
+    return x if x and 0 < x < 200 else None
+
+
 def collect_temps() -> Dict[str, Any]:
     """Returns {"sensors": [...], "cpu_temp": float|None}."""
     sensors: List[Dict[str, Any]] = []
@@ -457,8 +469,7 @@ def collect_temps() -> Dict[str, Any]:
                 if e.label and e.label.lower() != chip.lower():
                     label = "%s %s" % (chip, e.label)
                 sensors.append({"label": label, "current": round(e.current, 1),
-                                "high": e.high if e.high and e.high > 0 else None,
-                                "critical": e.critical if e.critical and e.critical > 0 else None})
+                                "high": _temp_limit(e.high), "critical": _temp_limit(e.critical)})
                 if cpu_temp is None and chip.lower() in _CPU_TEMP_KEYS:
                     if not e.label or any(k in e.label.lower() for k in _CPU_TEMP_LABELS):
                         cpu_temp = round(e.current, 1)
@@ -801,6 +812,24 @@ def content_allowed(cfg: Dict[str, str], path: str) -> bool:
         r = os.path.realpath(root)
         try:
             if os.path.commonpath([real, r]) == r and real != r:
+                return True
+        except ValueError:   # Windows: different drives
+            continue
+    return False
+
+
+def in_off_dir(cfg: Dict[str, str], path: Optional[str]) -> bool:
+    """Is `path` one of this host's AVM_TASK_LOG_OFF_DIRS or below one (G-02)? Local agent.conf only (not a REMOTE_KEY).
+    Both sides are resolved real paths (symlinks followed, case folded on Windows) compared by whole path components,
+    so /data/ab is not inside /data/a. Same rule as avm.py's _inside()."""
+    dirs = _csv(cfg.get("AVM_TASK_LOG_OFF_DIRS", ""))
+    if not path or not dirs:
+        return False
+    real = os.path.normcase(os.path.realpath(os.path.expanduser(path)))
+    for d in dirs:
+        r = os.path.normcase(os.path.realpath(os.path.expanduser(d)))
+        try:
+            if os.path.commonpath([real, r]) == r:
                 return True
         except ValueError:   # Windows: different drives
             continue
@@ -1347,6 +1376,10 @@ class ClaudeRunner:
         if not policy["snippets"]:   # conversation text of every session on this host stays here: ids, names, state, times only
             sessions, processes, agents = ([{k: v for k, v in d.items() if k not in self.SNIPPET_KEYS} for d in rows]
                                            for rows in (sessions, processes, agents))
+        elif _csv(self.cfg.get("AVM_TASK_LOG_OFF_DIRS", "")):   # G-02: the same, per session, for work in an off dir
+            sessions, processes, agents = ([{k: v for k, v in d.items() if k not in self.SNIPPET_KEYS}
+                                            if in_off_dir(self.cfg, d.get("cwd")) else d for d in rows]
+                                           for rows in (sessions, processes, agents))
         return {"available": bool(self.bin), "bin": self.bin, "version": self.check_version(), "user": _whoami(), "home": self.home,
                 "sessions": sessions, "processes": processes,
                 "agents": agents, "features": self.FEATURES, "policy": policy,
@@ -1456,6 +1489,9 @@ class ClaudeRunner:
 
         stderr_tail: deque = deque(maxlen=30)
         transcript = self.policy()["transcript"]
+        if transcript == "full" and in_off_dir(self.cfg, cwd):   # G-02: min(configured, summary) inside an off dir
+            transcript = "summary"
+            log.info("claude job #%d runs in an AVM_TASK_LOG_OFF_DIRS directory: summary transcript only", jid)
 
         def drain_err() -> None:
             assert proc.stderr is not None
@@ -1563,7 +1599,8 @@ class ClaudeRunner:
 
     def _local_session(self, key: str, sid: str) -> Optional[Dict[str, Any]]:
         """The session a restart/stop targets, as THIS host knows it: listed now by `claude agents` (with its real
-        kind), or a session whose transcript is on this host (an interactive session that has exited). None = unknown."""
+        kind), or a session whose transcript is on this host (an interactive session that has exited). None = unknown.
+        Its cwd comes from the same local record (the listing, else the transcript) - "" when neither has one."""
         rc, out = self._claude(["agents", "--json", "--all"], timeout=30)
         try:
             rows = json.loads(out[out.index("["):]) if rc == 0 and "[" in out else []
@@ -1574,9 +1611,15 @@ class ClaudeRunner:
                 kind = r.get("kind") or ""
                 if r.get("pid") and self._session_record(r["pid"]).get("entrypoint") == "claude-desktop" and kind != "background":
                     kind = "desktop"
-                return {"kind": kind, "session_id": r.get("sessionId") or sid}
-        if sid and re.fullmatch(r"[0-9a-f-]{8,64}", sid) and self._transcript(sid):
-            return {"kind": "interactive", "session_id": sid}
+                rsid = r.get("sessionId") or sid
+                cwd = r.get("cwd") or ""
+                if not cwd and rsid and re.fullmatch(r"[0-9a-f-]{8,64}", rsid):
+                    fp = self._transcript(rsid)
+                    cwd = (self._session_summary(fp).get("cwd") or "") if fp else ""
+                return {"kind": kind, "session_id": rsid, "cwd": cwd}
+        fp = self._transcript(sid) if sid and re.fullmatch(r"[0-9a-f-]{8,64}", sid) else None
+        if fp:
+            return {"kind": "interactive", "session_id": sid, "cwd": self._session_summary(fp).get("cwd") or ""}
         return None
 
     def _run_action(self, job: Dict[str, Any]) -> None:
@@ -1584,7 +1627,7 @@ class ClaudeRunner:
         conversation); anything else - or a failed respawn - resumes as a new background agent, whose id is sent back
         as new_key so the hub's registration follows it."""
         jid, action, t = job["id"], job["action"], job.get("target") or {}
-        key, sid, cwd = t.get("key") or "", t.get("session_id") or "", t.get("cwd") or None
+        key, sid = t.get("key") or "", t.get("session_id") or ""
         self._post("/claude/jobs/%d/start" % jid, {})
         new_key = None
         local = self._local_session(key, sid)
@@ -1594,6 +1637,8 @@ class ClaudeRunner:
             log.warning("claude %s refused: unknown session %s", action, key or sid)
             return
         t = dict(t, kind=local.get("kind") or "")   # what Claude says it is, not what the hub says
+        # G-03: a resumed session runs where THIS host recorded it, never in a directory the hub names (unknown: home)
+        cwd = local.get("cwd") or None
         if t.get("kind") == "desktop":   # the hub refuses these too; belt and braces for a job queued before that
             ok, out = False, "Claude Desktop sessions belong to the Desktop app: reopen or close them there."
         elif action == "stop":
@@ -1913,11 +1958,39 @@ def state_path(cfg: Dict[str, str], config_path: Optional[str], name: str) -> Op
 # against keys the hub cannot change - so whoever controls the hub or its code directory cannot push code to the fleet.
 # Signed with deploy/sign-release.py; a key change ships as a release signed by the previous key.
 RELEASE_PUBKEYS: Tuple[str, ...] = ("45734ed87354b599cd84443561f599d36c10f8cee7e985507703b085572a4d72",)   # 2026-10-26
+# The version line each signed file must carry once; its value is signed with the content (v2, F-12), so a hub can't
+# replay an older signed release onto a newer host. v1 signatures (.sig: name + hash only, no version) are still made
+# for agents <= 1.9.x, which know nothing else, but this agent never accepts them.
+RELEASE_VERSION_VARS = {"avalon_agent.py": "AGENT_VERSION", "avm.py": "AVM_VERSION"}
 
 
-def release_message(name: str, data: bytes) -> bytes:
-    """What a release signature covers: the file's name and the sha256 of its content (line endings normalised)."""
-    return ("avalon-release:v1:%s:%s" % (name, hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest())).encode()
+def release_version(name: str, data: bytes) -> Optional[str]:
+    """The version a release file declares: its single `<VAR> = "1.2.3"` line (VAR from RELEASE_VERSION_VARS), dotted
+    integers only. None when the line is missing, repeated or not dotted integers - such a file is no release. MUST
+    stay identical to release_version() in deploy/sign-release.py (tests/test_round_h.py compares them)."""
+    var = RELEASE_VERSION_VARS.get(name)
+    if not var:
+        return None
+    found = re.findall(rb'^' + re.escape(var.encode()) + rb'\s*=\s*"([^"]+)"', data.replace(b"\r\n", b"\n"), re.M)
+    if len(found) != 1 or not re.fullmatch(rb"[0-9]+(?:\.[0-9]+)*", found[0]):
+        return None
+    return found[0].decode()
+
+
+def release_message(name: str, version: str, data: bytes) -> bytes:
+    """What a (v2) release signature covers: the file's name, the version it declares (release_version) and the sha256
+    of its content (line endings normalised). MUST stay byte-identical to release_message() in deploy/sign-release.py."""
+    return ("avalon-release:v2:%s:%s:%s" % (name, version, hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest())).encode()
+
+
+def version_key(version: str) -> Optional[Tuple[int, ...]]:
+    """'1.10.0' -> (1, 10), compared numerically (1.10 > 1.9; 1.9 == 1.9.0). None when not dotted integers."""
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version or ""):
+        return None
+    parts = [int(x) for x in version.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
 
 
 _ED_P = 2 ** 255 - 19
@@ -1995,20 +2068,34 @@ def release_keys(cfg: Dict[str, str]) -> List[bytes]:
     return keys
 
 
-def signature_ok(cfg: Dict[str, str], name: str, data: bytes, sig_b64: Optional[str]) -> Optional[str]:
-    """None when `data` carries a valid release signature for `name`, else why not."""
+def signature_ok(cfg: Dict[str, str], name: str, data: bytes, sig_b64: Optional[str],
+                 installed: Optional[str] = None) -> Optional[str]:
+    """None when `data` carries a valid version-bound (v2) release signature for `name` and is not older than
+    `installed` (the version this host has now; None = nothing to compare with), else why not. `sig_b64` is the hub's
+    v2 signature (offer field sig2 / file_sigs2); a v1 one (sig / file_sigs) is never looked at. A lower version is
+    only installed when THIS host's agent.conf sets AVM_ALLOW_DOWNGRADE (a local key: the hub cannot set it)."""
     import base64
     keys = release_keys(cfg)
     if not keys:
         return "no release key configured (RELEASE_PUBKEYS / AVM_UPDATE_PUBKEYS) - refusing unsigned code"
     if not sig_b64:
-        return "the hub sent no signature for %s - refusing unsigned code" % name
+        return "refusing: release not version-signed (the hub sent no v2 signature for %s)" % name
+    version = release_version(name, data)
+    if version is None:
+        return "refusing: %s has no single dotted-integer %s line - not a release" % (
+            name, RELEASE_VERSION_VARS.get(name, "version"))
     try:
         sig = base64.b64decode(sig_b64, validate=True)
     except ValueError:
         return "malformed signature for %s" % name
-    msg = release_message(name, data)
-    return None if any(ed25519_verify(k, msg, sig) for k in keys) else "bad signature for %s - not installing" % name
+    msg = release_message(name, version, data)
+    if not any(ed25519_verify(k, msg, sig) for k in keys):
+        return "bad signature for %s %s - not installing" % (name, version)
+    have = version_key(installed or "")
+    if have is not None and version_key(version) < have and not _on(cfg.get("AVM_ALLOW_DOWNGRADE")):
+        return ("refusing downgrade of %s from %s to %s (a deliberate rollback needs AVM_ALLOW_DOWNGRADE=1 in this "
+                "host's agent.conf)" % (name, installed, version))
+    return None
 
 
 # ---------------------------------------------------------- self-update
@@ -2055,7 +2142,8 @@ def self_update(cfg: Dict[str, str], info: Dict[str, Any]) -> bool:
     got = hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
     if got != want:
         return _update_failed("hash mismatch (hub says %s, got %s) - not installing" % (want[:12], got[:12]))
-    why = signature_ok(cfg, "avalon_agent.py", data, info.get("sig"))   # the hash only proves we got what the hub meant
+    # the hash only proves we got what the hub meant; the v2 signature that it is a release, and not an older one
+    why = signature_ok(cfg, "avalon_agent.py", data, info.get("sig2"), AGENT_VERSION)
     if why:
         return _update_failed(why)
     try:
@@ -2086,7 +2174,7 @@ def self_update(cfg: Dict[str, str], info: Dict[str, Any]) -> bool:
         return _update_failed("cannot replace %s: %s (running as %s)" % (_SELF_PATH, e, _whoami()))
     _UPDATE_STATE["error"] = None
     _SELF_SHA["value"] = got
-    _refresh_companion(cfg, "avm.py", (info.get("file_sigs") or {}).get("avm.py"))
+    _refresh_companion(cfg, "avm.py", (info.get("file_sigs2") or {}).get("avm.py"))
     log.info("self-update: installed agent %s (%s), respawning", info.get("version", "?"), got[:12])
     return True
 
@@ -2117,7 +2205,7 @@ def sync_companions(cfg: Dict[str, str], info: Dict[str, Any]) -> None:
         if last and last[0] == want and time.monotonic() < last[1]:
             continue
         _COMPANION_TRIED[name] = (want, time.monotonic() + 600)
-        _refresh_companion(cfg, name, (info.get("file_sigs") or {}).get(name))
+        _refresh_companion(cfg, name, (info.get("file_sigs2") or {}).get(name))
 
 
 def _refresh_companion(cfg: Dict[str, str], name: str, sig: Optional[str]) -> None:
@@ -2130,12 +2218,17 @@ def _refresh_companion(cfg: Dict[str, str], name: str, sig: Optional[str]) -> No
             want = r.headers.get("X-File-Sha256", "")
         if want and hashlib.sha256(data).hexdigest() != want:
             return
-        why = signature_ok(cfg, name, data, sig)
+        dest = os.path.join(os.path.dirname(_SELF_PATH), name)
+        try:   # the version on disk now: a companion must not go backwards either (none readable = fresh install)
+            with open(dest, "rb") as f:
+                installed = release_version(name, f.read())
+        except OSError:
+            installed = None
+        why = signature_ok(cfg, name, data, sig, installed)
         if why:
             log.warning("self-update: %s", why)
             return
         compile(data, name, "exec")
-        dest = os.path.join(os.path.dirname(_SELF_PATH), name)
         tmp = dest + ".new"
         with open(tmp, "wb") as f:
             f.write(data)

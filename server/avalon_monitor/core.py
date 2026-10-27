@@ -97,11 +97,12 @@ class AgentBundle:
             out[name] = cache[name][1]
         return out
 
-    def signature(self, name: str) -> Optional[str]:
+    def signature(self, name: str, ext: str = ".sig") -> Optional[str]:
         """The release signature shipped beside a file (agent/<name>.sig, made by deploy/sign-release.py). Agents
-        refuse updates without a valid one; the hub only passes it along and cannot make one."""
+        refuse updates without a valid one; the hub only passes it along and cannot make one. ext=".sig2" is the
+        version-bound (v2) one agents 1.10+ require; ".sig" (v1) is still sent for agents <= 1.9.x."""
         try:
-            return (self.path.parent / (name + ".sig")).read_text().strip() or None
+            return (self.path.parent / (name + ext)).read_text().strip() or None
         except OSError:
             return None
 

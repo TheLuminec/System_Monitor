@@ -52,9 +52,24 @@ python3 -m venv .venv && .venv/bin/pip install -r server/requirements.txt -r age
 
 Agents (1.9+) install a self-update only if it carries an Ed25519 signature by a key they already trust:
 `RELEASE_PUBKEYS` in `agent/avalon_agent.py`, plus any `AVM_UPDATE_PUBKEYS` in a host's `agent.conf` (added to the
-built-in list, never replacing it). This covers `avalon_agent.py` and `avm.py`. The hub only passes the `.sig` files along and can't make
-one, so control of the hub or of `/opt/avalon-monitor` doesn't give control of the fleet
-([SECURITY.md](SECURITY.md#what-stays-trusted)).
+built-in list, never replacing it). This covers `avalon_agent.py` and `avm.py`. The hub only passes the `.sig` /
+`.sig2` files along and can't make one, so control of the hub or of `/opt/avalon-monitor` doesn't give control of the
+fleet ([SECURITY.md](SECURITY.md#what-stays-trusted)).
+
+**Two signatures per file (audit F-12).** `agent/<file>.sig2` (v2) covers the file's name, the version it declares
+(`AGENT_VERSION` / `AVM_VERSION`, read from the signed bytes) and its sha256: `avalon-release:v2:<name>:<version>:<sha256>`.
+Agents 1.10+ accept only this, and refuse a release whose version is lower than the one installed (avm.py: lower than
+the `avm.py` on disk), so whoever controls the hub can't replay an older signed release onto them. Equal versions are
+accepted (a rebuild under the same number). A deliberate rollback needs `AVM_ALLOW_DOWNGRADE=1` in that host's own
+`agent.conf`; the hub can't set it. `agent/<file>.sig` (v1: name and sha256 only) is still written because agents
+<= 1.9.x verify nothing else and must be able to take the release that upgrades them. The hub sends v1 as
+`sig`/`file_sigs` and v2 as `sig2`/`file_sigs2`. Once `avalon-monitor-manage agents` shows no host below 1.10, v1 can
+go: drop `release_message_v1` from `SIGNATURES` in the signer, the `.sig` files and the `sig`/`file_sigs` offer fields.
+Until then a 1.9.x host can still be handed an older v1-signed release (that is the hole v2 closes), so upgrade them.
+
+Each agent file must declare its version exactly once as dotted integers (`AGENT_VERSION = "1.10.0"`); the signer
+refuses otherwise. Bump the version with every agent release: equal versions are accepted, so an earlier signed build
+under the same number could still be replayed. Agents compare versions numerically (1.10 > 1.9).
 
 `deploy/sign-release.py` signs a **pushed commit**, never the working tree (audit F-02). Run the copy of the script
 that is on `origin/main`, with the system Python, from the checkout:
@@ -63,7 +78,7 @@ that is on `origin/main`, with the system Python, from the checkout:
 git fetch origin && git show origin/main:deploy/sign-release.py | /usr/bin/python3 -I -                # sign origin/main
 git fetch origin && git show origin/main:deploy/sign-release.py | /usr/bin/python3 -I - --commit <sha> # a commit on origin/main
 git fetch origin && git show origin/main:deploy/sign-release.py | /usr/bin/python3 -I - --init         # once: create the key
-.venv/bin/python deploy/sign-release.py --check [--commit <ref>]   # verify signatures (no passphrase, any Python)
+.venv/bin/python deploy/sign-release.py --check [--commit <ref>]   # verify .sig and .sig2 (no passphrase, any Python)
 ```
 
 `--repo <path>` names the checkout when you run it from elsewhere (default: the git toplevel of the current
@@ -73,32 +88,36 @@ script refuses to touch the key unless it runs isolated (`-I`), outside a virtua
 command above. Piping the committed copy keeps a modified `deploy/sign-release.py` in the checkout from running;
 `-I` keeps `PYTHON*` variables, the user site and the current directory off `sys.path`; and the signer never imports
 the agent (it carries its own copy of the release format, which `tests/test_sign_release.py` holds byte-identical to
-`release_message` in `avalon_agent.py`).
+`release_version` / `release_message` in `avalon_agent.py`).
 
 A signing run:
 
-1. `git fetch origin` (no prompts, 60 s timeout; a failed fetch refuses), resolves `--commit` (default `origin/main`)
-   and refuses a commit that isn't on `origin/main`.
-2. Reads `agent/avalon_agent.py` and `agent/avm.py` from that commit, re-hashing every git object from the commit
-   down to each file itself, so a rewritten object in `.git/objects` is refused too. `RELEASE_PUBKEYS` and the
-   versions are read from that text with a regex.
+1. Fetches `main` from `git@github.com:TheLuminec/avalon-monitor.git` (`ORIGIN_URL` in the script; `--origin-url`
+   overrides it) into a fresh scratch repository in a private temp directory, removed afterwards (no prompts, 60 s
+   timeout; a failed fetch refuses). The checkout's own `.git/config` (its remotes, `url.*.insteadOf`, `core.sshCommand`,
+   hooks) plays no part in the fetch (audit G-05). Without `--commit` it signs that fetched `main`; `--commit` is
+   resolved in the checkout (then in the scratch repository) and refused unless it is on the fetched `main`.
+2. Reads `agent/avalon_agent.py` and `agent/avm.py` from that commit in the scratch repository, re-hashing every git
+   object from the commit down to each file itself. `RELEASE_PUBKEYS` and the versions are read from that text with a
+   regex; a file without exactly one dotted-integer version line is refused.
 3. Refuses if any `agent/*.py` in the working tree differs from the commit. The `.sig` commit you make next must
    carry exactly the signed bytes.
-4. Prints, **before asking for the passphrase**: the full commit sha and subject, `origin`'s URL, the agent and avm
-   versions, each file's sha256, and the `agent/` diffstat and commits since the last signed release (the last commit
-   that changed `agent/*.sig`).
+4. Prints, **before asking for the passphrase**: the full commit sha and subject, the URL it fetched, the agent and
+   avm versions, each file's sha256, and the `agent/` diffstat and commits since the last signed release (the last
+   commit that changed `agent/*.sig` or `agent/*.sig2`).
 5. **Compare that sha with the head of `main` on GitHub** (on another device if you can) before typing the
    passphrase. Ctrl-C stops without signing.
-6. Signs, checks each signature, writes `agent/*.sig`, and reminds you to commit and push them.
+6. Signs, checks each signature, writes `agent/*.sig` (v1) and `agent/*.sig2` (v2), and reminds you to commit and
+   push them.
 
-Then `git add agent/*.sig && git commit -m "Release signatures ..." && git push`, and deploy.
+Then `git add agent/*.sig agent/*.sig2 && git commit -m "Release signatures ..." && git push`, and deploy.
 
 * `--init` writes the private key, passphrase-encrypted, to `~/.config/avalon-release/release-key.pem` (or
   `$AVM_RELEASE_KEY`) and the public key beside it as `release-key.pub`, and prints the public key for
   `RELEASE_PUBKEYS`. It never overwrites an existing key. Back up the key and its passphrase somewhere other than AVALON.
 * A signing run warns if the key isn't in the commit's `RELEASE_PUBKEYS`: agents running that release would refuse the next one.
-* `tests/test_release.py` fails while a signature is missing or stale, so deploy-hub.sh won't ship an unsigned
-  agent change.
+* `tests/test_release.py` fails while a `.sig` or `.sig2` is missing or stale, so deploy-hub.sh won't ship an
+  unsigned agent change.
 
 Sign last, after the final change to either agent file is pushed: any change makes the signature stale. What this
 protects against, and what it doesn't, is in [SECURITY.md](SECURITY.md#what-stays-trusted).
