@@ -118,7 +118,7 @@ def test_forged_cloudflare_headers_get_no_trusted_access(client):
 
 
 @pytest.mark.parametrize("host,ok", [
-    ("testserver", True), ("127.0.0.1:8787", True), ("100.123.17.92:8787", True), ("[fd7a::1]:8787", True),
+    ("testserver", True), ("127.0.0.1:8787", True), ("100.64.1.2:8787", True), ("[fd7a::1]:8787", True),
     ("localhost:8787", True), ("monitor.example.test", True),
     (f"{core._HOSTNAME}.some-tailnet.ts.net", True), (f"{core._HOSTNAME}:8787", True),
     ("evil.example", False), ("evil.example:8787", False), ("attacker.some-tailnet.ts.net", False),
@@ -158,5 +158,5 @@ def test_live_socket_refuses_foreign_host(client):
 
 def test_agents_unaffected(agent):
     """Agents talk to the tailnet IP with their token; nothing here may break ingest."""
-    r = agent.post("/api/v1/tasks", json={"name": "t", "source": "run"}, headers={"host": "100.123.17.92:8787"})
+    r = agent.post("/api/v1/tasks", json={"name": "t", "source": "run"}, headers={"host": "100.64.1.2:8787"})
     assert r.status_code == 200, r.text
