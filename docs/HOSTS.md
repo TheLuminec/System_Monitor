@@ -248,9 +248,17 @@ level below `full`, session snippets (the first/last lines of every Claude sessi
 processes' arguments) stay on the host too (`AVM_SESSION_SNIPPETS=auto`).
 
 **Hub-side safety net:** also set *Data-use host* (`AVM_DATA_USE=restricted`) in the host's settings on the
-dashboard. The hub then drops task output lines, commands and working directories, prompt tool inputs/results
-and intermediate text, session snippets and content-check text before storing anything - even if the agent.conf
-lines above are missing. A host whose agent reports a transcript level below `full` is treated the same way.
+dashboard. The hub then drops task output lines, commands, working directories and notes, prompt tool
+inputs/results and intermediate text, session snippets and content-check text before storing anything - even if the
+agent.conf lines above are missing. A host whose agent reports a transcript level below `full` (or session snippets
+off) is treated the same way.
+
+The restriction is **sticky**. The first report with such a policy from a host whose *Data-use host* setting is
+empty sets it to `restricted` for you (the hub logs it). If the agent later reports `full` again - say its
+agent.conf lost the lines above - the host stays restricted, and its card shows a failing **data-use policy**
+check until the agent.conf is fixed. Only you can lift it: set *Data-use host* to `off` (`normal` and `none` work
+too). The hub never overwrites an explicit `off`; while the agent itself still reports a restricted policy the host
+stays restricted through that anyway. Clearing the field (empty) puts it back on automatic.
 
 Notes:
 

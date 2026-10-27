@@ -1,5 +1,6 @@
 """Audit E-15/E-24/E-25/E-26/E-27: check state across agent restarts, partial settings edits, adoption, responder
 claims and the responder guardrails (rolling cap, pending instead of dropped, fork fallback)."""
+import threading
 import time
 
 import pytest
@@ -11,7 +12,8 @@ from avalon_monitor.db import Database
 from conftest import WRITE
 
 MOUNT, PROC = "AVM_WATCH_MOUNTS", "AVM_WATCH_PROCESSES"
-CLAUDE = {"available": True, "features": ["agent_actions", "fork_session"], "agents": []}
+POLICY = {"max_mode": "plan", "actions": True, "jobs": True, "transcript": "full", "snippets": True}   # agent 1.9+ (G-04)
+CLAUDE = {"available": True, "features": ["agent_actions", "fork_session"], "agents": [], "policy": POLICY}
 
 
 @pytest.fixture
@@ -86,15 +88,36 @@ def test_responder_fires_through_ingest_after_a_restart_gap(agent):
 
 # ------------------------------------------------------------------ E-26
 def test_two_concurrent_reports_queue_one_responder(db, h):
-    """The second report read the rows before the first one fired (two ingests in flight for one host)."""
+    """Two ingests in flight for one host, really concurrent: two threads run evaluate on the same failing report, and
+    a barrier right after each one reads the check rows makes both hold the pre-fire rows (open_job NULL) before
+    either fires - the race. Only check_fire's atomic claim can stop the second job."""
     _watch(db, h)
     t = 1_800_000_000.0
     ck.evaluate(db, h, _sample(_res("/mnt/data", True)), t)
-    stale = db.checks_list(h.id)
-    ck.evaluate(db, h, _sample(_res("/mnt/data", False)), t + 5)
-    db.checks_list = lambda host_id=None: [dict(r) for r in stale]
-    _, jobs = ck.evaluate(db, h, _sample(_res("/mnt/data", False)), t + 5)
-    assert jobs == [] and len(_responders(db, h)) == 1
+    gate, real = threading.Barrier(2, timeout=10), db.checks_list
+
+    def listed(host_id=None):
+        rows = real(host_id)
+        gate.wait()   # both reports have read the rows; now both go on to fire
+        return rows
+
+    db.checks_list = listed
+    out, errors = [], []
+
+    def report():
+        try:
+            out.append(ck.evaluate(db, h, _sample(_res("/mnt/data", False)), t + 5)[1])
+        except Exception as e:   # surfaced below: an assertion in a thread would be lost
+            errors.append(e)
+
+    threads = [threading.Thread(target=report) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(15)
+    db.checks_list = real
+    assert not errors and len(out) == 2
+    assert sorted(len(j) for j in out) == [0, 1] and len(_responders(db, h)) == 1
 
 
 # ------------------------------------------------------------------ E-27

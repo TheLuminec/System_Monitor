@@ -125,8 +125,10 @@ def test_forged_cloudflare_headers_get_no_trusted_access(client):
     ("evil.example", False), ("evil.example:8787", False), ("attacker.some-tailnet.ts.net", False),
     (f"{core._HOSTNAME}.evil.example", False), ("", False),
 ])
-def test_host_allowlist(client, host, ok):
-    """E-02: DNS rebinding - a request carrying a foreign Host is refused before auth."""
+def test_host_allowlist(client, host, ok, monkeypatch):
+    """E-02: DNS rebinding - a request carrying a foreign Host is refused before auth. Tailnet unknown here (no
+    AVM_TAILNET, nothing detected): any <hostname>.*.ts.net passes; pinned, see test_round_h_hub (F-15)."""
+    monkeypatch.setattr(core, "_tailnet", "", raising=False)
     r = client.get("/api/v1/config", headers={"host": host})
     assert (r.status_code != 421) is ok, (host, r.status_code)
 

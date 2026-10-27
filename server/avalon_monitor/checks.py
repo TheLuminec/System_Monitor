@@ -4,8 +4,10 @@ that host (read-only) so it can look into it, even if it was offline when the ch
 
 Designed with the agents that run the long jobs (training runs on AVALON and Miami): responders report, they never act.
 Guardrails: ok -> failing transitions only, per-check cooldown, a cap per rolling 24 h, one open alert per check until
-it recovers, held while the target session is mid-turn, plan (read-only) mode only, and the alert carries paths, ids
-and exit codes but no file contents or log lines unless the check owner opted in (--with-log).
+it recovers, held while the target session is mid-turn, plan (read-only) mode only, never queued for a host whose
+agent wouldn't accept a plan prompt (the same routes_ops.host_policy_refusal the dashboard's prompts go through), and
+the alert carries paths, ids and exit codes but no file contents or log lines unless the check owner opted in
+(--with-log). A held alert stays pending with its reason in hold_reason.
 """
 from __future__ import annotations
 
@@ -85,13 +87,25 @@ def render_settings(current: dict, rows: list[dict], now: Optional[float] = None
     return out
 
 
+def declared(cfg: Optional[dict]) -> list[tuple[str, str]]:
+    """(key, entry) of every AVM_WATCH_* / memory entry in a host's stored settings."""
+    out = []
+    for key in CHECK_KEYS:
+        value = str((cfg or {}).get(key) or "").strip()
+        out += [(key, e) for e in ([value] if key in SINGLE_KEYS else [x.strip() for x in value.split(",")]) if e]
+    return out
+
+
 def adopt(db: Any, host: Any, sample: dict) -> Optional[int]:
     """First report from an agent that tags its results (1.7+): make every check it runs from agent.conf a row, then
     mark the host managed so the rendered lists are complete. Without this, adding one process check from the hub
     would replace (and silently drop) agent.conf's whole process list. Returns the new settings revision, if any.
     Waits for a report with at least one tagged check: the agent sends an empty list when its check collector fails,
     and adopting that would push empty lists over every agent.conf check for good (and a host with no checks at all
-    loses nothing by staying unmanaged until its first one)."""
+    loses nothing by staying unmanaged until its first one).
+    Rows come from the report AND from the lists the hub already declares for the host (its stored AVM_WATCH_*
+    settings): once managed, the settings are rendered from rows only, so an entry the hub was pushing that the one
+    adopted report didn't show (applied late, legacy import skipped it) would otherwise be dropped with its kind."""
     cfg = host.check_config or {}
     if cfg.get(MANAGED) or _version((sample.get("host") or {}).get("agent_version")) < (1, 7):
         return None   # already managed, or an agent that can't say where its checks come from
@@ -99,9 +113,12 @@ def adopt(db: Any, host: Any, sample: dict) -> Optional[int]:
     if not results:
         return None
     have = {(r["key"], r["target"]) for r in db.checks_list(host.id)}
-    for c in results:
-        if (c["key"], c["src"]) not in have:
-            db.check_add(host.id, c["key"], str(c["src"]), {}, "agent.conf")
+    hub_side = declared(cfg)
+    for key, target in hub_side + [(c["key"], str(c["src"])) for c in results]:
+        if (key, target) in have or (key in SINGLE_KEYS and any(k == key for k, _ in have)):
+            continue   # a single-value key keeps one row: an existing one, else the hub's declared one (listed first)
+        db.check_add(host.id, key, target, {}, "hub settings" if (key, target) in hub_side else "agent.conf")
+        have.add((key, target))
     db.set_check_config(host.name, render_settings({**cfg, MANAGED: "1"}, db.checks_list(host.id)))
     return host.check_rev + 1
 
@@ -224,7 +241,9 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
     A check missing from a report is "unknown" (e.g. the first report after an agent restart, before the hub's
     settings are applied again); that neither restarts its clock nor its alert: a check that was ok, goes unknown and
     comes back failing alerts like an ok -> failing one. An alert that can't go out yet (cooldown, cap, target
-    mid-turn, nothing to prompt) stays pending and fires on a later report if the check is still failing."""
+    mid-turn, nothing to prompt, an agent whose policy refuses plan prompts) stays pending, with why in hold_reason,
+    and fires on a later report if the check is still failing."""
+    from .routes_ops import host_policy_refusal   # local import: routes_ops -> core -> db imports this module
     rows = db.checks_list(host.id)
     if not rows:
         return [], []
@@ -233,6 +252,8 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
     agents = claude.get("agents") or []
     can_prompt = bool(claude.get("available")) and claude.get("bin_source") != "desktop"
     can_fork = "fork_session" in (claude.get("features") or [])
+    # what this report's agent says it accepts (no policy / root / below plan): the same refusal as a dashboard prompt
+    refused = host_policy_refusal(host, mode="plan", sample=sample)
     changed, jobs = [], []
     tasks_cache: Optional[list] = None
 
@@ -260,18 +281,23 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
         elif not r.get("notify") and r.get("pending"):
             upd["pending"] = 0   # responder removed: nothing left to send
 
-        def hold() -> None:   # fire on a later report, if still failing
+        def hold(why: str) -> None:   # fire on a later report, if still failing; say why it's held (UI, API)
             if not r.get("pending"):
                 upd["pending"] = 1
+            if r.get("hold_reason") != why:
+                upd["hold_reason"] = why
 
         fire = state == "failing" and r.get("notify") and not r.get("open_job") and (known == "ok" or r.get("pending"))
         fired = _recent_fires(r, now) if fire else []
         if fire:
             cooldown = max(MIN_COOLDOWN_MIN, float(r.get("cooldown_min") or 30)) * 60
-            if (len(fired) >= int(r.get("daily_cap") or 6) or (r.get("last_fired") and now - r["last_fired"] < cooldown)
-                    or not can_prompt):
-                fire = False   # cap (rolling 24 h) reached, cooling down, or no Claude to prompt on this host
-                hold()
+            cap = int(r.get("daily_cap") or 6)
+            why = (refused or (None if can_prompt else "no Claude Code CLI to prompt on this host")
+                   or (f"daily cap reached ({cap} alerts in 24 h)" if len(fired) >= cap else None)
+                   or (f"cooling down ({cooldown / 60:g} min between alerts)" if r.get("last_fired") and now - r["last_fired"] < cooldown else None))
+            if why:   # the host's agent won't take a plan prompt, nothing to prompt, cap (rolling 24 h) or cooldown
+                fire = False
+                hold(why)
         if fire:
             resume, fork, cwd = None, False, r.get("notify_cwd")
             target = r["notify"]
@@ -284,7 +310,7 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                     cwd = cwd or t.get("cwd")
                     if live and live.get("live"):
                         if live.get("status") == "busy":
-                            hold()   # mid-turn: try again on a later report
+                            hold("the target session is mid-turn")   # try again on a later report
                             fire = False
                         elif can_fork:
                             resume, fork = t.get("session_id"), True   # live and idle: a copy of its context
@@ -305,6 +331,8 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                 if j is not None:   # None: another report for this host fired it first
                     jobs.append(j)
                     upd.update(fire_upd, open_job=j["id"])
+        if upd.get("pending") == 0 and r.get("hold_reason"):
+            upd["hold_reason"] = None   # fired, recovered or responder removed: no longer held
         if upd:
             row = db.check_update(r["id"], upd)
             if row and (set(upd) - {"last_ok", "detail"} or "detail" in upd and state == "failing"):

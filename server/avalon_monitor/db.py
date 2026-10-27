@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 import sqlite3
 import threading
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .models import Sample
+
+_log = logging.getLogger("avalon")
 
 # Scalar columns extracted from every sample. Order matters (INSERT below).
 SCALAR_COLUMNS = (
@@ -153,6 +156,7 @@ CREATE TABLE IF NOT EXISTS host_checks (
                                                   -- no Claude to prompt): fires once it can, if still failing
     known_state     TEXT,                 -- last ok | failing reported (state may be unknown in between)
     fire_log        TEXT,                 -- JSON list of alert times in the last 24 h (the rolling cap)
+    hold_reason     TEXT,                 -- why a pending alert hasn't gone out (cap, cooldown, host policy, ...)
     UNIQUE(host_id, key, target)
 );
 
@@ -326,10 +330,31 @@ class Database:
                                   # acked: a failed prompt dismissed from Alerts
                 self._conn.execute(f"ALTER TABLE claude_jobs ADD COLUMN {col} {ddl}")
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(host_checks)")}
-        for col, ddl in (("known_state", "TEXT"), ("fire_log", "TEXT")):
-            if col not in cols:   # known_state: last ok/failing across unknown gaps; fire_log: rolling 24 h alert cap
+        for col, ddl in (("known_state", "TEXT"), ("fire_log", "TEXT"), ("hold_reason", "TEXT")):
+            if col not in cols:   # known_state: last ok/failing across unknown gaps; fire_log: rolling 24 h alert cap;
+                                  # hold_reason: why a pending alert is held
                 self._conn.execute(f"ALTER TABLE host_checks ADD COLUMN {col} {ddl}")
+        self._backfill_known_state()
         self._import_legacy_checks()
+
+    def _backfill_known_state(self) -> None:
+        """known_state came after state: a row that was "unknown" when the column was added got NULL, so its next
+        failure didn't count as ok -> failing and never alerted. Derive it from what the row still says: a current
+        ok/failing state; an open or pending alert (failing); else last_ok against since (since = when the last known
+        state began; last_ok stops moving once a check fails, so last_ok >= since means it was ok). Rows with neither
+        never had a known state and stay NULL. One UPDATE (atomic), only on NULL rows: running it on every start is a
+        no-op once done, and never touches a row evaluate has already set."""
+        with self._lock:
+            n = self._conn.execute("""
+                UPDATE host_checks SET known_state = CASE
+                    WHEN state IN ('ok', 'failing') THEN state
+                    WHEN open_job IS NOT NULL OR pending THEN 'failing'
+                    WHEN last_ok IS NOT NULL AND (since IS NULL OR last_ok >= since) THEN 'ok'
+                    ELSE 'failing' END
+                WHERE known_state IS NULL AND (state IN ('ok', 'failing') OR open_job IS NOT NULL OR pending
+                                               OR last_ok IS NOT NULL OR since IS NOT NULL)""").rowcount
+        if n:
+            _log.info("backfilled known_state on %d check row(s)", n)
 
     def _import_legacy_checks(self) -> None:
         """Once per database (meta legacy_checks_imported: '0' = to do, '1' = done): hosts whose AVM_WATCH_* settings
@@ -832,7 +857,7 @@ class Database:
     # ------------------------------------------------------------- checks
     CHECK_EDITABLE = ("label", "expires", "notify", "notify_cwd", "notify_log", "cooldown_min", "daily_cap", "target", "owner")
     CHECK_STATE = ("state", "since", "last_ok", "detail", "last_fired", "fires_day", "fires_n", "open_job", "pending",
-                   "known_state", "fire_log")
+                   "known_state", "fire_log", "hold_reason")
 
     def checks_list(self, host_id: int | None = None) -> list[dict]:
         sql = "SELECT * FROM host_checks" + (" WHERE host_id=?" if host_id is not None else "") + " ORDER BY host_id, key, target"
