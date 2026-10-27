@@ -71,11 +71,24 @@ Every route and the rule it uses: [README → API](../README.md#api).
   **not** off AVALON: it lives in the operator's own account (`~/.config/avalon-release/`), the same account the hub
   deploys from and every Claude session can act as. What protects it is the passphrase, which only the owner knows,
   and how the signing is done (audit F-02):
-  * **What this stops.** Signing anything other than the reviewed, pushed commit: `sign-release.py` reads the files
-    from a commit on `origin/main` (re-hashing the git objects itself), refuses a working tree that differs from it,
-    and prints the commit sha, the file sha256s and the `agent/` diffstat since the last release before it asks for
-    the passphrase, so the owner can compare the sha with GitHub. A process that edits `agent/*.py` in the checkout,
-    or rewrites `.git/objects`, just before a signing run gets a refusal, not a signature. And the passphrase isn't
+  * **What this stops.** Signing anything other than the reviewed, pushed commit: `sign-release.py` fetches `main` by
+    its canonical URL into a scratch repository, reads the files from a commit on it (re-hashing the git objects
+    itself), refuses a working tree that differs from it, and prints the fetched URL, the commit sha, the file sha256s
+    and the `agent/` diffstat since the last release before it asks for the passphrase, so the owner can compare the
+    sha with GitHub. A process that edits `agent/*.py` in the checkout, or rewrites `.git/objects`, just before a
+    signing run gets a refusal (or the signer never reads what it rewrote), not a signature.
+  * **The checkout's git config (audit G-05).** `.git/config` is as writable as the checkout and can name programs
+    git runs (`core.sshCommand`, `credential.helper`, `core.fsmonitor`, hooks) or redirect a fetch (`url.*.insteadOf`,
+    `remote.origin.url`). The signer runs every git command with global and system config off
+    (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`), no prompts, only the ssh/https/file transports
+    (`GIT_ALLOW_PROTOCOL`), and `-c core.sshCommand=ssh -c credential.helper= -c core.fsmonitor=false
+    -c core.hooksPath=/dev/null -c log.showSignature=false`. The fetch itself, and everything read for signing, happens
+    in a scratch repository it creates, so the checkout's remotes and URL rewrites aren't consulted at all. What still
+    reads the checkout's config: resolving a `--commit` name, `--check` (which reads the checkout's objects, re-hashed),
+    and the bootstrap command (`git fetch origin && git show origin/main:deploy/sign-release.py`), which is the owner's
+    plain git in the checkout: a planted `url.*.insteadOf` or a forged `refs/remotes/origin/main` can hand it another
+    script. Comparing the printed sha with GitHub is what catches that. Environment variables (`GIT_SSH_COMMAND`,
+    `GIT_SSH`, `GIT_ASKPASS`) come from the owner's shell and are honoured. And the passphrase isn't
     typed into code from the user-writable checkout: the documented command runs the copy of the script on
     `origin/main` with `/usr/bin/python3 -I` and the root-owned system `cryptography`, and the script refuses to touch
     the key from a virtualenv, a non-isolated interpreter, or with anything on `sys.path` inside the repo or `$HOME`.
@@ -109,6 +122,7 @@ hub, the dashboard and a modified hub can't raise them:
 | `AVM_SESSION_SNIPPETS` | `auto` | first/last lines of every Claude session on the host and claude processes' arguments in each report: `on`, `off`, or `auto` (on only when `AVM_JOB_TRANSCRIPT=full`) |
 | `AVM_CONTENT_ROOTS` | none | a content check sends a file's first line to the hub. Targets listed in `agent.conf` itself are always allowed; a hub-added target must resolve (symlinks followed) inside one of these directories, or it reports "refused" |
 | `AVM_UPDATE_PUBKEYS` | built-in `RELEASE_PUBKEYS` | extra release keys a self-update may be signed with (added to the built-in list) |
+| `AVM_ALLOW_DOWNGRADE` | `false` | agents 1.10+ install only a release signed with its version (`.sig2`) and refuse one older than what is installed, so a hub can't replay an old signed release (F-12). `1` allows a deliberate rollback on this host |
 | `AVM_STATE_DIR` | beside the config file, else beside the agent script | where `remote-config.json` (the last settings the hub pushed) is kept, so checks survive a restart |
 
 `AVM_AUTO_UPDATE=false` stops self-updates on a host entirely.

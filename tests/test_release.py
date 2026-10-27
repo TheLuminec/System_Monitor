@@ -1,8 +1,10 @@
 """Release gate (E-04/E-23): the agent files in the tree must carry valid release signatures, or the fleet will refuse
 them - and deploy-hub.sh refuses to ship them. Fix a failure by pushing the agent change and signing that commit (F-02):
     git fetch origin && git show origin/main:deploy/sign-release.py | /usr/bin/python3 -I -
-then commit and push agent/*.sig (docs/RELEASING.md#signing-a-release)."""
+then commit and push agent/*.sig agent/*.sig2 (docs/RELEASING.md#signing-a-release). Both are needed (F-12): .sig2
+(version-bound, v2) is what agents 1.10+ install, .sig (v1) what agents <= 1.9.x install."""
 import base64
+import importlib.util
 from pathlib import Path
 
 import avalon_agent as a
@@ -10,6 +12,13 @@ from avalon_monitor import core
 
 AGENT = Path(a.__file__).resolve().parent
 SIGN = "push it, then sign the pushed commit (docs/RELEASING.md#signing-a-release)"
+
+
+def _signer():
+    spec = importlib.util.spec_from_file_location("sign_release", AGENT.parent / "deploy" / "sign-release.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def test_agent_trusts_a_release_key():
@@ -20,18 +29,23 @@ def test_agent_trusts_a_release_key():
 
 def test_agent_files_are_signed_by_a_release_key():
     keys = [bytes.fromhex(k) for k in a.RELEASE_PUBKEYS]
+    v1 = _signer().release_message_v1
     for name in ("avalon_agent.py", "avm.py"):
-        sig_file = AGENT / (name + ".sig")
-        assert sig_file.exists(), f"{sig_file.name} missing: " + SIGN
-        sig = base64.b64decode(sig_file.read_text().strip())
-        msg = a.release_message(name, (AGENT / name).read_bytes())
-        assert any(a.ed25519_verify(k, msg, sig) for k in keys), f"{name} changed since it was signed: " + SIGN
+        data = (AGENT / name).read_bytes()
+        version = a.release_version(name, data)
+        assert version, f"{name} declares no single dotted-integer version line: the v2 signature needs one"
+        for ext, msg in ((".sig2", a.release_message(name, version, data)), (".sig", v1(name, data))):
+            sig_file = AGENT / (name + ext)
+            assert sig_file.exists(), f"{sig_file.name} missing: " + SIGN
+            sig = base64.b64decode(sig_file.read_text().strip())
+            assert any(a.ed25519_verify(k, msg, sig) for k in keys), f"{name} changed since it was signed ({ext}): " + SIGN
 
 
 def test_hub_passes_signatures_to_agents(agent):
-    """The hub forwards the .sig files in the update offer; agents verify them (tests/test_agent.py)."""
+    """The hub forwards the .sig and .sig2 files in the update offer; agents verify them (tests/test_agent.py)."""
     reply = agent.post("/api/v1/ingest", json={"ts": 0, "interval": 5, "host": {"hostname": "x", "agent_version": "0"},
                                                 "agent_sha256": "old"}).json()
     offer = reply.get("agent") or {}
     assert offer.get("sig") == core.agent_bundle.signature("avalon_agent.py")
-    assert set(offer.get("file_sigs") or {}) == {"avm.py"}
+    assert offer.get("sig2") == core.agent_bundle.signature("avalon_agent.py", ".sig2")
+    assert set(offer.get("file_sigs") or {}) == {"avm.py"} and set(offer.get("file_sigs2") or {}) == {"avm.py"}

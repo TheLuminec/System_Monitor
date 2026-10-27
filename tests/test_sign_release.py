@@ -94,12 +94,13 @@ class World:
         return self.git("rev-parse", "HEAD")
 
     def sign(self, *args, python=(SYS_PY, "-I"), passphrase=PASS, script=None):
-        cmd = [*python, str(script or self.repo / "deploy" / "sign-release.py"), "--passphrase-fd", "0", *args]
+        cmd = [*python, str(script or self.repo / "deploy" / "sign-release.py"), "--passphrase-fd", "0",
+               "--origin-url", str(self.origin), *args]
         return subprocess.run(cmd, cwd=self.repo, env=self.env, input=passphrase + "\n", capture_output=True, text=True,
                               timeout=120, start_new_session=True)
 
-    def sig(self, name):
-        p = self.repo / "agent" / (name + ".sig")
+    def sig(self, name, ext=".sig"):
+        p = self.repo / "agent" / (name + ext)
         return p.read_text() if p.exists() else None
 
     def committed(self, sha, name):
@@ -112,24 +113,40 @@ def world(tmp_path):
     return World(tmp_path)
 
 
-def _verifies(pub, name, data, sig_text):
+def _verifies(pub, name, data, sig_text, v2=True):
+    """v2 (.sig2): the message the agent builds; v1 (.sig): the frozen format agents <= 1.9.x verify."""
+    msg = avalon_agent.release_message(name, avalon_agent.release_version(name, data), data) if v2 else V1(name, data)
     try:
-        Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub)).verify(base64.b64decode(sig_text.strip()),
-                                                                      avalon_agent.release_message(name, data))
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub)).verify(base64.b64decode(sig_text.strip()), msg)
         return True
     except Exception:
         return False
 
 
+def V1(name, data):
+    """The v1 release message exactly as agent 1.9.1 builds it (frozen: the fleet verifies this until it runs 1.10+)."""
+    return ("avalon-release:v1:%s:%s" % (name, hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest())).encode()
+
+
+def _both_verify(world, sha, name):
+    data = world.committed(sha, name)
+    return _verifies(world.pub, name, data, world.sig(name, ".sig2")) and \
+        _verifies(world.pub, name, data, world.sig(name, ".sig"), v2=False)
+
+
 # ------------------------------------------------------------------ the format stays the agent's
 def test_release_message_is_byte_identical_to_the_agents():
-    """F-02: the signer inlines release_message instead of importing working-tree code; it must never drift."""
+    """F-02 / F-12: the signer inlines release_version / release_message instead of importing working-tree code; they
+    must never drift from the agent's (v2), and its v1 copy must stay what agents <= 1.9.x verify."""
     sr = load_signer()
     samples = [b"", b"print(1)\n", b"a\r\nb\r\n", b"mixed\r\nline\nendings\r", "unicode é\n".encode(),
                (ROOT / "agent" / "avm.py").read_bytes(), (ROOT / "agent" / "avalon_agent.py").read_bytes()]
     for name in ("avalon_agent.py", "avm.py"):
         for data in samples:
-            assert sr.release_message(name, data) == avalon_agent.release_message(name, data)
+            for version in ("1.9.1", "1.10.0", "2"):
+                assert sr.release_message(name, version, data) == avalon_agent.release_message(name, version, data)
+            assert sr.release_version(name, data) == avalon_agent.release_version(name, data)
+            assert sr.release_message_v1(name, data) == V1(name, data)
 
 
 def test_keys_and_versions_read_by_regex_match_the_agent():
@@ -139,6 +156,9 @@ def test_keys_and_versions_read_by_regex_match_the_agent():
     assert sr.version_of(src, "AGENT_VERSION") == avalon_agent.AGENT_VERSION
     import avm
     assert sr.version_of((ROOT / "agent" / "avm.py").read_text(), "AVM_VERSION") == avm.AVM_VERSION
+    # the version signed into v2 is the one the code runs as (one line each, dotted integers)
+    assert sr.release_version("avalon_agent.py", src.encode()) == avalon_agent.AGENT_VERSION
+    assert sr.release_version("avm.py", (ROOT / "agent" / "avm.py").read_bytes()) == avm.AVM_VERSION
 
 
 def test_signer_never_imports_the_agent():
@@ -158,8 +178,10 @@ def test_signs_the_pushed_commit_and_prints_what_it_signs(world):
     for name in ("avalon_agent.py", "avm.py"):
         data = world.committed(world.head, name)
         assert hashlib.sha256(data).hexdigest() in out
-        assert _verifies(world.pub, name, data, world.sig(name))
+        assert _both_verify(world, world.head, name)   # F-12: v1 .sig for agents <= 1.9.x and v2 .sig2
+        assert "signed  agent/%s.sig\n" % name in out and "signed  agent/%s.sig2\n" % name in out
     assert "agent 1.0.0, avm 1.1.0" in out
+    assert "origin:    %s" % world.origin in out   # G-05: the URL actually fetched
     assert world.release1[:12] in out and "agent/avm.py" in out   # diffstat since the last signed release
     assert "Compare the sha" in out
     # all of that is printed before the passphrase is asked for (the key is only read after it)
@@ -175,13 +197,14 @@ def test_committed_copy_from_stdin_with_repo_arg(world, tmp_path):
     os.write(wfd, (PASS + "\n").encode())
     os.close(wfd)
     try:
-        r = subprocess.run([SYS_PY, "-I", "-", "--repo", str(world.repo), "--passphrase-fd", str(rfd)], cwd=tmp_path,
+        r = subprocess.run([SYS_PY, "-I", "-", "--repo", str(world.repo), "--passphrase-fd", str(rfd),
+                            "--origin-url", str(world.origin)], cwd=tmp_path,
                            env=world.env, input=script, capture_output=True, text=True, timeout=120,
                            start_new_session=True, pass_fds=(rfd,))
     finally:
         os.close(rfd)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert _verifies(world.pub, "avm.py", world.committed(world.head, "avm.py"), world.sig("avm.py"))
+    assert _both_verify(world, world.head, "avm.py")
 
 
 @needs_system_python
@@ -225,22 +248,33 @@ def test_local_branch_behind_origin_still_signs_origin_main_bytes(world):
     r = world.sign()
     assert r.returncode == 0, r.stdout + r.stderr
     assert newer in r.stdout
-    assert _verifies(world.pub, "avm.py", world.committed(newer, "avm.py"), world.sig("avm.py"))
+    assert _both_verify(world, newer, "avm.py")
 
 
 @needs_system_python
 def test_refuses_a_tampered_object_store(world):
     """A loose object rewritten under the same name (the object store is as writable as the checkout): `git show`
-    would hand back the new bytes, the signer's own hash check refuses them."""
+    would hand back the new bytes. Signing never reads the checkout's object store (G-05: main is fetched into a
+    scratch repository), so the forged bytes are never signed; --check, which does read it, re-hashes and refuses."""
     blob = world.git("rev-parse", "%s:agent/avm.py" % world.head)
     path = world.repo / ".git" / "objects" / blob[:2] / blob[2:]
+    genuine = world.committed(world.head, "avm.py")
     evil = b'AVM_VERSION = "1.1.0"\nprint("evil")\n'
     os.chmod(path, 0o644)
     path.write_bytes(zlib.compress(b"blob %d\0" % len(evil) + evil))
     world.write("agent/avm.py", evil.decode())   # the checkout agrees with the forged object
     r = world.sign()
-    assert r.returncode == 1 and "does not match its hash" in r.stderr
+    assert r.returncode == 1 and "working tree differs" in r.stderr and "agent/avm.py" in r.stderr
     assert world.sig("avm.py") == "old\n"
+    chk = subprocess.run([sys.executable, str(world.repo / "deploy" / "sign-release.py"), "--check", "--commit",
+                          world.head, "--origin-url", str(world.tmp / "nowhere.git")], cwd=world.repo, env=world.env,
+                         capture_output=True, text=True, timeout=60)
+    assert chk.returncode == 1 and "does not match its hash" in chk.stderr
+    (world.repo / "agent" / "avm.py").write_bytes(genuine)   # what origin has: signed from origin's bytes
+    r = world.sign()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _verifies(world.pub, "avm.py", genuine, world.sig("avm.py", ".sig2")) and b"evil" not in genuine
+    assert _verifies(world.pub, "avm.py", genuine, world.sig("avm.py"), v2=False)
 
 
 @needs_system_python
@@ -289,11 +323,69 @@ def test_check_working_tree_and_commit(world):
     assert r.returncode == 0, r.stdout + r.stderr
     chk = subprocess.run([sys.executable, str(world.repo / "deploy" / "sign-release.py"), "--check"], cwd=world.repo,
                          env=world.env, capture_output=True, text=True, timeout=60)
-    assert chk.returncode == 0 and chk.stdout.count("ok") == 2, chk.stdout
+    assert chk.returncode == 0 and chk.stdout.count("ok") == 4, chk.stdout   # .sig and .sig2 of both files
     signed = world.commit("Release signatures", push=True)
-    chk = subprocess.run([sys.executable, str(world.repo / "deploy" / "sign-release.py"), "--check", "--commit", signed],
+    chk = subprocess.run([sys.executable, str(world.repo / "deploy" / "sign-release.py"), "--check", "--commit", signed,
+                          "--origin-url", str(world.origin)],
                          cwd=world.repo, env=world.env, capture_output=True, text=True, timeout=60)
-    assert chk.returncode == 0 and signed in chk.stdout, chk.stdout + chk.stderr
+    assert chk.returncode == 0 and signed in chk.stdout and "NOT on origin/main" not in chk.stdout, chk.stdout + chk.stderr
     chk = subprocess.run([sys.executable, str(world.repo / "deploy" / "sign-release.py"), "--check", "--commit",
-                          world.release1], cwd=world.repo, env=world.env, capture_output=True, text=True, timeout=60)
+                          world.release1, "--origin-url", str(world.origin)], cwd=world.repo, env=world.env,
+                         capture_output=True, text=True, timeout=60)
     assert chk.returncode == 1 and "MISSING" in chk.stdout   # release 1's placeholder .sig files are not signatures
+    # a v1 .sig alone (all a <= 1.9.x signer made) does not pass: the .sig2 is checked too
+    (world.repo / "agent" / "avm.py.sig2").unlink()
+    chk = subprocess.run([sys.executable, str(world.repo / "deploy" / "sign-release.py"), "--check"], cwd=world.repo,
+                         env=world.env, capture_output=True, text=True, timeout=60)
+    assert chk.returncode == 1 and "MISSING  agent/avm.py.sig2" in chk.stdout, chk.stdout
+
+
+# ------------------------------------------------------------------ round H: version-bound signatures, git hardening
+@needs_system_python
+@pytest.mark.parametrize("avm_text", ['print("no version line")\n', 'AVM_VERSION = "1.2.0"\nAVM_VERSION = "9.0.0"\n',
+                                      'AVM_VERSION = "1.2.0-rc1"\n'])
+def test_refuses_a_release_without_one_dotted_version(world, avm_text):
+    """F-12: the v2 signature covers the version the file declares, so the signer refuses a file that declares none,
+    two (Python would run as the last, agents read the first), or one agents can't compare numerically."""
+    world.write("agent/avm.py", avm_text)
+    world.commit("avm without a usable version", push=True)
+    r = world.sign()
+    assert r.returncode == 1 and "AVM_VERSION" in r.stderr and "version" in r.stderr
+    assert world.sig("avm.py") == "old\n" and world.sig("avm.py", ".sig2") is None
+
+
+@needs_system_python
+def test_checkouts_git_config_never_runs_anything(world):
+    """G-05: .git/config is as writable as the checkout. The signer fetches main by URL into a scratch repository
+    (its remotes, url rewrites and hooks don't apply) and forces sshCommand / credential.helper / fsmonitor / hooksPath
+    on every git call, so nothing a planted config names ever runs - not for signing, not for --check."""
+    marks = world.tmp / "marks"
+    marks.mkdir()
+    hooks = world.tmp / "hooks"
+    hooks.mkdir()
+    for hook in ("reference-transaction", "post-checkout", "post-merge", "pre-auto-gc", "fsmonitor"):
+        (hooks / hook).write_text("#!/bin/sh\ntouch %s/%s\n" % (marks, hook))
+        os.chmod(hooks / hook, 0o755)
+    for key, value in (("core.sshCommand", "touch %s/ssh; false" % marks),
+                       ("credential.helper", "!touch %s/cred; false" % marks),
+                       ("core.hooksPath", str(hooks)),
+                       ("core.fsmonitor", str(hooks / "fsmonitor")),
+                       ("remote.origin.url", "ssh://git@example.invalid/release.git"),
+                       ("url.ssh://git@example.invalid/.insteadOf", str(world.origin))):
+        world.git("config", key, value)
+    r = world.sign()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "origin:    %s" % world.origin in r.stdout
+    assert _both_verify(world, world.head, "avm.py")
+    chk = subprocess.run([sys.executable, str(world.repo / "deploy" / "sign-release.py"), "--check", "--commit", world.head,
+                          "--origin-url", str(world.origin)], cwd=world.repo, env=world.env, capture_output=True,
+                         text=True, timeout=60)
+    assert chk.returncode == 1 and "NOT on origin/main" not in chk.stdout   # the head's .sig files are placeholders
+    assert sorted(p.name for p in marks.iterdir()) == []
+
+
+def test_default_origin_is_the_canonical_url():
+    """G-05: the signer names the repository itself instead of trusting the checkout's remote.origin.url."""
+    sr = load_signer()
+    assert sr.ORIGIN_URL == "git@github.com:TheLuminec/avalon-monitor.git"
+    assert '"fetch", "--quiet", "origin"' not in SCRIPT.read_text()
