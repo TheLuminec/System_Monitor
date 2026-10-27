@@ -208,10 +208,12 @@ What the card shows, from the last run's `state`:
 * **ok**: the snapshot has everything.
 * **partial** (amber): a snapshot was saved, but restic skipped unreadable files or a missing source path (restic exit
   code 3), or a SQLite copy failed, so the snapshot holds the previous copy of that database. `error` says what is
-  missing. `last_success` still advances: everything else in the snapshot is restorable, so the stale alert keeps
-  meaning "no usable snapshot for `max_age_sec`".
+  missing. Unreadable files or a failed SQLite copy still advance `last_success` (everything else in the snapshot is
+  restorable). A missing source path does not, and the success stamp is not touched either: that path isn't backed up
+  at all, so the stale alert goes red `max_age_sec` after the last run that had every path.
 * **failed** (red): no snapshot, or the run was stopped (SIGTERM from `systemctl stop` or the timeout, SIGINT,
-  SIGHUP) or crashed. `restic-backup.py` writes `failed` before it exits.
+  SIGHUP) or crashed before its snapshot was saved and pruned. `restic-backup.py` writes `failed` before it exits. A
+  stop after that point only skips the repository statistics; the run stays `ok`/`partial`.
 * **running**: a run is in progress. A `running` state older than `max_run_sec` shows red: only SIGKILL or power
   loss can leave it behind.
 
@@ -226,7 +228,7 @@ seconds, sizes bytes):
 | `name`, `tool`, `repository`, `paths`, `keep` | what is backed up where, and the retention (`{"daily": 7, ...}`) |
 | `state` | `running`, `ok`, `partial` (amber: a snapshot was saved, but without some files or source paths, or with an old copy of a database) or `failed` (the last run) |
 | `started`, `finished`, `duration_sec`, `next_run` | the last run and the next scheduled one |
-| `last_success`, `max_age_sec` | drives the chip colour and the stale alert (a `partial` run counts as a success here: its snapshot is restorable) |
+| `last_success`, `max_age_sec` | drives the chip colour and the stale alert (a `partial` run counts as a success here, unless a configured source path was missing) |
 | `max_run_sec` | a `running` state older than this (default 43200 = the unit's 12 h `TimeoutStartSec`) shows red: the run was killed without writing its end |
 | `snapshot`, `files`, `bytes_scanned`, `bytes_added`, `files_new`, `files_changed`, `warnings` | the last run's result (`warnings`: unreadable files + missing paths + failed SQLite copies) |
 | `snapshots`, `repo_bytes`, `target_free_bytes`, `checked` | the repository: snapshots kept, size, free space on its disk, last verify |
