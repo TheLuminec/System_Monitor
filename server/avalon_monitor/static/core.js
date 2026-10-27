@@ -52,14 +52,14 @@ export function guard(el) {
   return el;
 }
 // A host's own limits on dashboard prompts (agent.conf, E-04), as its agent reports them in sample.claude.policy:
-// {max_mode, actions, jobs, transcript}. Older agents send none: unknown, so nothing is greyed out.
+// {max_mode, actions, jobs, transcript, snippets}. Older agents send none and enforce no cap of their own: the hub
+// refuses prompts and actions to them (F-06), so nothing is offered here either.
 export const MODE_RANK = { plan: 0, acceptEdits: 1, full: 2 };
 export function modeAllowed(mode, policy) {
-  if (!policy) return true;
-  if (policy.jobs === false) return false;
+  if (!policy || policy.jobs === false) return false;
   return (MODE_RANK[mode] ?? 99) <= (MODE_RANK[policy.max_mode] ?? 0);   // the agent treats an unknown cap as plan
 }
-export const actionsAllowed = (policy) => !policy || (policy.actions !== false && policy.jobs !== false);
+export const actionsAllowed = (policy) => !!policy && policy.actions !== false && policy.jobs !== false;
 
 export const fmt = {
   pct: (v, d = 0) => (v == null ? "—" : v.toFixed(d) + "%"),

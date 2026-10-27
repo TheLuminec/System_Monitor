@@ -106,13 +106,13 @@ def test_dashboard_permission_logic_js():
     assert r["noConfig"] and r["access"] and not r["ro"] and r["oldHub"]
     assert r["tip"] == "read-only here: changes need your Cloudflare Access login - open https://monitor.example.test"
     assert r["tipNoUrl"] == "read-only here: changes need your Cloudflare Access login"
-    assert r["unknown"] == {"plan": True, "acceptEdits": True, "full": True}   # older agents: no restriction shown
+    assert r["unknown"] == {"plan": False, "acceptEdits": False, "full": False}   # older agents: refused by the hub (F-06)
     assert r["plan"] == {"plan": True, "acceptEdits": False, "full": False}
     assert r["edits"] == {"plan": True, "acceptEdits": True, "full": False}
     assert r["full"] == {"plan": True, "acceptEdits": True, "full": True}
     assert r["bogus"] == r["plan"]   # the agent itself treats an unknown cap as plan
     assert r["root"] == {"plan": False, "acceptEdits": False, "full": False}
-    assert r["act"] == [True, True, False, False]
+    assert r["act"] == [False, True, False, False]   # no policy (older agent): no restart/stop offered
 
 
 @needs_node

@@ -63,9 +63,30 @@ Every route and the rule it uses: [README → API](../README.md#api).
   Claude session with a shell on AVALON, can rewrite the hub. Such a process can change what the dashboard shows,
   read the hub's database, and queue prompts, session restarts and check changes. Agents still enforce their own
   limits on all of these (next section).
-  **Release signing keeps it from reaching the fleet:** agents install only agent code signed with the release key,
-  which is passphrase-encrypted and not on the hub ([RELEASING.md](RELEASING.md)). To make `agent/` root-only as well,
-  `chown` it to root (deploy-hub then deploys the hub only, and agent releases go through `sudo ./deploy/upgrade.sh`).
+  **Release signing keeps it from reaching the fleet:** agents install only agent code signed with the release key
+  ([RELEASING.md](RELEASING.md#signing-a-release)). The hub's code can't sign: it never sees the key. But the key is
+  **not** off AVALON: it lives in the operator's own account (`~/.config/avalon-release/`), the same account the hub
+  deploys from and every Claude session can act as. What protects it is the passphrase, which only the owner knows,
+  and how the signing is done (audit F-02):
+  * **What this stops.** Signing anything other than the reviewed, pushed commit: `sign-release.py` reads the files
+    from a commit on `origin/main` (re-hashing the git objects itself), refuses a working tree that differs from it,
+    and prints the commit sha, the file sha256s and the `agent/` diffstat since the last release before it asks for
+    the passphrase, so the owner can compare the sha with GitHub. A process that edits `agent/*.py` in the checkout,
+    or rewrites `.git/objects`, just before a signing run gets a refusal, not a signature. And the passphrase isn't
+    typed into code from the user-writable checkout: the documented command runs the copy of the script on
+    `origin/main` with `/usr/bin/python3 -I` and the root-owned system `cryptography`, and the script refuses to touch
+    the key from a virtualenv, a non-isolated interpreter, or with anything on `sys.path` inside the repo or `$HOME`.
+    So a tampered `.venv`, `sign-release.py` or agent module can't capture the passphrase.
+  * **What remains possible.** A process running as the operator can still keylog the terminal the passphrase is typed
+    into (an X11 or terminal-emulator hook, a modified shell rc, a `git` wrapper earlier on `PATH`, a forged
+    `origin/main` copy of the script itself if the owner skips the sha comparison), or copy the encrypted key and wait
+    for the passphrase. With the passphrase and the key file, it can sign anything. The passphrase keeps the key
+    safe from offline theft and from a session that doesn't see it typed; it is not a boundary against a live
+    compromise of the operator account at signing time. Signing on another machine, or with a hardware key, would be;
+    the owner chose to keep signing on AVALON.
+
+  To make `agent/` root-only as well, `chown` it to root (deploy-hub then deploys the hub only, and agent releases go
+  through `sudo ./deploy/upgrade.sh`).
 * **Loopback is a trusted network by default.** Any local process can read the whole dashboard (not change it).
   `deploy-hub.sh` relies on this for its smoke test (`GET /`, `/api/v1/hosts`, `/api/v1/stats` from 127.0.0.1).
 * **Tailscale ACLs and `ufw`** decide who can reach `:8787` at all. The hub binds `0.0.0.0` by default
@@ -82,6 +103,7 @@ hub, the dashboard and a modified hub can't raise them:
 | `AVM_ALLOW_ACTIONS` | `true` | allow restart/stop of tracked Claude sessions from the dashboard |
 | `AVM_ALLOW_ROOT_JOBS` | `false` | an agent running as root (Linux) or SYSTEM (Windows) refuses all prompts, responder alerts and actions unless this is on. A Windows agent installed as SYSTEM (e.g. LAPTOP-C) is in this state; use the rootless / `-AsCurrentUser` install for prompts |
 | `AVM_JOB_TRANSCRIPT` | `full` | what a prompt's transcript sends to the hub: `full`, `summary` (final answer and tool names only) or `off` (status and metadata only) |
+| `AVM_SESSION_SNIPPETS` | `auto` | first/last lines of every Claude session on the host and claude processes' arguments in each report: `on`, `off`, or `auto` (on only when `AVM_JOB_TRANSCRIPT=full`) |
 | `AVM_CONTENT_ROOTS` | none | a content check sends a file's first line to the hub. Targets listed in `agent.conf` itself are always allowed; a hub-added target must resolve (symlinks followed) inside one of these directories, or it reports "refused" |
 | `AVM_UPDATE_PUBKEYS` | built-in `RELEASE_PUBKEYS` | extra release keys a self-update may be signed with (added to the built-in list) |
 | `AVM_STATE_DIR` | beside the config file, else beside the agent script | where `remote-config.json` (the last settings the hub pushed) is kept, so checks survive a restart |

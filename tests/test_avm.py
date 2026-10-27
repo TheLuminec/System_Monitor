@@ -3,6 +3,7 @@ Most runs are in-process (avm.main) with Hub.call spied on, so the exact bodies 
 need a real process (signals to avm itself, a closed stdout pipe) run avm as a subprocess. No test touches the real
 /tmp/avm-queue, ~/.config or any agent.conf: avm's config lookup is pinned to a temp file and AVM_QUEUE_DIR to a temp dir."""
 import io
+import json
 import os
 import signal
 import socket
@@ -334,13 +335,18 @@ def test_queue_dir_symlink_refused(env, capsys):
     with pytest.raises(avm.QueueUnsafe, match="symlink"):
         avm.Queue({})
     marker = env.tmp / "ran"
-    assert env.run("run", "job", "--gpu", "--", "touch", str(marker)) == 2
-    assert not marker.exists()
+    # F-07: never used for tickets, but the command still runs (loudly, without admission control)
+    assert env.run("run", "job", "--gpu", "--", "sh", "-c", "touch %s; exit 5" % marker) == 5
+    assert marker.exists() and os.listdir(real) == []
+    err = capsys.readouterr().err
+    assert "queue disabled: refusing queue dir" in err and "running without admission control" in err
+    assert env.run("queue", "status") == 2   # queue commands still report the problem
     assert "refusing queue dir" in capsys.readouterr().err
-    assert env.run("queue", "status") == 2
 
 
-def test_queue_dir_foreign_owner_refused(env, monkeypatch):
+def test_queue_dir_foreign_owner_command_still_runs(env, monkeypatch, capsys):
+    """F-07 (was test_queue_dir_foreign_owner_refused): a queue dir owned by another user is never used for tickets,
+    but the job runs anyway without admission control: warning on stderr, a note on the task, rc passed through."""
     os.mkdir(env.qdir)
     assert "owned by uid %d" % os.getuid() in avm._dir_problem(env.qdir, os.getuid() + 4242, final=True)
     assert avm._dir_problem(env.qdir, os.getuid(), final=True) is None
@@ -348,6 +354,61 @@ def test_queue_dir_foreign_owner_refused(env, monkeypatch):
     monkeypatch.setattr(os, "getuid", lambda: me + 4242)   # as seen by another user: not theirs, not root's
     with pytest.raises(avm.QueueUnsafe, match="owned by uid"):
         avm.Queue({})
+    real = avm._dir_problem   # parents as on a real host (/tmp: root's, sticky); the queue dir itself as user B
+    monkeypatch.setattr(avm, "_dir_problem", lambda d, uid, final: real(d, uid if final else me, final))
+    with pytest.raises(avm.QueueUnsafe, match="%s is owned by uid %d" % (env.qdir, me)):
+        avm.Queue({})
+    marker = env.tmp / "ran"
+    assert env.run("run", "foreign", "--gpu", "--note", "mine", "--beat", "0.2", "--",
+                   "sh", "-c", "touch %s; exit 3" % marker) == 3
+    assert marker.exists()
+    assert os.listdir(env.qdir) == []   # no ticket written into a dir someone else controls
+    err = capsys.readouterr().err
+    assert "WARNING: queue disabled:" in err and "owned by uid %d" % me in err
+    assert "running without admission control" in err
+    t = env.task()
+    assert t["status"] == "failed" and t["rc"] == 3
+    assert "queue disabled" in t["note"] and "without admission control" in t["note"]
+    meta = json.loads(t["meta"]) if isinstance(t["meta"], str) else t["meta"]
+    assert meta["queue"]["disabled"] and meta["note"].startswith("mine; queue disabled")
+
+
+def test_shared_host_second_user_wait_job_runs(env, monkeypatch, capsys):
+    """F-07 / F-17, the shared-host case: after a reboot user A queues first and so owns /tmp/avm-queue (here: the
+    temp queue dir, created by a real Queue as A). User B's `--gpu --wait` job must still run - it used to exit 2."""
+    a = avm.Queue({})   # user A: creates the dir, 1777, owned by A
+    assert stat.S_IMODE(os.lstat(env.qdir).st_mode) == 0o1777
+    a.register({"name": "A's job", "state": "running", "gpu": "shared", "started_at": time.time()})
+    try:
+        me = os.getuid()
+        monkeypatch.setattr(os, "getuid", lambda: me + 4242)   # user B
+        real = avm._dir_problem   # parents as on a real host (/tmp: root's, sticky); the queue dir itself as user B
+        monkeypatch.setattr(avm, "_dir_problem", lambda d, uid, final: real(d, uid if final else me, final))
+        marker = env.tmp / "b-ran"
+        assert env.run("run", "B's job", "--gpu", "--wait", "--beat", "0.2", "--",
+                       "sh", "-c", "touch %s; echo $AVM_TASK_ID; exit 0" % marker) == 0
+        assert marker.exists()
+        assert "queue disabled: refusing queue dir: %s is owned by uid %d" % (env.qdir, me) in capsys.readouterr().err
+        t = env.task()
+        assert t["status"] == "done" and t["rc"] == 0 and "queue disabled" in t["note"]
+        monkeypatch.setattr(os, "getuid", lambda: me)
+        assert [x["name"] for x in avm.Queue({}).tickets()] == ["A's job"]   # B left nothing in A's dir
+    finally:
+        a.release()
+
+
+def test_planted_admit_lock_still_runs_and_cleans_up(env, capsys):
+    """F-07: a file planted in the queue dir (QueueUnsafe from try_admit, after the ticket was registered) also falls
+    back to running without admission, and the half-made ticket is removed."""
+    q = avm.Queue({})
+    victim = env.tmp / "victim"
+    victim.write_text("precious")
+    os.symlink(victim, os.path.join(q.dir, "admit.lock"))
+    marker = env.tmp / "ran"
+    assert env.run("run", "job", "--gpu", "--wait", "--", "sh", "-c", "touch %s; exit 7" % marker) == 7
+    assert marker.exists() and victim.read_text() == "precious"
+    assert "queue disabled: cannot use" in capsys.readouterr().err
+    assert sorted(os.listdir(q.dir)) == ["admit.lock"]   # only the planted link: our ticket is gone
 
 
 def test_queue_dir_writable_by_others_without_sticky_refused(env):

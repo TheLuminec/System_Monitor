@@ -97,6 +97,17 @@ A root agent refuses Claude prompts and actions (`AVM_ALLOW_ROOT_JOBS=false`). I
 `ProtectSystem=strict`, so `/etc/avalon-agent` is read-only to it: it keeps `remote-config.json` beside the agent
 script in `/opt/avalon-agent` instead (set `AVM_STATE_DIR` to choose another writable dir).
 
+The root install also writes `/etc/tmpfiles.d/avm-queue.conf` (`d /run/avm-queue 1777 root root -`) and runs
+`systemd-tmpfiles --create`, so `avm run --gpu/--wait` has a root-owned queue dir shared by every user, recreated at
+each boot. Without it avm uses `/tmp/avm-queue`, which belongs to whoever queued first after a reboot; every other
+user's queued jobs then still run, but **without admission control** (`queue disabled: ... owned by uid N` on stderr
+and in the task's note). A host with only rootless (`--user`) installs and more than one user of the queue needs that
+line once:
+
+```bash
+echo 'd /run/avm-queue 1777 root root -' | sudo tee /etc/tmpfiles.d/avm-queue.conf && sudo systemd-tmpfiles --create
+```
+
 ### Windows agents and self-update (1.2.x → 1.3+)
 
 Agents older than 1.3.1 running under `pythonw.exe` (the scheduled task) write
@@ -232,7 +243,16 @@ AVM_TASK_LOG=off
 AVM_JOB_TRANSCRIPT=summary
 ```
 
-and **no** `AVM_CONTENT_ROOTS`, so the hub can't add a content check that reads a file there. Notes:
+and **no** `AVM_CONTENT_ROOTS`, so the hub can't add a content check that reads a file there. With a transcript
+level below `full`, session snippets (the first/last lines of every Claude session on the host, and claude
+processes' arguments) stay on the host too (`AVM_SESSION_SNIPPETS=auto`).
+
+**Hub-side safety net:** also set *Data-use host* (`AVM_DATA_USE=restricted`) in the host's settings on the
+dashboard. The hub then drops task output lines, commands and working directories, prompt tool inputs/results
+and intermediate text, session snippets and content-check text before storing anything - even if the agent.conf
+lines above are missing. A host whose agent reports a transcript level below `full` is treated the same way.
+
+Notes:
 
 * `summary` still sends the final answer, which could quote what Claude read. `AVM_JOB_TRANSCRIPT=off` keeps the
   answer on the host too (the hub sees status only).

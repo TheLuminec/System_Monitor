@@ -60,9 +60,12 @@ Resources and the wait queue (host-local; opt-in - plain `avm run` behaves exact
     avm queue status [--json]     avm queue drain [--wait]     avm queue resume
         drain: admit nothing new (running jobs finish; --wait returns once the host is idle) - e.g. before a git pull.
       Settings (agent.conf): AVM_QUEUE_HEADROOM_GB (default 2), AVM_QUEUE_SETTLE_SEC (default 180), AVM_QUEUE_DIR.
-      The queue dir (default /run/avm-queue when the installer made it, else /tmp/avm-queue) is shared by every user
-      on the host. avm refuses it unless it is a real directory (not a symlink) owned by root or you, not writable by
-      others unless sticky, in a parent chain with the same properties; files in it are never followed through symlinks.
+      The queue dir (default /run/avm-queue when the root installer made it, else /tmp/avm-queue) is shared by every
+      user on the host. avm uses it only if it is a real directory (not a symlink) owned by root or you, not writable
+      by others unless sticky, in a parent chain with the same properties; files in it are never followed through
+      symlinks. If it fails those rules (e.g. another user created /tmp/avm-queue first), the command STILL runs: avm
+      warns "queue disabled: <why>; running without admission control" and notes it on the task. The fix is
+      /run/avm-queue (root install, or: d /run/avm-queue 1777 root root - in /etc/tmpfiles.d/avm-queue.conf).
 
 Task logs and data-use agreements (local switches in agent.conf; the hub cannot set them):
     AVM_TASK_LOG=off              no output lines leave this host: avm run / watch / task send only name, status,
@@ -98,7 +101,7 @@ import urllib.request
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
-AVM_VERSION = "1.9.0"
+AVM_VERSION = "1.9.1"
 IS_WINDOWS = sys.platform.startswith("win")
 
 
@@ -292,7 +295,8 @@ _BINARY = getattr(os, "O_BINARY", 0)
 
 
 class QueueUnsafe(Exception):
-    """The queue directory (or a file in it) is in a state another local user could abuse: refuse, don't work around."""
+    """The queue directory (or a file in it) is in a state another local user could abuse: never put a ticket there.
+    `avm run` then runs the command without admission control (F-07); `avm queue ...` reports the error."""
 
 
 def _open_queue_file(path: str, create: bool = False) -> Any:
@@ -471,23 +475,45 @@ def _res_text(t: dict) -> str:
     return ", ".join(x for x in parts if x) or "-"
 
 
+def _headroom(cfg: Dict[str, str]) -> float:
+    return float(cfg.get("AVM_QUEUE_HEADROOM_GB") or 2)
+
+
+def _impossible(res: Dict[str, Any], headroom: float) -> Optional[str]:
+    """Reject at submit what could never fit, instead of queueing it forever. Needs no queue dir."""
+    _, total = _mem_gb()
+    if res.get("mem_gb") and total and res["mem_gb"] + headroom > total:
+        return "asks for %g GB RAM but this host has %.1f GB (%.1f GB after %g GB headroom)" % (
+            res["mem_gb"], total, total - headroom, headroom)
+    if res.get("vram_gb"):
+        _, vtotal = _vram_gb()
+        if vtotal is None:
+            return "asks for VRAM but no NVIDIA GPU was found (nvidia-smi)"
+        if res["vram_gb"] > vtotal:
+            return "asks for %g GB VRAM but the GPU has %.1f GB" % (res["vram_gb"], vtotal)
+    return None
+
+
 class Queue:
     def __init__(self, cfg: Dict[str, str]):
         self.dir = self._dir(cfg)
-        self.headroom = float(cfg.get("AVM_QUEUE_HEADROOM_GB") or 2)
+        self.headroom = _headroom(cfg)
         self.settle = float(cfg.get("AVM_QUEUE_SETTLE_SEC") or 180)
         self.me: Optional[Dict[str, Any]] = None
         self._lockf = None
+        self._lock_id = ""
 
     @staticmethod
     def _dir(cfg: Dict[str, str]) -> str:
         """The shared queue dir, created if missing. Tickets must be visible to every user on the host (root's backup
         and a user's training share the GPU), so it can't be per-user; instead it must be one nobody else controls:
         a real directory owned by root or us, sticky if others may write, in a parent chain with the same properties.
-        Anything else is refused with the reason - no silent fallback to a private dir that would split the queue."""
+        Anything else raises QueueUnsafe with the reason - no silent fallback to a private dir that would split the
+        queue (avm run then runs the job without admission, loudly)."""
         d = os.path.abspath(os.environ.get("AVM_QUEUE_DIR") or cfg.get("AVM_QUEUE_DIR") or _default_queue_dir())
         uid = None if IS_WINDOWS else os.getuid()
-        fix = "remove it (or ask its owner / root to), or set AVM_QUEUE_DIR in agent.conf"
+        fix = ("remove it (or ask its owner / root to), or set AVM_QUEUE_DIR in agent.conf; lasting fix: a root-owned "
+               "/run/avm-queue (root install-linux.sh, or 'd /run/avm-queue 1777 root root -' in /etc/tmpfiles.d)")
         parent = os.path.dirname(d)
         if not IS_WINDOWS:
             chain = os.path.realpath(parent)
@@ -578,6 +604,7 @@ class Queue:
                 time.sleep(0.002)
         else:
             raise QueueUnsafe("cannot create a queue ticket in %s: the names are taken" % self.dir)
+        self._lock_id = tid   # release() removes it even if registering fails below
         if not IS_WINDOWS:
             os.fchmod(fd, 0o644)
         self._lockf = os.fdopen(fd, "r+b")
@@ -603,7 +630,7 @@ class Queue:
             _unlock(self._lockf)
             self._lockf.close()
             try:
-                os.remove(self._path(self.me["id"], ".lock"))
+                os.remove(self._path(self._lock_id, ".lock"))
             except OSError:
                 pass
         self.me, self._lockf = None, None
@@ -616,18 +643,7 @@ class Queue:
             return None
 
     def impossible(self, res: Dict[str, Any]) -> Optional[str]:
-        """Reject at submit what could never fit, instead of queueing it forever."""
-        _, total = _mem_gb()
-        if res.get("mem_gb") and total and res["mem_gb"] + self.headroom > total:
-            return "asks for %g GB RAM but this host has %.1f GB (%.1f GB after %g GB headroom)" % (
-                res["mem_gb"], total, total - self.headroom, self.headroom)
-        if res.get("vram_gb"):
-            _, vtotal = _vram_gb()
-            if vtotal is None:
-                return "asks for VRAM but no NVIDIA GPU was found (nvidia-smi)"
-            if res["vram_gb"] > vtotal:
-                return "asks for %g GB VRAM but the GPU has %.1f GB" % (res["vram_gb"], vtotal)
-        return None
+        return _impossible(res, self.headroom)
 
     def check(self) -> Tuple[bool, str, int]:
         """(fits now, why not, place in line). Call with the admit lock held."""
@@ -908,6 +924,8 @@ def _execute(hub: Hub, args: argparse.Namespace, command: Any, tid: Optional[int
     status = "done" if rc == 0 else "failed"
     took = _fmt_dur(time.time() - t0)
     note = ("killed by %s after %s" % (_signame(killed), took)) if killed else "%s after %s" % (status, took)
+    if getattr(args, "queue_note", None):   # F-07: ran without admission control
+        note += "; " + args.queue_note
     call("/tasks/%d/finish", {"status": status, "rc": rc, "log": lines, "note": note})
     _say("avm: task %s %s (rc=%s, %s)\n" % ("#%d" % tid if tid is not None else "(untracked)", status, rc,
                                             note if killed else took))
@@ -925,13 +943,39 @@ def _try_start(hub: Hub, body: Dict[str, Any]) -> Optional[int]:
         return None
 
 
+def _run_without_queue(args: argparse.Namespace, hub: Hub, command: Any, res: Dict[str, Any], body: Dict[str, Any],
+                       meta: Dict[str, Any], env: Dict[str, str], beat_every: float, why: str, tid: Optional[int]) -> int:
+    """F-07: the shared queue dir can't be used safely (another user created /tmp/avm-queue first, a symlink, a file
+    planted in it...). No ticket goes there, but that must not cost anyone their job: like an untracked run when the
+    hub is down (E-08), the command runs now - without admission control - and says so on stderr and on the task.
+    `tid`: the task already created while queued, if any."""
+    why = " ".join(why.split())
+    _say("avm: WARNING: queue disabled: %s; running without admission control\n" % why)
+    note = "queue disabled (%s): ran without admission control" % why[:300]
+    args.queue_note = note   # appended to the finish note by _execute
+    meta["queue"] = {"disabled": why[:300]}
+    meta["note"] = "%s; %s" % (args.note, note) if args.note else note
+    code = _code_identity(os.getcwd())
+    if code:
+        meta["code"] = code
+        env["AVM_CODE_SHA"] = code["sha"] + ("-dirty" if code["dirty"] else "")
+    env["AVM_STARTED_AT"] = "%d" % time.time()
+    if tid is None:
+        tid = _try_start(hub, dict(body, expect_beat=beat_every * 2, meta=meta))
+    else:
+        hub.try_call("/tasks/%d/beat" % tid, {"status": "running", "note": note,
+                                              "meta": {k: meta[k] for k in ("queue", "code", "note") if k in meta}})
+    if tid is not None:
+        env["AVM_TASK_ID"] = str(tid)
+        _say("avm: task #%d '%s' started [%s] without the queue\n" % (tid, args.name, _res_text(res)))
+    else:
+        _say("avm: untracked: %s - running '%s' [%s] anyway\n" % (hub.last_error, args.name, _res_text(res)))
+    return _execute(hub, args, command, tid, beat_every, env)
+
+
 def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, res: Dict[str, Any], max_wait: Optional[float]) -> int:
-    """avm run with resource tags and/or --wait: declare, queue until it fits, then run exactly like a plain avm run."""
-    try:
-        q = Queue(hub.cfg)
-    except QueueUnsafe as e:
-        sys.stderr.write("avm: %s\n" % e)
-        return 2
+    """avm run with resource tags and/or --wait: declare, queue until it fits, then run exactly like a plain avm run.
+    A queue dir that can't be used safely never stops the command: it runs without admission control (F-07)."""
     beat_every = max(MIN_BEAT, float(args.beat))
     log_on = getattr(args, "task_log", True)
     meta: Dict[str, Any] = {"hostname": socket.gethostname(), "resources": res}
@@ -942,6 +986,15 @@ def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, re
     env = dict(os.environ)
     if not log_on:
         env["AVM_TASK_LOG"] = "off"   # nested avm calls in the job stay quiet too
+    try:
+        q = Queue(hub.cfg)
+    except QueueUnsafe as e:
+        if args.wait:
+            why = _impossible(res, _headroom(hub.cfg))   # a property of the host, not of the queue dir
+            if why:
+                sys.stderr.write("avm: '%s' can never start on this host: %s\n" % (args.name, why))
+                return 2
+        return _run_without_queue(args, hub, command, res, body, meta, env, beat_every, str(e), None)
 
     parent = os.environ.get("AVM_QUEUE_HOLD")
     if parent and q._alive(parent):   # nested inside a queued job: use its reservation, never wait behind it
@@ -959,68 +1012,72 @@ def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, re
         if why:
             sys.stderr.write("avm: '%s' can never start on this host: %s\n" % (args.name, why))
             return 2
-    q.register({"name": args.name, "state": "waiting" if args.wait else "running", **res,
-                **({} if args.wait else {"started_at": time.time()})})
     tid: Optional[int] = None
     try:
-        if args.wait:
-            ok, why, pos = q.try_admit()
-            if not ok:
-                since = q.me["queued_at"] if q.me else time.time()
-                meta["queue"] = {"since": since, "reason": why, "position": pos, "max_wait": max_wait}
-                tid = _try_start(hub, dict(body, status="queued", expect_beat=max(QUEUE_BEAT, beat_every) * 2))
-                sys.stderr.write("avm: '%s' queued (%s)%s\n" % (args.name, why, "; task #%d" % tid if tid is not None else ""))
+        try:   # F-07: a file planted in the queue dir (or a dir that turned unsafe) -> run without admission
+            q.register({"name": args.name, "state": "waiting" if args.wait else "running", **res,
+                        **({} if args.wait else {"started_at": time.time()})})
+            if args.wait:
+                ok, why, pos = q.try_admit()
+                if not ok:
+                    since = q.me["queued_at"] if q.me else time.time()
+                    meta["queue"] = {"since": since, "reason": why, "position": pos, "max_wait": max_wait}
+                    tid = _try_start(hub, dict(body, status="queued", expect_beat=max(QUEUE_BEAT, beat_every) * 2))
+                    sys.stderr.write("avm: '%s' queued (%s)%s\n" % (args.name, why, "; task #%d" % tid if tid is not None else ""))
 
-                def interrupted(signum, frame):
-                    raise KeyboardInterrupt
-                previous = {}
-                for name in ("SIGTERM", "SIGHUP"):   # killed or hung up while waiting: finish the task as cancelled
-                    sig = getattr(signal, name, None)
-                    if sig is None:
-                        continue
-                    try:
-                        previous[sig] = signal.signal(sig, interrupted)
-                    except (ValueError, OSError):
-                        pass
-                last_beat, last_why = time.time(), why
-                try:
-                    while True:
-                        time.sleep(QUEUE_POLL)
-                        ok, why, pos = q.try_admit()
-                        if ok:
-                            break
-                        waited = time.time() - since
-                        if max_wait is not None and waited >= max_wait:
-                            note = "gave up after waiting %s (--max-wait): %s" % (_fmt_dur(waited), why)
-                            if tid is not None:
-                                hub.try_call("/tasks/%d/finish" % tid, {"status": "failed", "rc": EXIT_GAVE_UP, "note": note})
-                            sys.stderr.write("avm: '%s' %s\n" % (args.name, note))
-                            return EXIT_GAVE_UP
-                        if why != last_why:
-                            sys.stderr.write("avm: '%s' still queued: %s\n" % (args.name, why))
-                            last_why = why
-                        if time.time() - last_beat >= QUEUE_BEAT:
-                            last_beat = time.time()
-                            meta["queue"] = {"since": since, "reason": why, "position": pos, "max_wait": max_wait}
-                            if tid is None:   # the hub was unreachable when we queued: try again
-                                tid = _try_start(hub, dict(body, status="queued", expect_beat=max(QUEUE_BEAT, beat_every) * 2))
-                            else:
-                                hub.try_call("/tasks/%d/beat" % tid, {"status": "queued", "meta": {"queue": meta["queue"]}})
-                except KeyboardInterrupt:
-                    if tid is not None:
-                        hub.try_call("/tasks/%d/finish" % tid, {"status": "failed", "rc": 130, "note": "cancelled while queued"})
-                    sys.stderr.write("avm: '%s' cancelled while queued\n" % args.name)
-                    return 130
-                finally:
-                    for sig, handler in previous.items():
+                    def interrupted(signum, frame):
+                        raise KeyboardInterrupt
+                    previous = {}
+                    for name in ("SIGTERM", "SIGHUP"):   # killed or hung up while waiting: finish the task as cancelled
+                        sig = getattr(signal, name, None)
+                        if sig is None:
+                            continue
                         try:
-                            signal.signal(sig, handler)
-                        except (ValueError, OSError, TypeError):
+                            previous[sig] = signal.signal(sig, interrupted)
+                        except (ValueError, OSError):
                             pass
-                meta["queue"] = {"since": since, "waited": time.time() - since}
-                sys.stderr.write("avm: '%s' admitted after %s\n" % (args.name, _fmt_dur(time.time() - since)))
-            else:
-                meta["queue"] = {"since": q.me["queued_at"] if q.me else time.time(), "waited": 0}
+                    last_beat, last_why = time.time(), why
+                    try:
+                        while True:
+                            time.sleep(QUEUE_POLL)
+                            ok, why, pos = q.try_admit()
+                            if ok:
+                                break
+                            waited = time.time() - since
+                            if max_wait is not None and waited >= max_wait:
+                                note = "gave up after waiting %s (--max-wait): %s" % (_fmt_dur(waited), why)
+                                if tid is not None:
+                                    hub.try_call("/tasks/%d/finish" % tid, {"status": "failed", "rc": EXIT_GAVE_UP, "note": note})
+                                sys.stderr.write("avm: '%s' %s\n" % (args.name, note))
+                                return EXIT_GAVE_UP
+                            if why != last_why:
+                                sys.stderr.write("avm: '%s' still queued: %s\n" % (args.name, why))
+                                last_why = why
+                            if time.time() - last_beat >= QUEUE_BEAT:
+                                last_beat = time.time()
+                                meta["queue"] = {"since": since, "reason": why, "position": pos, "max_wait": max_wait}
+                                if tid is None:   # the hub was unreachable when we queued: try again
+                                    tid = _try_start(hub, dict(body, status="queued", expect_beat=max(QUEUE_BEAT, beat_every) * 2))
+                                else:
+                                    hub.try_call("/tasks/%d/beat" % tid, {"status": "queued", "meta": {"queue": meta["queue"]}})
+                    except KeyboardInterrupt:
+                        if tid is not None:
+                            hub.try_call("/tasks/%d/finish" % tid, {"status": "failed", "rc": 130, "note": "cancelled while queued"})
+                        sys.stderr.write("avm: '%s' cancelled while queued\n" % args.name)
+                        return 130
+                    finally:
+                        for sig, handler in previous.items():
+                            try:
+                                signal.signal(sig, handler)
+                            except (ValueError, OSError, TypeError):
+                                pass
+                    meta["queue"] = {"since": since, "waited": time.time() - since}
+                    sys.stderr.write("avm: '%s' admitted after %s\n" % (args.name, _fmt_dur(time.time() - since)))
+                else:
+                    meta["queue"] = {"since": q.me["queued_at"] if q.me else time.time(), "waited": 0}
+        except (QueueUnsafe, OSError) as e:
+            q.release()
+            return _run_without_queue(args, hub, command, res, body, meta, env, beat_every, str(e), tid)
         code = _code_identity(os.getcwd())
         if code:
             meta["code"] = code

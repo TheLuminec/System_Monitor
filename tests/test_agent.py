@@ -176,7 +176,7 @@ def test_root_agent_refuses_prompts_and_actions(monkeypatch):
 
 def test_policy_reported_to_hub():
     rep = _Runner(AVM_MAX_JOB_MODE="acceptEdits", AVM_JOB_TRANSCRIPT="summary").report()
-    assert rep["policy"] == {"max_mode": "acceptEdits", "actions": True, "jobs": True, "transcript": "summary"}
+    assert rep["policy"] == {"max_mode": "acceptEdits", "actions": True, "jobs": True, "transcript": "summary", "snippets": False}
 
 
 def test_prompt_is_passed_after_double_dash(monkeypatch, tmp_path):

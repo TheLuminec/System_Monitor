@@ -5,7 +5,7 @@ import pytest
 from fastapi.routing import APIRoute
 from starlette.websockets import WebSocketDisconnect
 
-from conftest import WRITE, access_token
+from conftest import WRITE, access_token, report_policy
 from avalon_monitor import core
 from avalon_monitor.config import settings
 
@@ -77,7 +77,8 @@ def test_every_write_route_refuses_trusted_network(client, method, path, guard):
     assert r.status_code == {"operator": 403, "agent": 401, "ingest": 401}[guard], (method, path, r.status_code, r.text)
 
 
-def test_access_login_may_change_things(tunnel, host):
+def test_access_login_may_change_things(tunnel, agent, host):
+    report_policy(agent)
     cfg = tunnel.get("/api/v1/config").json()
     assert cfg["user"] == {"subject": "owner@example.test", "method": "access"} and cfg["can_change"] is True
     r = tunnel.post("/api/v1/claude/jobs", headers=WRITE, json={"host": host[0].name, "prompt": "hello", "mode": "plan"})

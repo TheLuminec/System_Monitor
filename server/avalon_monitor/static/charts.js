@@ -1,6 +1,6 @@
 // Minimal canvas time-series chart + sparkline. No dependencies.
 // TimeChart: multi-series line/area, recessive grid, crosshair tooltip, live append.
-import { esc } from "./core.js?v=1.12.0";
+import { esc } from "./core.js?v=1.12.1";
 
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 

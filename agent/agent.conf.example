@@ -71,6 +71,9 @@ AVM_AUTO_UPDATE=true
 #AVM_ALLOW_ROOT_JOBS=false
 # What a prompt's transcript sends to the hub: full | summary (final answer + tool names only) | off (status only).
 #AVM_JOB_TRANSCRIPT=full
+# First/last lines of every Claude session on this host + claude processes' arguments in each report:
+# on | off | auto (= on only when AVM_JOB_TRANSCRIPT=full).
+#AVM_SESSION_SNIPPETS=auto
 # Directories a hub-added content check may read from (comma list; symlinks are resolved). Content checks listed in
 # this file are always allowed. Empty: hub-added content checks are refused.
 #AVM_CONTENT_ROOTS=

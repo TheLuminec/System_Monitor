@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from .auth import Identity
+from . import datause
 from .core import db, hub, require_agent, require_same_origin, require_operator, require_viewer
 from .db import HostRow
 
@@ -106,8 +107,9 @@ async def _emit_task(t: dict) -> None:
 async def task_start(body: TaskStart, host: HostRow = Depends(require_agent)):
     if body.source not in ("run", "task", "watch"):
         raise HTTPException(422, "source must be run, task or watch")
-    t = await run_in_threadpool(db.task_create, host.id, body.name, body.source, body.expect_beat, body.command,
-                                body.cwd, body.pid, body.user, body.meta, body.status)
+    hide = datause.restricted(host)   # data-use host: no command lines or paths (they can name the data)
+    t = await run_in_threadpool(db.task_create, host.id, body.name, body.source, body.expect_beat, None if hide else body.command,
+                                None if hide else body.cwd, body.pid, body.user, body.meta, body.status)
     log.info("task #%d '%s' %s on %s", t["id"], t["name"], "queued" if body.status == "queued" else "started", host.name)
     await _emit_task(t)
     return {"ok": True, "id": t["id"], "task": task_public(t)}
@@ -115,7 +117,8 @@ async def task_start(body: TaskStart, host: HostRow = Depends(require_agent)):
 
 @router.post("/tasks/{task_id}/beat")
 async def task_beat(task_id: int, body: TaskUpdate, host: HostRow = Depends(require_agent)):
-    t = await run_in_threadpool(db.task_update, task_id, host.id, progress=body.progress, log_lines=body.log, note=body.note, pid=body.pid,
+    t = await run_in_threadpool(db.task_update, task_id, host.id, progress=body.progress, note=body.note, pid=body.pid,
+                                log_lines=None if datause.restricted(host) else body.log,
                                 status=body.status, meta=body.meta)
     if t is None:
         raise HTTPException(404, "no such task on this host")
@@ -127,7 +130,8 @@ async def task_beat(task_id: int, body: TaskUpdate, host: HostRow = Depends(requ
 async def task_finish(task_id: int, body: TaskFinish, host: HostRow = Depends(require_agent)):
     if body.status not in ("done", "failed"):
         raise HTTPException(422, "status must be done or failed")
-    t = await run_in_threadpool(db.task_update, task_id, host.id, status=body.status, rc=body.rc, log_lines=body.log, note=body.note)
+    t = await run_in_threadpool(db.task_update, task_id, host.id, status=body.status, rc=body.rc, note=body.note,
+                                log_lines=None if datause.restricted(host) else body.log)
     if t is None:
         raise HTTPException(404, "no such task on this host")
     (log.warning if body.status == "failed" else log.info)("task #%d '%s' %s on %s (rc=%s)", t["id"], t["name"], body.status, host.name, body.rc)
@@ -223,6 +227,26 @@ class JobFinish(BaseModel):
     new_key: Optional[str] = Field(default=None, max_length=80)   # restart came back as a new background agent
 
 
+MODE_RANK = {"plan": 0, "acceptEdits": 1, "full": 2}
+
+
+def host_policy_refusal(h: HostRow, mode: Optional[str] = None, action: Optional[str] = None) -> Optional[str]:
+    """The hub's check of what a host's agent says it will accept (agent 1.9+ reports claude.policy): refuse up front
+    what it would refuse anyway - and everything for agents that report no policy, which enforce no local cap."""
+    policy = ((h.last_sample or {}).get("claude") or {}).get("policy")
+    if not isinstance(policy, dict):
+        return (f"{h.name}'s agent reports no local policy (older than 1.9), so it enforces no limits of its own: "
+                "prompts and restarts are refused until it updates")
+    if not policy.get("jobs", True):
+        return f"{h.name}'s agent runs as root/SYSTEM and refuses prompts and actions (AVM_ALLOW_ROOT_JOBS in its agent.conf)"
+    if action and not policy.get("actions", True):
+        return f"{h.name} doesn't allow restart/stop from the dashboard (AVM_ALLOW_ACTIONS in its agent.conf)"
+    cap = policy.get("max_mode") if policy.get("max_mode") in MODE_RANK else "plan"
+    if mode and MODE_RANK.get(mode, 99) > MODE_RANK[cap]:
+        return f"{h.name} allows prompts up to {cap} (AVM_MAX_JOB_MODE in its agent.conf; the hub can't raise it)"
+    return None
+
+
 @router.post("/claude/jobs")
 async def job_create(body: JobCreate, request: Request, ident: Identity = Depends(require_operator)):
     require_same_origin(request)
@@ -237,6 +261,9 @@ async def job_create(body: JobCreate, request: Request, ident: Identity = Depend
         # Claude Desktop's bundled CLI gets its login from the app; started by the agent it fails with "OAuth session expired".
         raise HTTPException(422, f"{h.name} only has Claude Desktop's built-in Claude Code, which can't run prompts outside the app. "
                                  "Install the Claude Code CLI there (and log in once) to prompt it from the dashboard.")
+    why = host_policy_refusal(h, mode=body.mode)
+    if why:
+        raise HTTPException(409, why)
     j = await run_in_threadpool(db.job_create, h.id, body.prompt, body.cwd, body.mode, body.model, body.resume_session, ident.subject)
     log.info("%s queued claude job #%d on %s (mode=%s)", ident.subject, j["id"], h.name, body.mode)
     await hub.broadcast({"type": "claude_job", "job": job_public(j)})
@@ -306,7 +333,8 @@ async def job_started(job_id: int, body: JobStart, host: HostRow = Depends(requi
 
 @router.post("/claude/jobs/{job_id}/events")
 async def job_events(job_id: int, body: JobEvents, host: HostRow = Depends(require_agent)):
-    stored = await run_in_threadpool(db.job_add_events, job_id, host.id, body.events)
+    events = [datause.scrub_event(e) for e in body.events] if datause.restricted(host) else body.events
+    stored = await run_in_threadpool(db.job_add_events, job_id, host.id, events)
     if not stored and body.events:
         raise HTTPException(404, "no such job on this host")
     sid = next((e.get("session_id") for _, e in stored if e.get("type") == "system" and e.get("session_id")), None)
@@ -402,6 +430,10 @@ async def tracked_action(tid: int, body: TrackAction, request: Request, ident: I
         raise HTTPException(404, "not tracked")
     if t["kind"] == "desktop":
         raise HTTPException(422, "Claude Desktop sessions belong to the Desktop app: reopen or close them there.")
+    h = await run_in_threadpool(db.host_by_id, t["host_id"])
+    why = host_policy_refusal(h, action=body.action) if h else "host gone"
+    if why:
+        raise HTTPException(409, why)
     label = t["name"] or t["key"][:8]
     target = {"key": t["key"], "session_id": t["session_id"], "kind": t["kind"], "name": t["name"], "cwd": t["cwd"]}
     prompt = body.prompt or "You were restarted from the Avalon Monitor dashboard. Re-read your recent context and pick up where you left off."

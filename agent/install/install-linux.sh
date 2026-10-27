@@ -98,6 +98,25 @@ chmod +x "$BIN_DIR/avm"
 [[ $USER_MODE -eq 1 ]] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]] && echo "    note: add ~/.local/bin to your PATH to use 'avm' directly"
 if [[ $USER_MODE -eq 0 ]]; then chmod 644 "$ETC_DIR/agent.conf" 2>/dev/null; chgrp "$(id -gn "${SUDO_USER:-root}")" "$ETC_DIR/agent.conf" 2>/dev/null || true; chmod 640 "$ETC_DIR/agent.conf"; fi
 
+# avm's shared queue dir (audit F-07): a root-owned 1777 /run/avm-queue, recreated at every boot. Without it avm
+# falls back to /tmp/avm-queue, which the first user to queue after a reboot owns; every other user's queued jobs
+# then run without admission control (with a warning). Root mode only: --user installs can't write /etc.
+if [[ $USER_MODE -eq 0 ]]; then
+  TMPFILES_CONF=/etc/tmpfiles.d/avm-queue.conf
+  TMPFILES_LINE='d /run/avm-queue 1777 root root -'
+  if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    echo "==> avm queue dir (/run/avm-queue via $TMPFILES_CONF)"
+    mkdir -p /etc/tmpfiles.d
+    if [[ "$(cat "$TMPFILES_CONF" 2>/dev/null)" != "$TMPFILES_LINE" ]]; then
+      printf '%s\n' "$TMPFILES_LINE" > "$TMPFILES_CONF"
+      chmod 644 "$TMPFILES_CONF"
+    fi
+    systemd-tmpfiles --create "$TMPFILES_CONF" || echo "    (systemd-tmpfiles --create failed; /run/avm-queue appears at the next boot)"
+  else
+    echo "    note: no systemd-tmpfiles here; create /run/avm-queue (root:root, mode 1777) at boot for a shared avm queue"
+  fi
+fi
+
 echo "==> systemd ($SYSTEMCTL)"
 mkdir -p "$UNIT_DIR"
 # Rewrite the unit's paths for this install location; user units drop the root-only hardening keys.

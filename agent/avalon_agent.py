@@ -44,6 +44,8 @@ Local policy - only this file sets these; the hub can never override them:
     AVM_ALLOW_ROOT_JOBS false   run Claude prompts/actions when this agent runs as root/SYSTEM (refused otherwise)
     AVM_JOB_TRANSCRIPT  full    what a prompt's transcript sends to the hub: full | summary (final answer and tool
                                 names only - no tool inputs/results or intermediate text) | off (status only)
+    AVM_SESSION_SNIPPETS auto   first/last lines of every Claude session on this host (and claude processes' arguments)
+                                in each report: on | off | auto (= on only when AVM_JOB_TRANSCRIPT=full)
     AVM_CONTENT_ROOTS   (none)  directories a hub-added content check may read from; content checks listed in this
                                 file are always allowed, any other target must resolve (symlinks followed) inside one
     AVM_UPDATE_PUBKEYS  (built-in) Ed25519 public keys (hex, comma list) whose signature a self-update must carry
@@ -86,7 +88,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.9.0"
+AGENT_VERSION = "1.9.1"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -124,6 +126,7 @@ DEFAULTS = {
     "AVM_ALLOW_ACTIONS": "true",
     "AVM_ALLOW_ROOT_JOBS": "false",
     "AVM_JOB_TRANSCRIPT": "full",
+    "AVM_SESSION_SNIPPETS": "auto",
     "AVM_CONTENT_ROOTS": "",
     "AVM_UPDATE_PUBKEYS": "",
     "AVM_STATE_DIR": "",
@@ -998,9 +1001,13 @@ class ClaudeRunner:
         """This host's own limits on what the hub may ask (agent.conf only - never overridden by the hub)."""
         cap = self.cfg["AVM_MAX_JOB_MODE"].strip()
         transcript = self.cfg["AVM_JOB_TRANSCRIPT"].strip().lower()
+        transcript = transcript if transcript in ("full", "summary", "off") else "summary"
+        snippets = self.cfg["AVM_SESSION_SNIPPETS"].strip().lower()
         return {"max_mode": cap if cap in self.MODE_RANK else "plan", "actions": _on(self.cfg["AVM_ALLOW_ACTIONS"]),
                 "jobs": not (_running_as_root() and not _on(self.cfg["AVM_ALLOW_ROOT_JOBS"])),
-                "transcript": transcript if transcript in ("full", "summary", "off") else "summary"}
+                "transcript": transcript,
+                # session snippets follow the transcript level unless set: a host that keeps transcripts in keeps these too
+                "snippets": _on(snippets) if snippets in ("on", "off", "true", "false", "1", "0", "yes", "no") else transcript == "full"}
 
     def _refusal(self, job: Dict[str, Any]) -> Optional[str]:
         p = self.policy()
@@ -1328,14 +1335,21 @@ class ClaudeRunner:
                 continue
         return out[:30]
 
+    SNIPPET_KEYS = ("first_prompt", "last_user", "last_assistant", "last_said", "detail", "args")
+
     def report(self) -> Dict[str, Any]:
         with self.lock:
             cur = self.current
             running = {"id": cur["id"], "title": cur["title"], "started": cur["started"]} if cur else None
             queued = [q["id"] for q in self.queue]
+        sessions, processes, agents = _safe(self.sessions, default=[]), _safe(self.processes, default=[]), _safe(self.agents, default=[])
+        policy = self.policy()
+        if not policy["snippets"]:   # conversation text of every session on this host stays here: ids, names, state, times only
+            sessions, processes, agents = ([{k: v for k, v in d.items() if k not in self.SNIPPET_KEYS} for d in rows]
+                                           for rows in (sessions, processes, agents))
         return {"available": bool(self.bin), "bin": self.bin, "version": self.check_version(), "user": _whoami(), "home": self.home,
-                "sessions": _safe(self.sessions, default=[]), "processes": _safe(self.processes, default=[]),
-                "agents": _safe(self.agents, default=[]), "features": self.FEATURES, "policy": self.policy(),
+                "sessions": sessions, "processes": processes,
+                "agents": agents, "features": self.FEATURES, "policy": policy,
                 "bin_source": "desktop" if self._is_desktop_bundle(self.bin) else ("cli" if self.bin else None),
                 "running_job": running, "queued_jobs": queued}
 
@@ -1547,6 +1561,24 @@ class ClaudeRunner:
             time.sleep(3)
         return True
 
+    def _local_session(self, key: str, sid: str) -> Optional[Dict[str, Any]]:
+        """The session a restart/stop targets, as THIS host knows it: listed now by `claude agents` (with its real
+        kind), or a session whose transcript is on this host (an interactive session that has exited). None = unknown."""
+        rc, out = self._claude(["agents", "--json", "--all"], timeout=30)
+        try:
+            rows = json.loads(out[out.index("["):]) if rc == 0 and "[" in out else []
+        except ValueError:
+            rows = []
+        for r in rows if isinstance(rows, list) else []:
+            if isinstance(r, dict) and ((key and r.get("id") == key) or (sid and r.get("sessionId") == sid)):
+                kind = r.get("kind") or ""
+                if r.get("pid") and self._session_record(r["pid"]).get("entrypoint") == "claude-desktop" and kind != "background":
+                    kind = "desktop"
+                return {"kind": kind, "session_id": r.get("sessionId") or sid}
+        if sid and re.fullmatch(r"[0-9a-f-]{8,64}", sid) and self._transcript(sid):
+            return {"kind": "interactive", "session_id": sid}
+        return None
+
     def _run_action(self, job: Dict[str, Any]) -> None:
         """restart / stop a tracked session. Background agents restart in place (`claude respawn <id>`: same id, name and
         conversation); anything else - or a failed respawn - resumes as a new background agent, whose id is sent back
@@ -1555,6 +1587,13 @@ class ClaudeRunner:
         key, sid, cwd = t.get("key") or "", t.get("session_id") or "", t.get("cwd") or None
         self._post("/claude/jobs/%d/start" % jid, {})
         new_key = None
+        local = self._local_session(key, sid)
+        if local is None:   # only sessions this host knows - never ids (or kinds) the hub made up
+            self._post("/claude/jobs/%d/finish" % jid, {"status": "failed", "error": "refused: %s is not a Claude session on this "
+                                                       "host (not listed by `claude agents`, no transcript here)" % (key or sid)})
+            log.warning("claude %s refused: unknown session %s", action, key or sid)
+            return
+        t = dict(t, kind=local.get("kind") or "")   # what Claude says it is, not what the hub says
         if t.get("kind") == "desktop":   # the hub refuses these too; belt and braces for a job queued before that
             ok, out = False, "Claude Desktop sessions belong to the Desktop app: reopen or close them there."
         elif action == "stop":
@@ -1571,8 +1610,14 @@ class ClaudeRunner:
                         "\nRemote Control NOT linked after 60 s: only sessions on this machine can message it (and it can't "
                         "reach other machines) until it links; run /remote-control in it, or check the account's Remote Control.")
             if not ok and sid:
-                prompt = job.get("prompt") or "You were restarted from the Avalon Monitor dashboard. Pick up where you left off."
-                args = ["--bg", "--resume", sid] + (["-n", t["name"]] if t.get("name") else []) + ["--", prompt]
+                # Resuming starts a new process: it runs with THIS host's cap, whatever mode the session had (a session
+                # started with --dangerously-skip-permissions must not become a way to run hub text with full access),
+                # and hub-supplied text is only passed on where the host allows more than plan mode.
+                cap = self.policy()["max_mode"]
+                default = "You were restarted from the Avalon Monitor dashboard. Pick up where you left off."
+                prompt = (job.get("prompt") or default) if cap != "plan" else default
+                mode = ["--dangerously-skip-permissions"] if cap == "full" else ["--permission-mode", cap]
+                args = ["--bg", "--resume", sid] + mode + (["-n", t["name"]] if t.get("name") else []) + ["--", prompt]
                 rc2, out2 = self._claude(args, timeout=90, cwd=cwd)
                 out = (out + "\n" if out else "") + out2
                 m = re.search(r"backgrounded\W+([0-9a-f]{8})\b", out2)

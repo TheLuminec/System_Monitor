@@ -1,10 +1,10 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.12.0";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.12.1";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
          loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct, backupHealth,
-         canChange, roTip, guard } from "./core.js?v=1.12.0";
-import { renderResearch } from "./research.js?v=1.12.0";
-import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.12.0";
+         canChange, roTip, guard } from "./core.js?v=1.12.1";
+import { renderResearch } from "./research.js?v=1.12.1";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.12.1";
 
 // ------------------------------------------------------------------ shell
 const NAV = [
@@ -346,7 +346,7 @@ async function renderDetail(name) {
 // prompted, read-only, when the check starts failing) and expiry; adding and editing checks; and the few other host
 // settings. Agents manage the same rows with `avm check ...`. Saved on the hub, pushed to the agent on its next report.
 const TTL_OPTS = [["", "no expiry"], ["3600", "1 h"], ["21600", "6 h"], ["43200", "12 h"], ["86400", "1 day"], ["259200", "3 days"], ["604800", "7 days"]];
-const SETTING_LABELS = { AVM_COMMIT_WARN_PCT: ["Warn when memory commit above (%)", "85 (default) · off"], AVM_TAILSCALE_MIN: ["Minimum Tailscale version", "1.104.2 (default)"], AVM_PROCESSES: ["Top processes reported", "8"], AVM_TAGS: ["Tags", "comma-separated chips"] };
+const SETTING_LABELS = { AVM_COMMIT_WARN_PCT: ["Warn when memory commit above (%)", "85 (default) · off"], AVM_TAILSCALE_MIN: ["Minimum Tailscale version", "1.104.2 (default)"], AVM_DATA_USE: ["Data-use host (hub drops logs, transcripts, snippets)", "restricted · empty = off"], AVM_PROCESSES: ["Top processes reported", "8"], AVM_TAGS: ["Tags", "comma-separated chips"] };
 
 async function sendCommand(name, cmd) {
   try {

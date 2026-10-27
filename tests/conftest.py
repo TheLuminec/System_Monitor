@@ -87,3 +87,13 @@ def agent(app_obj, host):
     c.headers.update({"Authorization": f"Bearer {token}"})
     c.host_row = row
     return c
+
+
+def report_policy(agent_client, policy=None, **claude):
+    """Ingest one minimal sample for the agent's host carrying claude.policy (what agents 1.9+ report)."""
+    pol = {"max_mode": "plan", "actions": True, "jobs": True, "transcript": "full", "snippets": True} if policy is None else policy
+    body = {"ts": time.time(), "interval": 5, "host": {"hostname": "x", "agent_version": "1.9.0"},
+            "claude": {"available": True, "policy": pol, **claude}}
+    r = agent_client.post("/api/v1/ingest", json=body)
+    assert r.status_code == 200, r.text
+    return r.json()

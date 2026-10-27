@@ -114,9 +114,14 @@ RAM. `--wait` queues until the job fits (first come, first served among jobs com
 Without `--wait` the tags only declare.
 
 The queue lives in a directory shared by all users of the host: `/run/avm-queue` if it exists, else
-`/tmp/avm-queue` (Windows: `%ProgramData%\AvalonAgent\queue`; `AVM_QUEUE_DIR` overrides). avm refuses a queue
-dir that is a symlink, isn't owned by root or you, or is writable by others without the sticky bit (the same rules
-for its parents), and it never follows symlinks inside it. No installer creates `/run/avm-queue`. To have it at every boot on a multi-user host:
+`/tmp/avm-queue` (Windows: `%ProgramData%\AvalonAgent\queue`; `AVM_QUEUE_DIR` overrides). avm never puts a ticket
+in a queue dir that is a symlink, isn't owned by root or you, or is writable by others without the sticky bit (the
+same rules for its parents), and it never follows symlinks inside it. Such a dir never stops a job, though: `avm run`
+prints `queue disabled: <why>; running without admission control`, notes it on the task and runs the command at
+once, exit code passed through as usual (`avm queue status/drain/resume` report the error). On a multi-user host
+`/tmp/avm-queue` belongs to whoever queued first after a boot, so everyone else's jobs run unqueued. The fix is a
+root-owned `/run/avm-queue`: the root `install-linux.sh` creates it (a tmpfiles.d entry, so it comes back at every
+boot). For a host with only `--user` installs, once:
 
 ```bash
 echo 'd /run/avm-queue 1777 root root -' | sudo tee /etc/tmpfiles.d/avm-queue.conf && sudo systemd-tmpfiles --create
@@ -151,7 +156,11 @@ Two gates, one on each side:
 * **Host:** each agent caps what it accepts in its own `agent.conf`, which the hub can't override.
   `AVM_MAX_JOB_MODE` defaults to `plan`, so *Accept edits* and *Full access* are refused until a host raises it.
   `AVM_ALLOW_ACTIONS=false` blocks session restart/stop, and an agent running as root/SYSTEM refuses all prompts
-  unless `AVM_ALLOW_ROOT_JOBS=true`. `AVM_JOB_TRANSCRIPT=summary|off` limits what the transcript sends back.
+  unless `AVM_ALLOW_ROOT_JOBS=true`. `AVM_JOB_TRANSCRIPT=summary|off` limits what the transcript sends back
+  (and, unless `AVM_SESSION_SNIPPETS` says otherwise, the session snippets in each report). A restart that resumes
+  a session runs it at the host's own cap, whatever mode it was started with, and only on sessions the host itself
+  lists. The hub refuses prompts and restarts to agents that report no policy (older than 1.9) and anything above
+  a host's reported limit.
 
 Prompting needs the agent to run as a user with a Claude login: the rootless `--user` install on Linux, or
 `install-windows.ps1 -AsCurrentUser` on Windows. Set `AVM_CLAUDE=false` in an agent's config to opt a machine out

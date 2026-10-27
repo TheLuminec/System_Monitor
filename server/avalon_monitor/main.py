@@ -34,6 +34,7 @@ REMOTE_KEYS = (
     "AVM_MEM_AVAILABLE_WARN_GB", "AVM_PROCESSES", "AVM_TAGS",
     "AVM_COMMIT_WARN_PCT",   # hub/dashboard only (memory-commit warning threshold); agents ignore keys they don't know
     "AVM_TAILSCALE_MIN",     # hub only: lowest acceptable Tailscale version on this host (default checks.TAILSCALE_MIN)
+    "AVM_DATA_USE",          # hub only: "restricted" = data-use host, the hub drops file/conversation text (see datause.py)
 )
 AGENT_COMMANDS = ("respawn",)
 
@@ -41,6 +42,7 @@ AGENT_COMMANDS = ("respawn",)
 from .core import (AGENT_SCRIPT, AgentBundle, LiveHub, agent_bundle, authz, client_ip, db, gpu_stall, hub,  # noqa: F401
                    host_allowed, may_change, require_agent, require_operator, require_same_origin, require_viewer, same_origin)
 from . import checks as checks_mod
+from . import datause
 from .routes_checks import router as checks_router
 from .routes_ops import job_public, router as ops_router, task_public, tracked_public
 from .routes_results import router as results_router
@@ -310,6 +312,11 @@ async def ingest(request: Request):
         sample.checks.append(Check(name="duplicate agent", kind="rule", ok=False, detail=dup))
     for c in checks_mod.tailscale_checks(sample.tailscale, (host.check_config or {}).get("AVM_TAILSCALE_MIN")):
         sample.checks.append(Check(**c))
+    if datause.restricted(host, {"claude": sample.claude}):   # data-use host: keep conversation and file text off the hub
+        sample.claude = datause.scrub_claude(sample.claude)
+        for c in sample.checks:
+            if c.kind == "content" and c.ok:
+                c.detail = datause.WITHHELD
 
     await run_in_threadpool(db.record_sample, host, sample, ip)
     try:   # checks: adopt agent.conf checks once, state per row, responders on ok -> failing (never break ingest)
