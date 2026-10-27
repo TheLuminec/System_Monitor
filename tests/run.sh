@@ -6,7 +6,8 @@
 #                    py_compile on the agent and the backup scripts
 #
 # Runs every check, then exits non-zero if any failed. AVM_TEST_PYTHON picks the interpreter for pytest
-# (default: .venv/bin/python in the repo root).
+# (default: .venv/bin/python in the repo root). AVM_TEST_SKIP_PYTEST=1 runs only the static checks (what
+# deploy-hub.sh --skip-tests still runs).
 set -uo pipefail   # no -e: one failing check must not hide the others
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,7 +23,9 @@ each() {  # $1 = label, $2 = command (word-split on purpose), rest = files: run 
   if ((bad)); then echo "FAIL  $label" >&2; failed+=("$label"); else echo "ok    $label ($# files)"; fi
 }
 
-if [[ -x "$PY" ]]; then
+if [[ "${AVM_TEST_SKIP_PYTEST:-}" == 1 ]]; then
+  echo "skip  pytest (AVM_TEST_SKIP_PYTEST=1)"
+elif [[ -x "$PY" ]]; then
   if "$PY" -m pytest tests -q -p no:warnings; then echo "ok    pytest"; else echo "FAIL  pytest" >&2; failed+=(pytest); fi
 else
   echo "FAIL  pytest: no Python at $PY (create .venv, or set AVM_TEST_PYTHON)" >&2; failed+=(pytest)
@@ -45,4 +48,5 @@ if ((${#failed[@]})); then
   echo "tests/run.sh: ${#failed[@]} check(s) FAILED: ${failed[*]}" >&2
   exit 1
 fi
+if [[ "${AVM_TEST_SKIP_PYTEST:-}" == 1 ]]; then echo "tests/run.sh: all static checks passed (pytest SKIPPED)"; exit 0; fi
 echo "tests/run.sh: all checks passed"

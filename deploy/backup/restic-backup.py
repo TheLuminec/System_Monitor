@@ -10,9 +10,10 @@ the dashboard). Reads /etc/avalon-backup/config.json, then:
   5. writes the status file (read by the agent, shown as the host's Backups card) and touches the success stamp
 
 The final state is "ok", "partial" (a snapshot was saved but without some files, a missing source path or a fresh
-SQLite copy - `error` says which) or "failed". A run that is stopped (SIGTERM from systemd stop or TimeoutStartSec,
-SIGINT, SIGHUP) or crashes still writes "failed"; only SIGKILL/power loss can leave "running", which the dashboard
-treats as dead once it is older than max_run_sec.
+SQLite copy - `error` says which; a missing source path also leaves last_success where it was) or "failed". A run
+that is stopped (SIGTERM from systemd stop or TimeoutStartSec, SIGINT, SIGHUP) or crashes before its snapshot is
+saved and pruned still writes "failed" (stopped later, it is "ok"/"partial"); only SIGKILL/power loss can leave
+"running", which the dashboard treats as dead once it is older than max_run_sec.
 
 The status file is world-readable JSON - schema in docs/HOSTS.md ("Backups"). It never holds the password or file
 contents: only counts, sizes, times, the repository location, the backed-up paths and the paths that could not be read.
@@ -385,24 +386,46 @@ def backup(cfg, status, restic, started, fail):
             return fail(f"restic check exited {rc} - the repository may be damaged", rc)
         status["checked"] = time.time()
 
-    snaps = restic.json(["snapshots", "--tag", cfg["tag"]]) or []
+    # F-14: the snapshot is saved and pruned (and checked) - this run has succeeded. A stop from here on (systemd stop,
+    # TimeoutStartSec) only cuts the statistics short; it must not turn the run into a false "failed". The handler is
+    # still armed during the statistics (a restic listing a large repository can take minutes, and systemd SIGKILLs
+    # 90 s after its SIGTERM) and the stop signals are ignored for the final writes.
+    extra = {}
+    try:
+        extra["snapshots"] = len(restic.json(["snapshots", "--tag", cfg["tag"]]) or [])
+        local = os.path.isdir(cfg["repository"])
+        extra["repo_bytes"] = dir_bytes(cfg["repository"]) if local else None
+        extra["target_free_bytes"] = shutil.disk_usage(cfg["repository"]).free if local else None
+        extra["next_run"] = next_run(cfg["timer"])
+    except Stopped as e:   # on_stop_signal already ignores further stop signals; what was not measured keeps the last run's
+        try:
+            say("stopped by signal %d after the snapshot was saved - skipped the repository statistics" % e.signum)
+        except OSError:
+            pass
+    for s in STOP_SIGNALS:
+        signal.signal(s, signal.SIG_IGN)
     now = time.time()
-    # a partial run still advances last_success: its snapshot is saved and restorable for everything else, so the
-    # 26 h stale alert keeps meaning "no usable snapshot"; the "partial" state keeps the amber warning up until a
-    # clean run instead
-    status.update(state="partial" if problems else "ok", finished=now, duration_sec=round(now - started), last_success=now,
+    # last_success: a run whose snapshot misses a configured source path does NOT advance it (F-13). That path is not
+    # backed up at all, and a path gone for good (renamed, unmounted) would otherwise leave the card amber forever:
+    # this way the 26 h stale alert goes red one max_age_sec after the last run that had every path. Unreadable files
+    # or a failed SQLite copy still advance it - the snapshot holds everything else (and the previous SQLite copy) -
+    # and the "partial" state keeps the amber warning up until a clean run.
+    complete = not restic.missing
+    status.update(state="partial" if problems else "ok", finished=now, duration_sec=round(now - started),
+                  last_success=now if complete else status.get("last_success"),
                   error=problems or None, snapshot=summary["snapshot_id"][:8], files=summary.get("total_files_processed"),
                   bytes_scanned=summary.get("total_bytes_processed"), bytes_added=summary.get("data_added"),
                   files_new=summary.get("files_new"), files_changed=summary.get("files_changed"),
-                  warnings=warnings, snapshots=len(snaps),
-                  repo_bytes=dir_bytes(cfg["repository"]) if os.path.isdir(cfg["repository"]) else None,
-                  target_free_bytes=shutil.disk_usage(cfg["repository"]).free if os.path.isdir(cfg["repository"]) else None,
-                  next_run=next_run(cfg["timer"]))
+                  warnings=warnings, **extra)
     write_json(cfg["status_file"], status)
-    with open(cfg["stamp_file"], "w") as f:
-        f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z\n"))
-    os.chmod(cfg["stamp_file"], 0o644)
-    say("backup PARTIAL: " + problems if problems else "backup OK")
+    if complete:   # the stamp is "the end of the last successful run" (seed() reads it as last_success)
+        with open(cfg["stamp_file"], "w") as f:
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z\n"))
+        os.chmod(cfg["stamp_file"], 0o644)
+    try:   # stdout may be gone by now (avm stopped with the run): that must not make a saved backup "failed"
+        say(("backup PARTIAL: " + problems + ("" if complete else " - last success not advanced")) if problems else "backup OK")
+    except OSError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())   # nor fail the flush at exit
     return 0
 
 
