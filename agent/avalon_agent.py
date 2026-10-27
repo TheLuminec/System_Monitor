@@ -74,7 +74,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.8.0"
+AGENT_VERSION = "1.8.1"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -1081,6 +1081,28 @@ class ClaudeRunner:
         return {"cwd": cwd, "first_prompt": first_prompt, "last_user": last_user, "last_assistant": last_assistant,
                 "first_ts": first_ts, "last_ts": last_ts, "claude_version": version, "git_branch": branch}
 
+    _scope_prefix: Optional[List[str]] = None
+
+    def _own_scope(self, argv: List[str]) -> List[str]:
+        """Linux under systemd: start claude in its own transient scope (`systemd-run --scope` execs it in place, so the
+        pid, pipes and terminate() are unchanged). Whatever it starts - the background-session daemon and every session
+        it hosts - then lives outside the agent's service cgroup; otherwise stopping or restarting the agent service
+        kills every background Claude session on the host. Probed once; plain argv when unavailable."""
+        if self._scope_prefix is None:
+            self._scope_prefix = []
+            exe = shutil.which("systemd-run") if IS_LINUX and os.environ.get("INVOCATION_ID") else None
+            if exe:
+                try:
+                    with open("/proc/self/cgroup") as f:
+                        user = "/user@" in f.read()
+                    pre = [exe] + (["--user"] if user else []) + ["--scope", "--quiet", "--collect", "--"]
+                    if subprocess.run(pre + ["true"], capture_output=True, timeout=15).returncode == 0:
+                        self._scope_prefix = pre
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            log.info("claude processes run %s", "in their own systemd scope" if self._scope_prefix else "as agent children")
+        return self._scope_prefix + argv
+
     def _env(self) -> Dict[str, str]:
         """Environment for claude subprocesses: never inherit a parent Claude session; give it the user's tool dirs."""
         env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
@@ -1092,7 +1114,7 @@ class ClaudeRunner:
     def _claude(self, args: List[str], timeout: float, cwd: Optional[str] = None) -> Tuple[int, str]:
         """Run the claude CLI once; (returncode, stdout+stderr). Never raises."""
         try:
-            p = subprocess.run([self.bin] + args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            p = subprocess.run(self._own_scope([self.bin] + args), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
                                cwd=cwd if cwd and os.path.isdir(cwd) else self.home, env=self._env(), stdin=subprocess.DEVNULL,
                                **({"creationflags": 0x08000000} if IS_WINDOWS else {}))
             return p.returncode, (p.stdout or "") + (p.stderr or "")
@@ -1308,7 +1330,7 @@ class ClaudeRunner:
         env = self._env()
         env["AVM_CLAUDE_JOB"] = str(jid)
         try:
-            proc = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            proc = subprocess.Popen(self._own_scope(args), cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
                                     **({"creationflags": 0x08000000} if IS_WINDOWS else {}))
         except OSError as e:

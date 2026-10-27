@@ -122,9 +122,12 @@ class Restic:
         t.join(5)
         return p.returncode
 
-    def json(self, args):
-        out = subprocess.run(["restic", *args, "--json"], env=self.env, capture_output=True, text=True, timeout=600)
-        return json.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else None
+    def json(self, args, timeout=600):
+        try:
+            out = subprocess.run(["restic", *args, "--json"], env=self.env, capture_output=True, text=True, timeout=timeout)
+            return json.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else None
+        except (subprocess.SubprocessError, ValueError):
+            return None
 
 
 def snapshot_time(s):
@@ -140,15 +143,21 @@ def snapshot_time(s):
 
 def seed(cfg):
     """Write the status file from what the repository already holds (no backup): for a repository that existed before
-    this runner, so the dashboard card has data before the next scheduled run."""
+    this runner, so the dashboard card has data before the next scheduled run. Quick (snapshot list + repository size);
+    --count also counts the latest snapshot's files, which reads every tree in it (minutes for ~1M files)."""
     if cfg["require_mount"] and not os.path.ismount(cfg["require_mount"]):
         say(f"{cfg['require_mount']} is not mounted"); return 2
     restic = Restic(cfg)
-    snaps = restic.json(["snapshots", "--tag", cfg["tag"]]) or []
+    say("reading the snapshot list ...")
+    snaps = restic.json(["snapshots", "--tag", cfg["tag"]], timeout=300) or []
     if not snaps:
-        say("no snapshots with tag %r yet - nothing to seed" % cfg["tag"]); return 1
+        say("no snapshots with tag %r yet (or the repository could not be read) - nothing to seed" % cfg["tag"]); return 1
     latest = max(snaps, key=lambda s: s.get("time", ""))
-    stats = restic.json(["stats", "latest", "--tag", cfg["tag"]]) or {}
+    stats = {}
+    if "--count" in sys.argv[1:]:
+        say("counting the files in snapshot %s (can take several minutes) ..." % latest.get("short_id"))
+        stats = restic.json(["stats", "latest", "--tag", cfg["tag"]], timeout=3600) or {}
+    say("measuring the repository ...")
     when = snapshot_time(latest)
     try:
         when = os.stat(cfg["stamp_file"]).st_mtime   # the end of the last successful run, when there is one
@@ -161,7 +170,8 @@ def seed(cfg):
               "repo_bytes": dir_bytes(cfg["repository"]), "target_free_bytes": shutil.disk_usage(cfg["repository"]).free,
               "next_run": next_run(cfg["timer"]), "seeded": True}
     write_json(cfg["status_file"], status)
-    say("status seeded from snapshot %s (%s files, %s)" % (status["snapshot"], status["files"], gib(status["bytes_scanned"])))
+    say("status seeded from snapshot %s (%d snapshots, repository %s) - the card shows it within a few seconds"
+        % (status["snapshot"], len(snaps), gib(status["repo_bytes"])))
     return 0
 
 
