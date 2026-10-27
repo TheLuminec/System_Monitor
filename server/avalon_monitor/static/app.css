@@ -188,7 +188,17 @@ main { padding: 20px; max-width: 1800px; margin: 0 auto; }
 @media (max-width: 440px) { .tables { grid-template-columns: 1fr; } }
 .table-card { padding: 14px; min-width: 0; }   /* a grid item: let .table-wrap scroll instead of the card outgrowing its column (E-35) */
 .table-card h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; }
-.table-wrap { overflow-x: auto; }
+/* a table wider than its card scrolls; edge shadows say there is more to the side (the "local" covers scroll with the
+   content and hide a shadow once that edge is reached), and the scrollbar stays visible (F-20) */
+.table-wrap { overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent;
+  background: linear-gradient(to right, var(--surface) 30%, transparent) left / 24px 100% no-repeat local,
+    linear-gradient(to left, var(--surface) 30%, transparent) right / 24px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, color-mix(in srgb, var(--ink) 22%, transparent), transparent) left / 10px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, color-mix(in srgb, var(--ink) 22%, transparent), transparent) right / 10px 100% no-repeat scroll; }
+/* host page tables: drop low-value columns when their card is narrow (two columns at ~900-1300 px, or a phone), F-20 */
+.tables > .table-card { container-type: inline-size; }
+@container (max-width: 640px) { .hide-narrow { display: none; } td .bar { width: 56px; } }
+@container (max-width: 460px) { .hide-xnarrow { display: none; } }
 table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 th { text-align: left; font-weight: 500; color: var(--ink-3); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; padding: 4px 8px 6px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; white-space: nowrap; }
@@ -413,7 +423,11 @@ details.transcripts[open] > summary { margin-bottom: 10px; }
 .btn.active { background: color-mix(in srgb, var(--accent) 18%, transparent); border-color: var(--accent); }
 .btn.danger { color: var(--s-crit); border-color: color-mix(in srgb, var(--s-crit) 50%, transparent); }
 .btn.small { padding: 3px 10px; font-size: 12px; }
-.btn:disabled, .iconbtn:disabled, .prompt-box textarea:disabled { opacity: 0.5; cursor: not-allowed; }
+/* F-18: a disabled control (read-only viewer, a host's caps) looks disabled whatever its variant: no primary/danger/active
+   colours, no hover. The doubled selectors outrank .btn.primary, .btn.danger, .btn.active and .btn:hover. */
+button:disabled, .btn[disabled], .btn.btn:disabled, .btn.btn:disabled:hover, .iconbtn.iconbtn:disabled, .iconbtn.iconbtn:disabled:hover {
+  background: var(--surface-2); border-color: var(--border); color: var(--ink-3); box-shadow: none; opacity: 0.55; cursor: not-allowed; }
+input:disabled, select:disabled, textarea:disabled { opacity: 0.55; cursor: not-allowed; }
 .ro-link { text-decoration: underline; text-underline-offset: 2px; color: var(--s-warn); }
 
 .detail-head .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }

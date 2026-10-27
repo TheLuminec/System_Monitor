@@ -76,6 +76,8 @@ export const fmt = {
     return (i === 0 ? v.toFixed(0) : v.toFixed(v >= 100 ? 0 : 1)) + " " + u[i];
   },
   temp: (t) => (t == null ? "—" : Math.round(t) + "°C"),
+  // a sensor's high/critical limit: an unset one comes through as 0xFFFF kelvin (65262 °C) from older agents (F-19)
+  tempLimit: (t) => (t == null || !(t < 200) ? "—" : Math.round(t) + "°C"),
   watts: (w) => (w == null ? "—" : Math.round(w) + " W"),
   dur: (s) => {
     if (s == null) return "—";
@@ -118,6 +120,9 @@ export const ICON = {
   send: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4z"/></svg>',
 };
 
+// Free space on a host's root disk (E-34): the agent's own free figure, which excludes ext4's reserved blocks;
+// total - used only for an older agent that does not send it.
+export const diskFree = (d) => (d?.total ? d.free ?? d.total - d.used : null);
 export function levelFor(p, warn = 80, crit = 92) { return p == null ? "" : p >= crit ? "crit" : p >= warn ? "warn" : ""; }
 export function osLabel(host) { return host?.os_version || host?.os || "unknown"; }
 

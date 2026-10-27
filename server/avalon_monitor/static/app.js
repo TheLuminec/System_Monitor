@@ -1,7 +1,7 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
 import { TimeChart, drawSparkline } from "./charts.js?v=1.12.1";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
-         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct, backupHealth,
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct, backupHealth, diskFree,
          canChange, roTip, guard } from "./core.js?v=1.12.1";
 import { renderResearch } from "./research.js?v=1.12.1";
 import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.12.1";
@@ -152,7 +152,7 @@ function updateCard(card, host) {
   setMeter(m.cpu, fmt.pct(s.cpu?.percent), s.cpu?.load ? "load " + s.cpu.load[0].toFixed(2) : (s.cpu?.cores ? s.cpu.cores + " cores" : ""), s.cpu?.percent);
   setMeter(m.mem, fmt.pct(s.memory?.percent), s.memory?.total ? `${fmt.bytes(s.memory.used, 1)} of ${fmt.bytes(s.memory.total, 0)}` : "", s.memory?.percent);
   const dpct = s.disk?.percent ?? s.disk?.max_percent;
-  setMeter(m.disk, fmt.pct(dpct), s.disk?.total ? `${fmt.bytes(s.disk.free ?? s.disk.total - s.disk.used, 0)} free` : "", dpct, dpct == null);
+  setMeter(m.disk, fmt.pct(dpct), s.disk?.total ? `${fmt.bytes(diskFree(s.disk), 0)} free` : "", dpct, dpct == null);
   const g = s.gpus?.[0];
   if (g) {
     setMeter(m.gpu, fmt.pct(g.util_percent), g.mem_percent != null ? `vram ${fmt.pct(g.mem_percent)}` : "", g.util_percent);
@@ -510,17 +510,18 @@ function updateDetail(host) {
 
   const body = (id) => { const el = d.panels[id].querySelector('[data-f="body"]'); el.innerHTML = ""; return el; };
   const show = (id, yes) => d.panels[id]?.classList.toggle("hidden", d.hidden.has(id) || !yes);
-  const table = (head, rows) => h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...head.map((x) => h("th", { class: x.startsWith("r:") ? "r" : "" }, x.replace(/^r:/, ""))))), h("tbody", {}, ...rows)));
+  // head: "Label", "r:Label" (right-aligned), "...|hide-narrow" / "|hide-xnarrow": a low-value column dropped in a narrow card (F-20)
+  const table = (head, rows) => h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...head.map((x) => { const [l, c = ""] = x.split("|"); return h("th", { class: (l.startsWith("r:") ? "r " : "") + c }, l.replace(/^r:/, "")); }))), h("tbody", {}, ...rows)));
   const bar = (p, c = "var(--m-disk)") => h("span", { class: "bar" }, h("i", { style: `width:${p ?? 0}%; background:${levelFor(p) === "crit" ? "var(--s-crit)" : levelFor(p) === "warn" ? "var(--s-warn)" : c}` }));
   show("storage", (s.disks || []).length);
-  if ((s.disks || []).length) body("storage").append(table(["Mount", "Type", "r:Used", "r:Free", "r:Size", "r:"], s.disks.map((x) => h("tr", {},
-    h("td", { title: x.device }, x.mountpoint), h("td", { class: "muted" }, x.fstype), h("td", { class: "r num" }, fmt.pct(x.percent, 1)), h("td", { class: "r num" }, fmt.bytes(x.free, 0)), h("td", { class: "r num" }, fmt.bytes(x.total, 0)), h("td", { class: "r" }, bar(x.percent))))));
+  if ((s.disks || []).length) body("storage").append(table(["Mount", "Type|hide-narrow", "r:Used", "r:Free", "r:Size|hide-xnarrow", "r:"], s.disks.map((x) => h("tr", {},
+    h("td", { title: x.device }, x.mountpoint), h("td", { class: "muted hide-narrow" }, x.fstype), h("td", { class: "r num" }, fmt.pct(x.percent, 1)), h("td", { class: "r num" }, fmt.bytes(x.free, 0)), h("td", { class: "r num hide-xnarrow" }, fmt.bytes(x.total, 0)), h("td", { class: "r" }, bar(x.percent))))));
   show("gpus", (s.gpus || []).length);
-  if ((s.gpus || []).length) body("gpus").append(table(["GPU", "r:Util", "r:VRAM", "r:Temp", "r:Power", "r:Fan", "r:Clock"], s.gpus.map((g) => h("tr", {},
+  if ((s.gpus || []).length) body("gpus").append(table(["GPU", "r:Util", "r:VRAM", "r:Temp", "r:Power|hide-xnarrow", "r:Fan|hide-narrow", "r:Clock|hide-narrow"], s.gpus.map((g) => h("tr", {},
     h("td", { class: "wrap", title: `${g.vendor} via ${g.source}${g.state ? " · " + g.state : ""}` }, `${g.name}${g.state === "suspended" ? " (sleeping)" : ""}`), h("td", { class: "r num" }, fmt.pct(g.util_percent)),
     h("td", { class: "r num" }, g.mem_used != null && g.mem_total ? `${fmt.bytes(g.mem_used, 1)} / ${fmt.bytes(g.mem_total, 0)}` : fmt.pct(g.mem_percent)),
-    h("td", { class: "r num" }, fmt.temp(g.temp_c)), h("td", { class: "r num" }, g.power_w != null ? `${Math.round(g.power_w)}${g.power_limit_w ? " / " + Math.round(g.power_limit_w) : ""} W` : "—"),
-    h("td", { class: "r num" }, fmt.pct(g.fan_percent)), h("td", { class: "r num" }, g.clock_mhz != null ? Math.round(g.clock_mhz) + " MHz" : "—")))));
+    h("td", { class: "r num" }, fmt.temp(g.temp_c)), h("td", { class: "r num hide-xnarrow" }, g.power_w != null ? `${Math.round(g.power_w)}${g.power_limit_w ? " / " + Math.round(g.power_limit_w) : ""} W` : "—"),
+    h("td", { class: "r num hide-narrow" }, fmt.pct(g.fan_percent)), h("td", { class: "r num hide-narrow" }, g.clock_mhz != null ? Math.round(g.clock_mhz) + " MHz" : "—")))));
   show("procs", (s.processes || []).length);
   if ((s.processes || []).length) body("procs").append(table(["PID", "Name", "User", "r:CPU", "r:Memory"], s.processes.map((p) => h("tr", {},
     h("td", { class: "num muted" }, p.pid), h("td", {}, p.name), h("td", { class: "muted" }, p.user || ""), h("td", { class: "r num" }, fmt.pct(p.cpu_percent, 1)), h("td", { class: "r num" }, `${fmt.bytes(p.mem_rss, 0)} · ${fmt.pct(p.mem_percent, 1)}`)))));
@@ -529,7 +530,7 @@ function updateDetail(host) {
     h("td", {}, i.name), h("td", { class: "r num" }, fmt.bps(i.rx_bps)), h("td", { class: "r num" }, fmt.bps(i.tx_bps)), h("td", { class: "r num muted" }, i.speed_mbps ? i.speed_mbps + " Mb/s" : (i.up ? "up" : "down"))))));
   show("sensors", (s.temps || []).length);
   if ((s.temps || []).length) body("sensors").append(table(["Sensor", "r:Temp", "r:High", "r:Critical"], s.temps.map((x) => h("tr", {},
-    h("td", {}, x.label), h("td", { class: "r num" }, fmt.temp(x.current)), h("td", { class: "r num muted" }, fmt.temp(x.high)), h("td", { class: "r num muted" }, fmt.temp(x.critical))))));
+    h("td", {}, x.label), h("td", { class: "r num" }, fmt.temp(x.current)), h("td", { class: "r num muted" }, fmt.tempLimit(x.high)), h("td", { class: "r num muted" }, fmt.tempLimit(x.critical))))));
   show("backups", (s.backups || []).length);
   if ((s.backups || []).length) {
     const el = body("backups"), now = Date.now() / 1000;
