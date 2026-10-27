@@ -85,7 +85,7 @@ avm task start "data prep" --expect 300                 # manual lifecycle -> pr
 avm task beat ID --progress 0.4 --log "epoch 3"
 avm task done ID        |   avm task fail ID --rc 1 --note "why"
 avm task list
-avm results push xrsec docs/results/dashboard.json      # publish a results document to the Research tab
+avm results push myproject docs/results/dashboard.json      # publish a results document to the Research tab
 ```
 
 * `avm run` always runs the command. If the hub is down, rejects the token or there is no config, it prints
@@ -244,15 +244,15 @@ AVM_TAGS=gpu,training
 AVM_WATCH_PROCESSES=queue_runner.sh
 AVM_WATCH_FILES=/srv/queue/heartbeat:120
 AVM_WATCH_TCP=127.0.0.1:11434
-AVM_WATCH_MOUNTS=/run/media/feng/Data
+AVM_WATCH_MOUNTS=/run/media/<user>/Data
 # show a file's first line (e.g. the running job); globs that must match nothing (or glob::regex on content)
 AVM_WATCH_CONTENT=/srv/queue/current.txt
 AVM_WATCH_MARKERS=~/markers/*.done::rc=(?!0\b)
 # warn when a queue file is empty; systemd unit state (system: | user: | user@NAME:)
 AVM_WATCH_NONEMPTY=/srv/queue/queue.txt
-AVM_WATCH_UNITS=user:xrsec-queue.service
+AVM_WATCH_UNITS=user:train-queue.service
 # active scopes = "a job is running" (drives the GPU-stall rule); amber when MemAvailable drops below N GB
-AVM_WATCH_JOBS=user:xrsec-*.scope
+AVM_WATCH_JOBS=user:train-*.scope
 AVM_MEM_AVAILABLE_WARN_GB=8
 # Windows: LibreHardwareMonitor for temps / AMD-Intel GPUs
 AVM_LHM_URL=http://localhost:8085/data.json

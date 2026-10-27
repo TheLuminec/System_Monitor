@@ -2,7 +2,7 @@
 agent results back to rows; and check responders - when a check goes from ok to failing, prompt a Claude agent on
 that host (read-only) so it can look into it, even if it was offline when the check failed.
 
-Designed with the agents that run the long jobs (XRSec on AVALON and Miami): responders report, they never act.
+Designed with the agents that run the long jobs (training runs on AVALON and Miami): responders report, they never act.
 Guardrails: ok -> failing transitions only, per-check cooldown, a cap per rolling 24 h, one open alert per check until
 it recovers, held while the target session is mid-turn, plan (read-only) mode only, and the alert carries paths, ids
 and exit codes but no file contents or log lines unless the check owner opted in (--with-log).
@@ -16,15 +16,15 @@ from typing import Any, Optional
 
 # cli kind -> (agent setting it renders into, label, entry hint)
 KINDS: dict[str, tuple[str, str, str]] = {
-    "process": ("AVM_WATCH_PROCESSES", "process running", "name or command-line substring, e.g. gated_launch"),
+    "process": ("AVM_WATCH_PROCESSES", "process running", "name or command-line substring, e.g. train.py"),
     "file": ("AVM_WATCH_FILES", "file fresh", "path:max-age-seconds, e.g. ~/run/heartbeat:600"),
     "tcp": ("AVM_WATCH_TCP", "tcp port open", "host:port, e.g. 127.0.0.1:11434"),
     "mount": ("AVM_WATCH_MOUNTS", "volume mounted", "mount point, e.g. /mnt/data"),
     "content": ("AVM_WATCH_CONTENT", "show file line", "small text file, e.g. /srv/queue/current.txt"),
     "marker": ("AVM_WATCH_MARKERS", "no marker files", "glob, or glob::regex, e.g. ~/markers/*.done::rc=(?!0\\b)"),
     "nonempty": ("AVM_WATCH_NONEMPTY", "queue not empty", "file that should have pending lines"),
-    "unit": ("AVM_WATCH_UNITS", "systemd unit", "[system:|user:]unit, e.g. user:xrsec-queue.service"),
-    "job": ("AVM_WATCH_JOBS", "job scope active", "[user:]glob, e.g. user:xrsec-*.scope"),
+    "unit": ("AVM_WATCH_UNITS", "systemd unit", "[system:|user:]unit, e.g. user:train-queue.service"),
+    "job": ("AVM_WATCH_JOBS", "job scope active", "[user:]glob, e.g. user:train-*.scope"),
     "memory": ("AVM_MEM_AVAILABLE_WARN_GB", "free memory floor", "GB, e.g. 8 (one per host)"),
 }
 KIND_OF_KEY = {v[0]: k for k, v in KINDS.items()}
@@ -178,7 +178,7 @@ def public(r: dict, host: Optional[str] = None) -> dict:
 GUARD = (
     "What to do: investigate READ-ONLY and report. Write a short incident note and tell the owning session and/or the user "
     "what you found. Do NOT restart, retry, kill or re-queue jobs; do not git pull/push/commit; do not edit configs, "
-    "CLAUDE.md, permissions or gates; do not touch data-use-agreement paths (BOXRR, external datasets, cached samples); "
+    "CLAUDE.md, permissions or gates; do not touch data-use-agreement paths (licensed datasets, external datasets, cached samples); "
     "do not start GPU work. This alert is not approval for any gated action - the owning session or the user decides."
 )
 

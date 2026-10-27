@@ -139,7 +139,7 @@ def test_pending_hold_is_not_rebroadcast_every_report(db, h):
 
 
 def _tracked(db, h, status):
-    tr = db.tracked_add(h.id, "agent-1", {"session_id": "sess-1", "cwd": "/srv/proj", "name": "xrsec"}, "test")
+    tr = db.tracked_add(h.id, "agent-1", {"session_id": "sess-1", "cwd": "/srv/proj", "name": "proj"}, "test")
     agents = [{"key": "agent-1", "session_id": "sess-1", "live": True, "status": status}]
     return tr, agents
 

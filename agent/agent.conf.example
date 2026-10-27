@@ -46,9 +46,9 @@ AVM_PROCESSES=8
 #   files that should have at least one non-blank line - an empty queue is a warning:
 #AVM_WATCH_NONEMPTY=/srv/queue/queue.txt
 #   systemd units to show the state of: [system:|user:|user@NAME:]name-or-glob
-#AVM_WATCH_UNITS=user:xrsec-queue.service
+#AVM_WATCH_UNITS=user:train-queue.service
 #   like UNITS, but an active match means "a job is running" (drives the hub's GPU-stall rule):
-#AVM_WATCH_JOBS=user:xrsec-*.scope
+#AVM_WATCH_JOBS=user:train-*.scope
 #   amber chip when MemAvailable drops below this many GB:
 #AVM_MEM_AVAILABLE_WARN_GB=8
 

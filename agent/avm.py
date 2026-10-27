@@ -24,7 +24,7 @@ One command when you set something off:
         Publishes a results document (JSON, "<name>-results/<n>" schema) to the project's
         Research page; every push is kept as history. Aggregates only - the hub renders what you send.
 
-    avm agent track [--name "XRSec Coordinator"] [--note "..."]
+    avm agent track [--name "Project Coordinator"] [--note "..."]
         Run from inside a Claude Code session: registers that session on the dashboard's Agents page, where it
         stays listed (and can be restarted) even after it stops or the machine goes offline.
     avm agent untrack            (from inside the session)    avm agent list
@@ -1403,7 +1403,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p = sub.add_parser("results", help="publish a results document to the dashboard's Research page")
     rp = p.add_subparsers(dest="op", required=True)
-    s = rp.add_parser("push"); s.add_argument("project", help="project slug, e.g. xrsec"); s.add_argument("file", help="results JSON")
+    s = rp.add_parser("push"); s.add_argument("project", help="project slug, e.g. myproject"); s.add_argument("file", help="results JSON")
 
     p = sub.add_parser("agent", help="track this Claude Code session on the dashboard's Agents page")
     ap2 = p.add_subparsers(dest="op", required=True)
