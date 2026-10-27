@@ -1,9 +1,9 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.10.6";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.11.0";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
-         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct } from "./core.js?v=1.10.6";
-import { renderResearch } from "./research.js?v=1.10.6";
-import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.10.6";
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct, backupHealth } from "./core.js?v=1.11.0";
+import { renderResearch } from "./research.js?v=1.11.0";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.11.0";
 
 // ------------------------------------------------------------------ shell
 const NAV = [
@@ -185,6 +185,11 @@ function updateCard(card, host) {
     const cls = c.ok ? (c.kind === "unit" && !(c.value > 0) ? "" : "ok") : (c.level === "warning" ? "warn" : "bad");
     checks.append(h("span", { class: "chip " + cls, title: c.detail || "", html: (c.ok ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(label) }));
   }
+  for (const b of s.backups || []) {
+    const bh = backupHealth(b);
+    checks.append(h("span", { class: "chip " + (bh.level === "crit" ? "bad" : bh.level), title: `${b.name}: last success ${fmt.when(b.last_success)}${b.snapshot ? " · snapshot " + b.snapshot : ""}${b.next_run ? " · next run " + fmt.when(b.next_run) : ""}${b.error ? " · " + b.error : ""}`,
+      html: (bh.level === "ok" ? ICON.ok : ICON.bad).replace("<svg", '<svg width="11" height="11"') + esc(bh.label) }));
+  }
   const failed = [...state.tasks.values()].filter((x) => x.host === host.name && taskAlerting(x));
   for (const x of failed.slice(0, 3)) checks.append(h("span", { class: "chip " + (x.status === "failed" ? "bad" : "warn"), title: (x.note ? x.note + " · " : "") + "click to open (acknowledges the alert)", onclick: (e) => { e.stopPropagation(); ackTasks([x.id]); navigate(`#/tasks?open=${x.id}`); } }, `task ${x.status}: ${x.name}`));
   if (host.agent_update_error) checks.append(h("span", { class: "chip bad", title: host.agent_update_error }, "agent update failed"));
@@ -250,7 +255,7 @@ const CHARTS = [
   { id: "temp", title: "Temperature", yMax: null, format: (v) => Math.round(v) + "°C", series: [{ key: "cpu_temp", label: "CPU", color: "--c-blue" }, { key: "gpu_temp", label: "GPU", color: "--c-orange" }, { key: "temp_max", label: "hottest sensor", color: "--c-aqua" }] },
 ];
 const PANELS = [...CHARTS.map((c) => ({ id: c.id, title: c.title })), { id: "cores", title: "Per-core load" }, { id: "storage", title: "Storage" }, { id: "gpus", title: "GPUs" }, { id: "procs", title: "Top processes" },
-  { id: "net-if", title: "Network interfaces" }, { id: "sensors", title: "Sensors" }, { id: "hostinfo", title: "Host" }];
+  { id: "net-if", title: "Network interfaces" }, { id: "sensors", title: "Sensors" }, { id: "hostinfo", title: "Host" }, { id: "backups", title: "Backups" }];
 
 async function renderDetail(name) {
   const app = $("#app"); app.innerHTML = "";
@@ -298,7 +303,7 @@ async function renderDetail(name) {
   charts.append(panelCard("cores", "Per-core load", cores, "card chart-card cores-card"));
 
   const tables = h("div", { class: "tables", "data-f": "tables" });
-  for (const id of ["storage", "gpus", "procs", "net-if", "sensors", "hostinfo"]) tables.append(panelCard(id, PANELS.find((p) => p.id === id).title, h("div", { "data-f": "body" }), "card table-card"));
+  for (const id of ["backups", "storage", "gpus", "procs", "net-if", "sensors", "hostinfo"]) tables.append(panelCard(id, PANELS.find((p) => p.id === id).title, h("div", { "data-f": "body" }), "card table-card"));
   const checksPanel = h("div", { class: "card checks-panel", "data-f": "checks-panel" }, h("h3", {}, "Checks"));
 
   app.append(head, hiddenBar, kpis, charts, tables, checksPanel);
@@ -521,6 +526,30 @@ function updateDetail(host) {
   show("sensors", (s.temps || []).length);
   if ((s.temps || []).length) body("sensors").append(table(["Sensor", "r:Temp", "r:High", "r:Critical"], s.temps.map((x) => h("tr", {},
     h("td", {}, x.label), h("td", { class: "r num" }, fmt.temp(x.current)), h("td", { class: "r num muted" }, fmt.temp(x.high)), h("td", { class: "r num muted" }, fmt.temp(x.critical))))));
+  show("backups", (s.backups || []).length);
+  if ((s.backups || []).length) {
+    const el = body("backups"), now = Date.now() / 1000;
+    for (const b of s.backups) {
+      const bh = backupHealth(b, now);
+      const run = [...state.tasks.values()].filter((x) => x.host === host.name && x.name === b.name).sort((x, y) => y.started - x.started)[0];
+      const keep = b.keep ? Object.entries(b.keep).map(([k2, v]) => `${v} ${k2}`).join(" / ") : "";
+      el.append(h("div", { class: "backup-head" }, h("b", {}, b.name || "backup"), " ", chip(bh.label, bh.level === "crit" ? "bad" : bh.level),
+        run ? h("a", { href: `#/tasks?open=${run.id}`, class: "muted", style: "margin-left:8px" }, `last run: task #${run.id} (${run.status})`) : null));
+      el.append(h("dl", { class: "kvlist", style: "margin:6px 0 14px" },
+        ...[["Last success", b.last_success ? `${fmt.when(b.last_success)} · ${fmt.ago(now - b.last_success)}` : "never"],
+          ["Last run", b.state === "running" ? `running since ${fmt.when(b.started)}` : b.finished ? `${b.state} · ${fmt.when(b.finished)}${b.duration_sec != null ? " · took " + fmt.dur(b.duration_sec) : ""}` : null],
+          ["Error", b.error], ["Next run", b.next_run ? fmt.when(b.next_run) : null],
+          ["Snapshot", b.snapshot ? `${b.snapshot}${b.files != null ? ` · ${b.files.toLocaleString()} files` : ""}${b.bytes_scanned != null ? " · " + fmt.bytes(b.bytes_scanned) : ""}` : null],
+          ["Last run added", b.bytes_added != null ? `${fmt.bytes(b.bytes_added)} new data${b.files_new != null ? ` · ${b.files_new.toLocaleString()} new / ${(b.files_changed || 0).toLocaleString()} changed files` : ""}` : null],
+          ["Unreadable", b.warnings ? `${b.warnings} file${b.warnings === 1 ? "" : "s"} could not be read (snapshot still saved)` : null],
+          ["Repository", `${b.repository || "?"}${b.repo_bytes != null ? " · " + fmt.bytes(b.repo_bytes) : ""}${b.target_free_bytes != null ? " · " + fmt.bytes(b.target_free_bytes, 0) + " free" : ""}`],
+          ["Kept", b.snapshots != null ? `${b.snapshots} snapshot${b.snapshots === 1 ? "" : "s"}${keep ? " · keeps " + keep : ""}` : null],
+          ["Verified", b.checked ? `${fmt.when(b.checked)} (part of the data re-read)` : null],
+          ["Covers", (b.paths || []).join("  ")],
+          ["Note", b.seeded ? "read from the repository; per-run numbers appear after the next run" : null]]
+          .filter(([, v]) => v).flatMap(([k2, v]) => [h("dt", {}, k2), h("dd", {}, v)])));
+    }
+  }
   show("hostinfo", true);
   body("hostinfo").append(h("dl", { class: "kvlist" },
     ...[["Hostname", hi.hostname], ["OS", osLabel(hi)], ["Kernel", hi.kernel], ["Platform", hi.platform], ["CPU", hi.cpu_model], ["Cores", hi.cpu_count != null ? `${hi.cpu_count} logical · ${hi.cpu_count_physical ?? "?"} physical` : null],

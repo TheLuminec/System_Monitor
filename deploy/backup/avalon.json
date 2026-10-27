@@ -1,0 +1,18 @@
+{
+  "name": "AVALON nightly",
+  "repository": "/mnt/DataHoarder/restic-avalon",
+  "password_file": "/root/.restic-pass",
+  "require_mount": "/mnt/DataHoarder",
+  "paths": ["/etc", "/root", "/home", "/opt", "/usr/local/bin", "/usr/local/sbin", "/var/www", "/var/spool/cron",
+            "/var/lib/tailscale", "/var/lib/avalon-monitor", "/var/backups/avalon-monitor"],
+  "exclude": ["/home/*/.cache", "/home/*/.local/share/Trash", "/home/*/.npm", "/home/*/.claude/jobs/*/tmp", "/root/.cache",
+              "node_modules", "__pycache__", "/var/lib/avalon-monitor/monitor.db", "/var/lib/avalon-monitor/monitor.db-wal",
+              "/var/lib/avalon-monitor/monitor.db-shm"],
+  "sqlite": [["/var/lib/avalon-monitor/monitor.db", "/var/backups/avalon-monitor/monitor.db"]],
+  "keep": {"daily": 7, "weekly": 4, "monthly": 6},
+  "check_weekday": 7,
+  "check_subset": "5%",
+  "unit": "avalon-backup",
+  "schedule": "*-*-* 03:30",
+  "max_age_sec": 93600
+}

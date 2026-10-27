@@ -92,6 +92,8 @@ def _summary_of(sample: Optional[dict]) -> dict[str, Any]:
         "checks": checks,
         "checks_failing": sum(1 for c in checks if not c.get("ok") and c.get("level") != "info"),
         "top_process": max(sample.get("processes", []), key=lambda p: p.get("cpu_percent") or 0, default=None),
+        "backups": [{k: b.get(k) for k in ("name", "state", "last_success", "max_age_sec", "next_run", "error", "snapshot")}
+                    for b in (sample.get("backups") or []) if isinstance(b, dict)],
     }
 
 

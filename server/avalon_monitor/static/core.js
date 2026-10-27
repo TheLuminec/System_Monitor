@@ -24,6 +24,17 @@ export function commitWarnPct(host) {
   return n > 0 ? n : 85;
 }
 
+// A backup's health from its status file (deploy/backup/restic-backup.py): crit when nothing has succeeded within
+// max_age_sec (default 26 h) or it never has, warn when the last run failed but an older success is still fresh or
+// the first run is still going, else ok.
+export function backupHealth(b, now = Date.now() / 1000) {
+  const age = b?.last_success ? Math.max(0, now - b.last_success) : null;
+  if (age == null) return b?.state === "running" ? { level: "warn", label: "first backup running", age } : { level: "crit", label: "no backup yet", age };
+  if (age > (b.max_age_sec || 93600)) return { level: "crit", label: `last backup ${fmt.ago(age)}`, age };
+  if (b.state === "failed") return { level: "warn", label: "backup failed", age };
+  return { level: "ok", label: b.state === "running" ? "backup running" : `backup ${fmt.ago(age)}`, age };
+}
+
 export const fmt = {
   pct: (v, d = 0) => (v == null ? "—" : v.toFixed(d) + "%"),
   bytes: (b, d = 1) => {

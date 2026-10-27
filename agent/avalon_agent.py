@@ -28,6 +28,9 @@ Configuration (env vars override the config file; file is KEY=VALUE lines):
     AVM_WATCH_NONEMPTY  comma list of files that should have at least one non-blank line (e.g. queue.txt);
                         an empty one raises a warning chip - silence from a queue is not success
     AVM_LHM_URL         http://localhost:8085/data.json  (LibreHardwareMonitor on Windows)
+    AVM_BACKUP_STATUS   comma list of backup status files to report (the host's Backups card; written by
+                        deploy/backup/restic-backup.py). Default: /var/lib/avalon-backup/status.json, or
+                        C:\\ProgramData\\avalon-backup\\status.json on Windows; missing files are skipped
     AVM_AUTO_UPDATE     true    replace this script with the hub's copy when its hash changes, then respawn
     AVM_CLAUDE          true    report Claude Code sessions on this machine and run prompts sent from the dashboard
     AVM_CLAUDE_BIN      path to the `claude` CLI (default: found on PATH)
@@ -71,7 +74,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.7.3"
+AGENT_VERSION = "1.8.0"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -99,6 +102,7 @@ DEFAULTS = {
     "AVM_WATCH_JOBS": "",
     "AVM_MEM_AVAILABLE_WARN_GB": "",
     "AVM_LHM_URL": "",
+    "AVM_BACKUP_STATUS": "",
     "AVM_AUTO_UPDATE": "true",
     "AVM_CLAUDE": "true",
     "AVM_CLAUDE_BIN": "",
@@ -1575,6 +1579,30 @@ def collect_tailscale() -> Optional[Dict[str, Any]]:
     return out
 
 
+_BACKUP_KEYS = {"v", "name", "tool", "repository", "paths", "keep", "max_age_sec", "state", "started", "finished",
+                "duration_sec", "last_success", "next_run", "checked", "snapshot", "files", "bytes_scanned", "bytes_added",
+                "files_new", "files_changed", "warnings", "snapshots", "repo_bytes", "target_free_bytes", "error", "seeded"}
+
+
+def collect_backups(cfg: Dict[str, str]) -> Optional[List[Dict[str, Any]]]:
+    """Backup status files (JSON written by the backup job, see deploy/backup/restic-backup.py) for the host's Backups
+    card. Small, world-readable files; only known keys are passed on. None when this host has no backup set up."""
+    default = r"C:\ProgramData\avalon-backup\status.json" if IS_WINDOWS else "/var/lib/avalon-backup/status.json"
+    out = []
+    for path in _csv(cfg["AVM_BACKUP_STATUS"]) or [default]:
+        try:
+            if os.path.getsize(path) > 65536:
+                continue
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            st = os.stat(path)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            out.append({**{k: v for k, v in data.items() if k in _BACKUP_KEYS}, "status_file": path, "updated": st.st_mtime})
+    return out or None
+
+
 def collect_sample(cfg: Dict[str, str], interval: float) -> Dict[str, Any]:
     exclude_fs = [x.lower() for x in _csv(cfg["AVM_DISK_EXCLUDE_FS"])]
     lhm = _safe(gpus_lhm, cfg["AVM_LHM_URL"], default={"gpus": [], "cpu_temp": None})
@@ -1597,6 +1625,7 @@ def collect_sample(cfg: Dict[str, str], interval: float) -> Dict[str, Any]:
         "checks": _safe(collect_checks, cfg, default=[]),
         "claude": _safe(_CLAUDE.report) if _CLAUDE else None,
         "tailscale": _safe(collect_tailscale),
+        "backups": _safe(collect_backups, cfg),
     }
 
 

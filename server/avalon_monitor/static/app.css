@@ -198,6 +198,7 @@ td .bar { display: inline-block; width: 90px; height: 5px; border-radius: 999px;
 td .bar i { display: block; height: 100%; background: var(--c, var(--m-disk)); border-radius: 999px; }
 .kvlist { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 12.5px; }
 .kvlist dt { color: var(--ink-3); } .kvlist dd { margin: 0; word-break: break-word; }
+.backup-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13px; }
 
 .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 10px; padding: 8px 14px; font-size: 13px; box-shadow: var(--shadow); z-index: 30; display: none; }
 .toast.show { display: block; }

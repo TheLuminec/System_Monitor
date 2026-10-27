@@ -149,3 +149,4 @@ class Sample(BaseModel):
     checks: list[Check] = Field(default_factory=list)
     claude: Optional[dict] = None       # Claude Code availability, recent sessions, running job (agent 1.3+)
     tailscale: Optional[dict] = None    # agent 1.7.3+: version, ssh, app_connector, control, serve_unix (advisory checks)
+    backups: Optional[list[dict]] = None   # agent 1.8+: backup status files (Backups card; deploy/backup/restic-backup.py)

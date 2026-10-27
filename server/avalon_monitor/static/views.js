@@ -1,5 +1,5 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.10.6";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct, backupHealth } from "./core.js?v=1.11.0";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
@@ -600,6 +600,11 @@ export function computeAlerts() {
     const s = host.summary || {};
     if (host.status === "offline") out.push({ level: "crit", what: `${host.display_name} is offline`, why: `last seen ${fmt.ago(host.age_sec)}`, host: host.name, go: `#/host/${encodeURIComponent(host.name)}`, ts: host.last_seen });
     for (const c of s.checks || []) if (!c.ok && c.level !== "info") out.push({ level: c.level === "warning" ? "warn" : "crit", what: `${c.kind === "rule" ? "" : c.kind + " check: "}${c.name}`, why: c.detail || "", host: host.name, go: `#/host/${encodeURIComponent(host.name)}`, ts: s.ts });
+    for (const b of s.backups || []) {
+      const bh = backupHealth(b, now);
+      if (bh.level !== "ok" && b.state !== "running") out.push({ level: bh.level, what: `${bh.label}: ${b.name}`, why: b.error || `last success ${fmt.when(b.last_success)}${b.next_run ? " · next run " + fmt.when(b.next_run) : ""}`,
+        host: host.name, go: `#/host/${encodeURIComponent(host.name)}`, ts: b.finished || b.last_success });
+    }
     if (host.agent_update_error) out.push({ level: "warn", what: "agent self-update failed", why: host.agent_update_error, host: host.name, go: `#/host/${encodeURIComponent(host.name)}`, ts: s.ts });
     if (s.memory?.committed != null && s.memory?.commit_limit && (100 * s.memory.committed) / s.memory.commit_limit >= commitWarnPct(host)) out.push({ level: "warn", what: "memory commit pressure", why: `committed ${fmt.bytes(s.memory.committed)} of ${fmt.bytes(s.memory.commit_limit)}`, host: host.name, go: `#/host/${encodeURIComponent(host.name)}`, ts: s.ts });
   }

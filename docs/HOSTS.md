@@ -136,3 +136,33 @@ text is the coordinator's wording for the training role, not the hardware.)
 The Linux installer is distro-agnostic (`python3` + `venv` module required;
 `sudo apt install python3-venv` on Raspberry Pi OS). CPU temperature comes
 from `cpu_thermal` / `thermal_zone0`; there is no GPU reporting on the Pi.
+
+## Backups (Backups card, agent 1.8+)
+
+A host shows a **Backups** card (host page), a backup chip on its Overview tile, and an Alerts entry when a backup
+fails or nothing has succeeded within its `max_age_sec` (default 26 h) - whenever its agent finds a backup status file.
+The agent reads `/var/lib/avalon-backup/status.json` (`C:\ProgramData\avalon-backup\status.json` on Windows), or the
+comma list in `AVM_BACKUP_STATUS`.
+
+Linux with restic: write a config like [`deploy/backup/avalon.json`](../deploy/backup/avalon.json) and run
+
+```bash
+sudo deploy/backup/install-restic-backup.sh deploy/backup/<host>.json [--now]
+```
+
+It installs restic, creates the repository and its password if they don't exist (the password is printed once - keep
+it somewhere other than that machine), installs `deploy/backup/restic-backup.py` as a nightly systemd timer wrapped in
+`avm run` (each run is a task on the dashboard), and seeds the status file from an existing repository.
+
+Any other backup tool can feed the card by writing the same JSON (all keys optional except `name`; times are Unix
+seconds, sizes bytes):
+
+| key | meaning |
+|---|---|
+| `name`, `tool`, `repository`, `paths`, `keep` | what is backed up where, and the retention (`{"daily": 7, ...}`) |
+| `state` | `running`, `ok` or `failed` (the last run) |
+| `started`, `finished`, `duration_sec`, `next_run` | the last run and the next scheduled one |
+| `last_success`, `max_age_sec` | drives the chip colour and the stale alert |
+| `snapshot`, `files`, `bytes_scanned`, `bytes_added`, `files_new`, `files_changed`, `warnings` | the last run's result |
+| `snapshots`, `repo_bytes`, `target_free_bytes`, `checked` | the repository: snapshots kept, size, free space on its disk, last verify |
+| `error` | why the last run failed |
