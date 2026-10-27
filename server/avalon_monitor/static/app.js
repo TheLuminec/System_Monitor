@@ -346,7 +346,7 @@ async function renderDetail(name) {
 // prompted, read-only, when the check starts failing) and expiry; adding and editing checks; and the few other host
 // settings. Agents manage the same rows with `avm check ...`. Saved on the hub, pushed to the agent on its next report.
 const TTL_OPTS = [["", "no expiry"], ["3600", "1 h"], ["21600", "6 h"], ["43200", "12 h"], ["86400", "1 day"], ["259200", "3 days"], ["604800", "7 days"]];
-const SETTING_LABELS = { AVM_COMMIT_WARN_PCT: ["Warn when memory commit above (%)", "85 (default) · off"], AVM_TAILSCALE_MIN: ["Minimum Tailscale version", "1.104.2 (default)"], AVM_DATA_USE: ["Data-use host (hub drops logs, transcripts, snippets)", "restricted · empty = off"], AVM_PROCESSES: ["Top processes reported", "8"], AVM_TAGS: ["Tags", "comma-separated chips"] };
+const SETTING_LABELS = { AVM_COMMIT_WARN_PCT: ["Warn when memory commit above (%)", "85 (default) · off"], AVM_TAILSCALE_MIN: ["Minimum Tailscale version", "1.104.2 (default)"], AVM_DATA_USE: ["Data-use host (hub drops logs, transcripts, snippets, notes)", "restricted · off = lifted · empty = auto (set when the agent reports a restricted policy)"], AVM_PROCESSES: ["Top processes reported", "8"], AVM_TAGS: ["Tags", "comma-separated chips"] };
 
 async function sendCommand(name, cmd) {
   try {
@@ -408,7 +408,7 @@ async function renderChecksPanel(name, force = false) {
     const cls = st === "ok" ? "ok" : st === "failing" ? (r?.level === "warning" ? "warn" : "bad") : "";
     const respName = !c.notify ? "—" : c.notify === "new" ? "new read-only session" : (cl.responders.find((x) => x.value === c.notify)?.label || "tracked agent (gone)");
     const alert = c.open_job ? h("a", { class: "chip warn", href: `#/agents/${encodeURIComponent(name)}?job=${c.open_job}`, title: "the responder prompt sent for this failure" }, `alert #${c.open_job}`)
-      : c.pending ? h("span", { class: "chip", title: "held: the cap (alerts per rolling 24 h) is reached, it is cooling down, the target session is mid-turn, or there is nothing to prompt on this host yet - it goes out on a later report if the check is still failing" }, "alert pending") : null;
+      : c.pending ? h("span", { class: "chip", title: c.hold_reason ? `held: ${c.hold_reason} - it goes out on a later report if the check is still failing` : "held: the cap (alerts per rolling 24 h) is reached, it is cooling down, the target session is mid-turn, or there is nothing to prompt on this host yet - it goes out on a later report if the check is still failing" }, "alert pending") : null;
     const editTr = h("tr", { class: "check-edit", style: "display:none" });
     const closeEdit = () => { editTr.style.display = "none"; editTr.dataset.open = ""; };
     editTr.append(h("td", { colspan: 6 }, checkForm(cl, c, (body) => patch(c.id, body), closeEdit)));
