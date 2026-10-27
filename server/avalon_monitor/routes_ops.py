@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from .auth import Identity
-from .core import db, hub, require_agent, require_same_origin, require_viewer
+from .core import db, hub, require_agent, require_same_origin, require_operator, require_viewer
 from .db import HostRow
 
 log = logging.getLogger("avalon.ops")
@@ -169,7 +169,7 @@ class TaskAck(BaseModel):
 
 
 @router.post("/tasks/ack")
-async def tasks_ack(body: TaskAck, request: Request, ident: Identity = Depends(require_viewer)):
+async def tasks_ack(body: TaskAck, request: Request, ident: Identity = Depends(require_operator)):
     """Acknowledge failed/stalled/lost tasks so they stop alerting (they stay in the task list)."""
     require_same_origin(request)
     host_id = None
@@ -185,7 +185,7 @@ async def tasks_ack(body: TaskAck, request: Request, ident: Identity = Depends(r
 
 
 @router.delete("/tasks/{task_id}")
-async def task_delete(task_id: int, request: Request, ident: Identity = Depends(require_viewer)):
+async def task_delete(task_id: int, request: Request, ident: Identity = Depends(require_operator)):
     require_same_origin(request)
     if not await run_in_threadpool(db.task_delete, task_id):
         raise HTTPException(404, "no such task")
@@ -224,7 +224,7 @@ class JobFinish(BaseModel):
 
 
 @router.post("/claude/jobs")
-async def job_create(body: JobCreate, request: Request, ident: Identity = Depends(require_viewer)):
+async def job_create(body: JobCreate, request: Request, ident: Identity = Depends(require_operator)):
     require_same_origin(request)
     if body.mode not in JOB_MODES:
         raise HTTPException(422, f"mode must be one of {', '.join(JOB_MODES)}")
@@ -261,7 +261,7 @@ class JobAck(BaseModel):
 
 
 @router.post("/claude/jobs/ack")
-async def jobs_ack(body: JobAck, request: Request, ident: Identity = Depends(require_viewer)):
+async def jobs_ack(body: JobAck, request: Request, ident: Identity = Depends(require_operator)):
     """Acknowledge failed prompts so they stop alerting (they stay in the job list)."""
     require_same_origin(request)
     rows = await run_in_threadpool(db.job_ack, body.ids, ident.subject, body.undo)
@@ -280,7 +280,7 @@ async def job_get(job_id: int, ident: Identity = Depends(require_viewer), after:
 
 
 @router.post("/claude/jobs/{job_id}/cancel")
-async def job_cancel(job_id: int, request: Request, ident: Identity = Depends(require_viewer)):
+async def job_cancel(job_id: int, request: Request, ident: Identity = Depends(require_operator)):
     require_same_origin(request)
     j = await run_in_threadpool(db.job_get, job_id)
     if not j:
@@ -375,7 +375,7 @@ async def tracked_list(ident: Identity = Depends(require_viewer), host: Optional
 
 
 @router.post("/claude/tracked")
-async def tracked_add(body: TrackAddHost, request: Request, ident: Identity = Depends(require_viewer)):
+async def tracked_add(body: TrackAddHost, request: Request, ident: Identity = Depends(require_operator)):
     require_same_origin(request)
     h = await _host_or_404(body.host)
     row = await run_in_threadpool(db.tracked_add, h.id, body.key, body.model_dump(), ident.subject)
@@ -385,7 +385,7 @@ async def tracked_add(body: TrackAddHost, request: Request, ident: Identity = De
 
 
 @router.delete("/claude/tracked/{tid}")
-async def tracked_delete(tid: int, request: Request, ident: Identity = Depends(require_viewer)):
+async def tracked_delete(tid: int, request: Request, ident: Identity = Depends(require_operator)):
     require_same_origin(request)
     if not await run_in_threadpool(db.tracked_delete, tid):
         raise HTTPException(404, "not tracked")
@@ -394,7 +394,7 @@ async def tracked_delete(tid: int, request: Request, ident: Identity = Depends(r
 
 
 @router.post("/claude/tracked/{tid}/action")
-async def tracked_action(tid: int, body: TrackAction, request: Request, ident: Identity = Depends(require_viewer)):
+async def tracked_action(tid: int, body: TrackAction, request: Request, ident: Identity = Depends(require_operator)):
     """Queue a restart/stop for the session's host. It runs on the host's next report (or when it comes back online)."""
     require_same_origin(request)
     t = await run_in_threadpool(db.tracked_get, tid)

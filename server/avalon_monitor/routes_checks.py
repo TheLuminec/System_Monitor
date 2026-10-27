@@ -12,7 +12,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import checks as ck
 from .auth import Identity
-from .core import db, hub, require_agent, require_same_origin, require_viewer
+from .core import db, hub, require_agent, require_same_origin, require_operator, require_viewer
 from .db import HostRow
 from .routes_ops import tracked_public
 
@@ -184,7 +184,7 @@ async def checklist(name: str, ident: Identity = Depends(require_viewer)):
 
 
 @router.post("/hosts/{name}/checklist")
-async def checklist_add(name: str, body: CheckIn, request: Request, ident: Identity = Depends(require_viewer)):
+async def checklist_add(name: str, body: CheckIn, request: Request, ident: Identity = Depends(require_operator)):
     require_same_origin(request)
     if body.notify == "self":
         raise HTTPException(422, "notify=self is for avm inside a Claude session; pick a tracked agent here")
@@ -192,20 +192,20 @@ async def checklist_add(name: str, body: CheckIn, request: Request, ident: Ident
 
 
 @router.patch("/checklist/{cid}")
-async def checklist_patch(cid: int, body: CheckPatch, request: Request, ident: Identity = Depends(require_viewer)):
+async def checklist_patch(cid: int, body: CheckPatch, request: Request, ident: Identity = Depends(require_operator)):
     require_same_origin(request)
     return {"ok": True, "check": await _patch(await _check_host(cid), cid, body, False)}
 
 
 @router.delete("/checklist/{cid}")
-async def checklist_delete(cid: int, request: Request, ident: Identity = Depends(require_viewer)):
+async def checklist_delete(cid: int, request: Request, ident: Identity = Depends(require_operator)):
     require_same_origin(request)
     await _delete(await _check_host(cid), cid)
     return {"ok": True}
 
 
 @router.put("/hosts/{name}/check-settings")
-async def check_settings(name: str, request: Request, ident: Identity = Depends(require_viewer)):
+async def check_settings(name: str, request: Request, ident: Identity = Depends(require_operator)):
     """The few non-check host settings (commit warning %, top processes, tags); check rows are untouched."""
     require_same_origin(request)
     body = await request.json()

@@ -1311,7 +1311,7 @@ class ClaudeRunner:
             self._post("/claude/jobs/%d/finish" % jid, {"status": "failed", "error": "cwd does not exist: %s" % cwd})
             self._done()
             return
-        args = [self.bin, "-p", job["prompt"], "--output-format", "stream-json", "--verbose"]
+        args = [self.bin, "-p", "--output-format", "stream-json", "--verbose"]   # the prompt goes last, after "--"
         mode = job.get("mode") or "plan"
         if mode == "full":
             args.append("--dangerously-skip-permissions")
@@ -1327,6 +1327,7 @@ class ClaudeRunner:
                  "You were started from the Avalon Monitor dashboard on host %s. When you launch anything long-running "
                  "(training, builds, services), wrap it as `avm run \"<name>\" -- <command>` so it is tracked; `avm --help` for details."
                  % socket.gethostname()]
+        args += ["--", job["prompt"]]   # a prompt starting with "-" must never be parsed as a CLI option
         env = self._env()
         env["AVM_CLAUDE_JOB"] = str(jid)
         try:
@@ -1467,7 +1468,7 @@ class ClaudeRunner:
                         "reach other machines) until it links; run /remote-control in it, or check the account's Remote Control.")
             if not ok and sid:
                 prompt = job.get("prompt") or "You were restarted from the Avalon Monitor dashboard. Pick up where you left off."
-                args = ["--bg", "--resume", sid] + (["-n", t["name"]] if t.get("name") else []) + [prompt]
+                args = ["--bg", "--resume", sid] + (["-n", t["name"]] if t.get("name") else []) + ["--", prompt]
                 rc2, out2 = self._claude(args, timeout=90, cwd=cwd)
                 out = (out + "\n" if out else "") + out2
                 m = re.search(r"backgrounded\W+([0-9a-f]{8})\b", out2)

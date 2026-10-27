@@ -39,7 +39,7 @@ AGENT_COMMANDS = ("respawn",)
 
 
 from .core import (AGENT_SCRIPT, AgentBundle, LiveHub, agent_bundle, authz, client_ip, db, gpu_stall, hub,  # noqa: F401
-                   require_agent, require_same_origin, require_viewer)
+                   host_allowed, require_agent, require_operator, require_same_origin, require_viewer, same_origin)
 from . import checks as checks_mod
 from .routes_checks import router as checks_router
 from .routes_ops import job_public, router as ops_router, task_public, tracked_public
@@ -224,6 +224,28 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Avalon Monitor", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 
+class HostGuard:
+    """Refuse HTTP and WebSocket requests whose Host isn't this hub (DNS rebinding, see core.host_allowed)."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+            if not host_allowed(headers.get("host", ""), headers):
+                log.warning("refused %s %s with Host %r", scope["type"], scope.get("path"), headers.get("host"))
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 4421})
+                else:
+                    await JSONResponse({"detail": "unexpected Host header"}, status_code=421)(scope, receive, send)
+                return
+        await self.inner(scope, receive, send)
+
+
+app.add_middleware(HostGuard)
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response: Response = await call_next(request)
@@ -377,6 +399,8 @@ async def get_config(ident: Identity = Depends(require_viewer)):
         "ranges": RANGES,
         "metrics": list(METRICS),
         "access_enabled": settings.access_enabled,
+        "can_change": ident.method == "access" or settings.trusted_write,
+        "public_url": settings.public_url,
         "agent_version": agent_bundle.version,
     }
 
@@ -431,7 +455,7 @@ async def get_checks(name: str, ident: Identity = Depends(require_viewer)):
 
 
 @app.put("/api/v1/hosts/{name}/checks")
-async def put_checks(name: str, request: Request, ident: Identity = Depends(require_viewer)):
+async def put_checks(name: str, request: Request, ident: Identity = Depends(require_operator)):
     require_same_origin(request)
     body = await request.json()
     if not isinstance(body, dict):
@@ -464,7 +488,7 @@ async def put_checks(name: str, request: Request, ident: Identity = Depends(requ
 
 
 @app.post("/api/v1/hosts/{name}/command/{cmd}")
-async def post_command(name: str, cmd: str, request: Request, ident: Identity = Depends(require_viewer)):
+async def post_command(name: str, cmd: str, request: Request, ident: Identity = Depends(require_operator)):
     require_same_origin(request)
     if cmd not in AGENT_COMMANDS:
         raise HTTPException(400, f"command must be one of {', '.join(AGENT_COMMANDS)}")
@@ -484,6 +508,10 @@ async def get_stats(ident: Identity = Depends(require_viewer)):
 @app.websocket("/api/v1/live")
 async def live(ws: WebSocket):
     ip = ws.client.host if ws.client else "0.0.0.0"
+    if not same_origin(ws.headers):   # cross-site WebSocket hijacking: browsers always send Origin on a WS
+        log.warning("refused live socket from %s with Origin %r", ip, ws.headers.get("origin"))
+        await ws.close(code=4403)
+        return
     try:
         authz.viewer(ws.headers, ws.cookies, ip)
     except AuthError:

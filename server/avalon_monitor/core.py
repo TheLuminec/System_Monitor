@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import re
+import socket
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request, WebSocket
 from starlette.concurrency import run_in_threadpool
 
-from .auth import AuthError, Authorizer, Identity
+from .auth import AuthError, Authorizer, Identity, via_cloudflare
 from .config import settings
 from .db import Database, HostRow
 from .rules import GpuStallRule
@@ -122,10 +125,69 @@ def require_viewer(request: Request) -> Identity:
         raise HTTPException(e.status, e.detail)
 
 
+_HOSTNAME = socket.gethostname().lower()
+_PUBLIC_HOST = (urlsplit(settings.public_url).hostname or "").lower() if settings.public_url else ""
+
+
+def host_allowed(host_header: str, headers=None) -> bool:
+    """DNS-rebinding guard: only Host names that are really this hub. An attacker's page can make its own name
+    resolve to this machine, but its requests then carry the attacker's Host - refused here. IP literals can't be
+    rebound (the page's origin would be the IP itself), so they are always fine; that is what agents use.
+    Requests marked as coming through Cloudflare pass: Cloudflare only routes this tunnel's own hostnames, and such
+    a request gets no trusted-network access - it needs a valid Access JWT (a page forging cf-* headers has none)."""
+    if headers is not None and via_cloudflare(headers):
+        return True
+    host = (host_header or "").strip().lower()
+    if host.startswith("["):   # [v6]:port
+        host = host[1:host.find("]")] if "]" in host else host
+    elif host.count(":") == 1:
+        host = host.rsplit(":", 1)[0]
+    host = host.rstrip(".")
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if host in ("localhost", _HOSTNAME) or host == _PUBLIC_HOST or host in settings.allowed_hosts:
+        return True
+    parts = host.split(".")   # MagicDNS name of this machine: <hostname>.<tailnet>.ts.net
+    return len(parts) == 4 and parts[0] == _HOSTNAME and parts[2:] == ["ts", "net"]
+
+
+def same_origin(headers) -> bool:
+    """True unless the request says a browser sent it from another site: an Origin that isn't this request's own
+    host, or Sec-Fetch-Site cross-site/same-site. Non-browser clients (no Origin) pass."""
+    origin = headers.get("origin")
+    if origin and origin != "null":
+        if urlsplit(origin).netloc.lower() != (headers.get("host") or "").lower():
+            return False
+    elif origin == "null":
+        return False
+    return headers.get("sec-fetch-site", "same-origin") in ("same-origin", "none")
+
+
 def require_same_origin(request: Request) -> None:
-    """CSRF guard for state-changing calls: browsers can't add this header cross-origin without CORS."""
+    """CSRF guard for state-changing calls: browsers can't add this header cross-origin without CORS, and a
+    same-origin request from a rebound name is already refused by the Host check; the Origin check is belt and braces."""
     if request.headers.get("x-requested-with") != "avalon-monitor":
         raise HTTPException(403, "missing X-Requested-With header")
+    if not same_origin(request.headers):
+        raise HTTPException(403, "cross-origin request refused")
+
+
+def require_operator(request: Request) -> Identity:
+    """Changing anything needs a Cloudflare Access identity (and, when AVM_OPERATORS is set, one on that list).
+    Trusted-network viewers - tailnet devices, local processes - are read-only unless AVM_TRUSTED_WRITE is on."""
+    ident = require_viewer(request)
+    require_same_origin(request)
+    if ident.method != "access" and not settings.trusted_write:
+        where = settings.public_url or "the public dashboard address"
+        raise HTTPException(403, f"read-only here: changes need your Cloudflare Access login - open {where}")
+    if settings.operators and ident.method == "access" and ident.subject.lower() not in settings.operators:
+        raise HTTPException(403, f"{ident.subject} may view but not change things (AVM_OPERATORS)")
+    return ident
 
 
 async def require_agent(request: Request) -> HostRow:

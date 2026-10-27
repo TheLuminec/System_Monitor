@@ -64,6 +64,15 @@ class Settings:
     # loopback + the Tailscale ranges.
     trusted_networks: list = field(default_factory=lambda: _networks(DEFAULT_TRUSTED_NETWORKS))
     allow_trusted_no_auth: bool = True
+    # Trusted-network viewers are READ-ONLY: changing anything (prompts, restarts, checks, dismissals, settings)
+    # needs a Cloudflare Access identity. AVM_TRUSTED_WRITE=true restores the old behaviour (e.g. a hub without
+    # Access, on a private network you fully trust).
+    trusted_write: bool = False
+    # Access identities (emails, lower-case) allowed to change things; empty = anyone Access lets in.
+    operators: list = field(default_factory=list)
+    # Host header values accepted (DNS-rebinding guard). Always accepted: IP literals, localhost, this machine's
+    # hostname (also as <hostname>.<tailnet>.ts.net) and the host of AVM_PUBLIC_URL; this list adds more.
+    allowed_hosts: list = field(default_factory=list)
 
     # Networks agents are allowed to push metrics from.
     ingest_networks: list = field(default_factory=lambda: _networks(DEFAULT_TRUSTED_NETWORKS))
@@ -113,6 +122,9 @@ def load_settings() -> Settings:
     s.access_aud = env.get("AVM_ACCESS_AUD", "").strip()
     s.trusted_networks = _networks(env.get("AVM_TRUSTED_NETWORKS", DEFAULT_TRUSTED_NETWORKS))
     s.allow_trusted_no_auth = _bool(env.get("AVM_ALLOW_TRUSTED_NO_AUTH"), True)
+    s.trusted_write = _bool(env.get("AVM_TRUSTED_WRITE"), False)
+    s.operators = [x.strip().lower() for x in env.get("AVM_OPERATORS", "").split(",") if x.strip()]
+    s.allowed_hosts = [x.strip().lower() for x in env.get("AVM_ALLOWED_HOSTS", "").split(",") if x.strip()]
     s.ingest_networks = _networks(env.get("AVM_INGEST_NETWORKS", DEFAULT_TRUSTED_NETWORKS))
     s.retention_raw_hours = int(env.get("AVM_RETENTION_RAW_HOURS", s.retention_raw_hours))
     s.retention_1m_days = int(env.get("AVM_RETENTION_1M_DAYS", s.retention_1m_days))
