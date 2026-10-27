@@ -93,6 +93,17 @@ def test_operator_allowlist(tunnel, monkeypatch):
     assert tunnel.post("/api/v1/claude/jobs/ack", headers=WRITE, json={"ids": []}).status_code == 200
 
 
+@pytest.mark.parametrize("operators,trusted_write", [([], False), (["someone@else.test"], False), (["owner@example.test"], False), ([], True)])
+def test_config_can_change_matches_the_server_answer(client, tunnel, monkeypatch, operators, trusted_write):
+    """The dashboard greys out controls from /config's can_change: it must agree with what a write actually gets."""
+    monkeypatch.setattr(settings, "operators", operators)
+    monkeypatch.setattr(settings, "trusted_write", trusted_write)
+    for c in (client, tunnel):
+        can = c.get("/api/v1/config").json()["can_change"]
+        status = c.post("/api/v1/claude/jobs/ack", headers=WRITE, json={"ids": []}).status_code
+        assert can is (status == 200), (operators, trusted_write, can, status)
+
+
 def test_trusted_write_switch_restores_old_behaviour(client, monkeypatch):
     monkeypatch.setattr(settings, "trusted_write", True)
     assert client.post("/api/v1/claude/jobs/ack", headers=WRITE, json={"ids": []}).status_code == 200

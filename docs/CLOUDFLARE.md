@@ -9,7 +9,7 @@ a 401/403 and nothing else.
 
 ```
  browser ──HTTPS──▶ Cloudflare edge ──(Access login)──▶ tunnel ──▶ cloudflared on AVALON ──▶ 127.0.0.1:8787
- agents  ──Tailscale (100.x)───────────────────────────────────────────────────────────────▶ 100.123.17.92:8787
+ agents  ──Tailscale (100.x)───────────────────────────────────────────────────────────────▶ 100.x.y.z:8787
 ```
 
 ## 1. Add the tunnel ingress rule (on AVALON)
@@ -63,6 +63,8 @@ sudo nano /etc/avalon-monitor/monitor.env
 AVM_ACCESS_TEAM_DOMAIN=avalontech.cloudflareaccess.com
 AVM_ACCESS_AUD=<the AUD tag from step 2>
 AVM_PUBLIC_URL=https://monitor.avalontech.xyz
+# optional: only these Access identities may change things (empty = anyone the Access policy admits)
+#AVM_OPERATORS=you@example.com
 ```
 ```bash
 sudo systemctl restart avalon-monitor
@@ -72,15 +74,22 @@ journalctl -u avalon-monitor -n 5   # expect: "Cloudflare Access verification en
 Visit `https://monitor.avalontech.xyz` → Cloudflare login page → dashboard.
 The user chip in the top-right shows the email from the Access token.
 
+`AVM_PUBLIC_URL` is more than a label. Its host is on the hub's Host allowlist, and the tailnet dashboard (which is
+read-only) sends you there to make changes. Every change (prompts, checks, restarts, acknowledging alerts) needs an
+Access login: viewers on the tailnet or localhost can look but not change anything ([SECURITY.md](SECURITY.md)).
+
 ## 4. What the hub enforces (defense in depth)
 
 | Request arrives…                                   | Result |
 |----------------------------------------------------|--------|
-| via Cloudflare with a valid Access JWT             | allowed, identity shown in the UI |
+| via Cloudflare with a valid Access JWT             | allowed, identity shown in the UI; may change things (if on `AVM_OPERATORS`, when set) |
 | via Cloudflare with a missing / invalid / expired JWT | 401 |
 | via Cloudflare while Access isn't configured       | 403 (nothing served, not even the HTML shell) |
-| directly from the tailnet or localhost, no Cloudflare headers | allowed (`AVM_ALLOW_TRUSTED_NO_AUTH=true`) |
+| directly from the tailnet or localhost, no Cloudflare headers | **view only** (`AVM_ALLOW_TRUSTED_NO_AUTH=true`); changes get 403 unless `AVM_TRUSTED_WRITE=true` |
 | from any other network                             | 401 |
+| with a `Host` that isn't this hub (DNS rebinding)  | 421 (WebSocket: closed 4421) |
+| a change from another site (`Origin` / `Sec-Fetch-Site`), or without `X-Requested-With` | 403 |
+| `/api/v1/live` WebSocket from another site's page  | closed 4403 |
 | `POST /api/v1/ingest` via Cloudflare               | 403 always |
 | `POST /api/v1/ingest` from the tailnet, valid host token | accepted |
 
@@ -126,3 +135,9 @@ beacon is blocked; the dashboard works), but noisy. Pick one:
 * **WebSocket doesn't connect (grey dot in the user chip)**: Cloudflare proxies
   WebSockets by default; make sure no Cloudflare *Configuration Rule* disables
   them for this hostname.
+* **`421 unexpected Host header`** (or "refused ... with Host" in the journal): the name used to reach the hub
+  isn't on its allowlist. Add it to `AVM_ALLOWED_HOSTS` (e.g. a DNS alias, or a Tailscale machine name that differs
+  from AVALON's hostname) and restart.
+* **"read-only here: changes need your Cloudflare Access login"**: you're on the tailnet / localhost address.
+  Open `AVM_PUBLIC_URL` to make the change. **"may view but not change things (AVM_OPERATORS)"**: your Access
+  email isn't on that list.

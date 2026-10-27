@@ -58,7 +58,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("checks", help="show or set a host's remote check settings")
     p.add_argument("name")
     p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
-    p.add_argument("--clear", action="store_true", help="remove all remote settings (agent falls back to its file)")
+    p.add_argument("--clear", action="store_true",
+                   help="remove every check and remote setting (a hub-managed host then runs no AVM_WATCH_* checks; "
+                        "an unmanaged one falls back to its agent.conf)")
     sub.add_parser("respawn", help="ask an agent (or all) to re-exec itself").add_argument("name")
     sub.add_parser("agents", help="agent versions: served by the hub vs running on each host")
 
@@ -92,26 +94,29 @@ def main(argv=None) -> int:
             db.delete_host(args.name)
             print(f"removed {args.name} and its history")
         elif args.cmd == "checks":
+            from avalon_monitor import checks
             from avalon_monitor.main import REMOTE_KEYS
             host = db.host_by_name(args.name)
             if not host:
                 raise KeyError(args.name)
-            cfg = dict(host.check_config or {})
-            if args.clear:
-                cfg = {}
+            body = {k: "" for k in REMOTE_KEYS} if args.clear else {}
             for item in args.set:
                 k, _, v = item.partition("=")
                 if k not in REMOTE_KEYS:
                     print(f"error: {k} is not remotely settable ({', '.join(REMOTE_KEYS)})", file=sys.stderr)
                     return 1
-                cfg[k] = v.strip()
-            if args.set or args.clear:
-                rev = db.set_check_config(args.name, cfg)
+                body[k] = v.strip()
+            if body:   # same row logic as PUT /api/v1/hosts/NAME/checks: check entries are rows, so it sticks
+                rev = checks.put_settings(db, host, body, "manage.py")
                 print(f"saved revision {rev}; the agent applies it on its next push")
+                host = db.host_by_name(args.name)
+            cfg = host.check_config or {}
             for k, v in cfg.items():
                 print(f"{k}={v}")
             if not cfg:
                 print("(no remote settings; agent uses its local agent.conf)")
+            elif cfg.get(checks.MANAGED):
+                print("(hub-managed: these lists replace agent.conf's, empty ones included)")
         elif args.cmd == "respawn":
             targets = [h.name for h in db.list_hosts()] if args.name == "all" else [args.name]
             for n in targets:

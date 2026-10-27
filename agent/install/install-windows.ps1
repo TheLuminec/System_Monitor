@@ -71,18 +71,28 @@ if (-not $py) { throw "Python 3 not found. Install it (winget install Python.Pyt
 Write-Host "==> using $py"
 
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
+# The agent runs as SYSTEM from here, so only admins may write here (E-19). Inherited from ProgramData, standard users
+# can create files in its subfolders: a planted json.py beside avalon_agent.py, or a .pth in the venv, would run as
+# SYSTEM. Reset to a known explicit ACL on every run (also drops an earlier -AsCurrentUser grant; re-added below):
+# SYSTEM and Administrators full control, Users read/execute. SIDs, so localized group names don't matter.
+# Child objects that inherit pick it up; agent.conf keeps its own explicit ACL.
+icacls $AppDir /reset | Out-Null
+icacls $AppDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "could not set the permissions of $AppDir (icacls exit code $LASTEXITCODE)" }
 Copy-Item (Join-Path $SrcDir "avalon_agent.py") (Join-Path $AppDir "avalon_agent.py") -Force
 if (Test-Path (Join-Path $SrcDir "avm.py")) { Copy-Item (Join-Path $SrcDir "avm.py") (Join-Path $AppDir "avm.py") -Force }
 
 $venv = Join-Path $AppDir "venv"
 if (-not (Test-Path (Join-Path $venv "Scripts\python.exe"))) {
   Write-Host "==> creating venv"
-  & $py -m venv $venv
+  & $py -I -m venv $venv
 }
 $vpy = Join-Path $venv "Scripts\python.exe"
 $vpyw = Join-Path $venv "Scripts\pythonw.exe"
-& $vpy -m pip install --quiet --upgrade pip
-& $vpy -m pip install --quiet -r (Join-Path $SrcDir "requirements.txt")
+# -I everywhere python runs from here: isolated mode puts neither the script's folder nor the current directory on
+# sys.path and ignores PYTHON* variables and user site-packages
+& $vpy -I -m pip install --quiet --upgrade pip
+& $vpy -I -m pip install --quiet -r (Join-Path $SrcDir "requirements.txt")
 
 $conf = Join-Path $AppDir "agent.conf"
 if (-not $Upgrade) {
@@ -95,12 +105,12 @@ if (-not $Upgrade) {
 }
 
 Write-Host "==> checking connectivity"
-& $vpy (Join-Path $AppDir "avalon_agent.py") --config $conf --check
+& $vpy -I (Join-Path $AppDir "avalon_agent.py") --config $conf --check
 if ($LASTEXITCODE -ne 0) { Write-Warning "hub check failed - the task will keep retrying once the config is fixed." }
 
 # avm command: C:\ProgramData\AvalonAgent\avm.cmd, on the machine PATH
 $avmCmd = Join-Path $AppDir "avm.cmd"
-Set-Content -Path $avmCmd -Value "@echo off`r`nset AVM_CONFIG=$conf`r`n`"$vpy`" `"$AppDir\avm.py`" %*" -Encoding ASCII
+Set-Content -Path $avmCmd -Value "@echo off`r`nset AVM_CONFIG=$conf`r`n`"$vpy`" -I `"$AppDir\avm.py`" %*" -Encoding ASCII
 $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
 if ($machinePath -notlike "*$AppDir*") { [Environment]::SetEnvironmentVariable("Path", "$machinePath;$AppDir", "Machine"); Write-Host "==> added $AppDir to the system PATH (open a new terminal to use 'avm')" }
 if ($AsCurrentUser) {
@@ -111,7 +121,7 @@ if ($AsCurrentUser) {
 }
 
 Write-Host "==> registering scheduled task $TaskName"
-$action = New-ScheduledTaskAction -Execute $vpyw -Argument "`"$AppDir\avalon_agent.py`" --config `"$conf`"" -WorkingDirectory $AppDir
+$action = New-ScheduledTaskAction -Execute $vpyw -Argument "-I `"$AppDir\avalon_agent.py`" --config `"$conf`"" -WorkingDirectory $AppDir
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
   -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
 if ($AsCurrentUser) {
@@ -132,4 +142,4 @@ Stop-AgentProcesses   # including self-update respawns the task no longer owns (
 Start-ScheduledTask -TaskName $TaskName
 Start-Sleep -Seconds 2
 Write-Host ("Task state: " + (Get-ScheduledTask -TaskName $TaskName).State)
-Write-Host "Done. Config: $conf   Logs: run `"$vpy $AppDir\avalon_agent.py --config $conf`" interactively to see output."
+Write-Host "Done. Config: $conf   Logs: run `"$vpy -I $AppDir\avalon_agent.py --config $conf`" interactively to see output."

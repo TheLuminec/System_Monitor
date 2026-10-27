@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,6 +29,9 @@ def _load_env_file(path: str | None) -> None:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
+        value = value.strip()
+        if value[:1] not in ('"', "'"):   # unquoted: an inline comment starts at " #"
+            value = re.split(r"\s+#", value, maxsplit=1)[0]
         value = value.strip().strip('"').strip("'")
         os.environ.setdefault(key, value)
 

@@ -14,5 +14,6 @@
   "check_subset": "5%",
   "unit": "avalon-backup",
   "schedule": "*-*-* 03:30",
-  "max_age_sec": 93600
+  "max_age_sec": 93600,
+  "max_run_sec": 43200
 }

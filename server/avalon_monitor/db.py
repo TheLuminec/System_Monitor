@@ -125,7 +125,7 @@ CREATE INDEX IF NOT EXISTS claude_jobs_host ON claude_jobs(host_id, status);
 -- Checks, one row per watched thing (the source of truth for the AVM_WATCH_* settings pushed to agents, which
 -- are rendered from these rows). Each may carry a label, an owner session (`avm check add` from inside it), an
 -- expiry, and a responder: on an ok -> failing transition the hub prompts a Claude agent on that host
--- (read-only, guard-railed: cooldown, daily cap, one open alert until the check recovers).
+-- (read-only, guard-railed: cooldown, cap per rolling 24 h, one open alert until the check recovers).
 CREATE TABLE IF NOT EXISTS host_checks (
     id              INTEGER PRIMARY KEY,
     host_id         INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
@@ -140,16 +140,19 @@ CREATE TABLE IF NOT EXISTS host_checks (
     notify_cwd      TEXT,                 -- working dir for a "new" responder session
     notify_log      INTEGER NOT NULL DEFAULT 0,   -- include related task log tails in the alert (off: paths/ids only)
     cooldown_min    REAL NOT NULL DEFAULT 30,
-    daily_cap       INTEGER NOT NULL DEFAULT 6,
+    daily_cap       INTEGER NOT NULL DEFAULT 6,   -- alerts per rolling 24 h
     state           TEXT,                 -- ok | failing | unknown (from the agent's reports)
-    since           REAL,
+    since           REAL,                 -- when the last known (ok/failing) state began; unknown doesn't reset it
     last_ok         REAL,
     detail          TEXT,
     last_fired      REAL,
-    fires_day       TEXT,
-    fires_n         INTEGER NOT NULL DEFAULT 0,
+    fires_day       TEXT,                 -- unused since the cap became a rolling window (fire_log)
+    fires_n         INTEGER NOT NULL DEFAULT 0,   -- alerts in the last 24 h, as of the last one
     open_job        INTEGER,              -- responder job of the current failure (cleared when the check recovers)
-    pending         INTEGER NOT NULL DEFAULT 0,   -- failure seen but the target session was mid-turn: fire when idle
+    pending         INTEGER NOT NULL DEFAULT 0,   -- failure seen but no alert yet (cooldown, cap, target mid-turn,
+                                                  -- no Claude to prompt): fires once it can, if still failing
+    known_state     TEXT,                 -- last ok | failing reported (state may be unknown in between)
+    fire_log        TEXT,                 -- JSON list of alert times in the last 24 h (the rolling cap)
     UNIQUE(host_id, key, target)
 );
 
@@ -297,7 +300,10 @@ class Database:
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys=ON")
+        had_checks = self._conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_checks'").fetchone() is not None
         self._conn.executescript(SCHEMA)
+        if not had_checks:   # a database from before host_checks: its legacy check settings are still to be imported
+            self._conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('legacy_checks_imported', '0')")
         self._migrate()
 
     def _migrate(self) -> None:
@@ -319,22 +325,40 @@ class Database:
             if col not in cols:   # action: restart/stop a tracked session; fork_session: prompt a copy of a live session;
                                   # acked: a failed prompt dismissed from Alerts
                 self._conn.execute(f"ALTER TABLE claude_jobs ADD COLUMN {col} {ddl}")
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(host_checks)")}
+        for col, ddl in (("known_state", "TEXT"), ("fire_log", "TEXT")):
+            if col not in cols:   # known_state: last ok/failing across unknown gaps; fire_log: rolling 24 h alert cap
+                self._conn.execute(f"ALTER TABLE host_checks ADD COLUMN {col} {ddl}")
         self._import_legacy_checks()
 
     def _import_legacy_checks(self) -> None:
-        """One-time: hosts whose AVM_WATCH_* settings predate host_checks get one row per entry."""
+        """Once per database (meta legacy_checks_imported: '0' = to do, '1' = done): hosts whose AVM_WATCH_* settings
+        predate host_checks get one row per entry, in one transaction. No flag at all = host_checks came with an
+        earlier release, which imported (and re-ran this on every start): it only gets the flag, so stale settings
+        never come back."""
         from .checks import CHECK_KEYS   # local import: checks.py imports nothing from db
+        flag = self._conn.execute("SELECT value FROM meta WHERE key='legacy_checks_imported'").fetchone()
+        if flag and flag["value"] == "1":
+            return
         now = time.time()
-        for r in self._conn.execute("SELECT id, check_config FROM hosts WHERE check_config IS NOT NULL").fetchall():
-            if self._conn.execute("SELECT 1 FROM host_checks WHERE host_id=? LIMIT 1", (r["id"],)).fetchone():
-                continue
-            cfg = json.loads(r["check_config"] or "{}")
-            for key in CHECK_KEYS:
-                entries = [cfg.get(key) or ""] if key == "AVM_MEM_AVAILABLE_WARN_GB" else (cfg.get(key) or "").split(",")
-                for e in (x.strip() for x in entries if x):
-                    if e:
-                        self._conn.execute("INSERT OR IGNORE INTO host_checks(host_id, key, target, created, created_by) VALUES (?,?,?,?,?)",
-                                           (r["id"], key, e, now, "imported"))
+        self._conn.execute("BEGIN")
+        try:
+            for r in (self._conn.execute("SELECT id, check_config FROM hosts WHERE check_config IS NOT NULL").fetchall()
+                      if flag else []):
+                if self._conn.execute("SELECT 1 FROM host_checks WHERE host_id=? LIMIT 1", (r["id"],)).fetchone():
+                    continue
+                cfg = json.loads(r["check_config"] or "{}")
+                for key in CHECK_KEYS:
+                    entries = [cfg.get(key) or ""] if key == "AVM_MEM_AVAILABLE_WARN_GB" else (cfg.get(key) or "").split(",")
+                    for e in (x.strip() for x in entries if x):
+                        if e:
+                            self._conn.execute("INSERT OR IGNORE INTO host_checks(host_id, key, target, created, created_by) VALUES (?,?,?,?,?)",
+                                               (r["id"], key, e, now, "imported"))
+            self._conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_checks_imported', '1')")
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -480,8 +504,13 @@ class Database:
         return [(r["ts"], r["v"]) for r in rows]
 
     # ------------------------------------------------------------ lifecycle
+    # Agent timestamps are kept when within 120 s of the hub's clock (main.py ingest), so a sample can land in a minute
+    # that was already rolled up: each pass re-aggregates this far before the previous cutoff (INSERT OR REPLACE).
+    ROLLUP_REDO_SEC = 180
+
     def rollup(self, now: float | None = None) -> int:
-        """Fold complete minutes into samples_1m. Returns number of rollup rows written."""
+        """Fold complete minutes into samples_1m, redoing the trailing ROLLUP_REDO_SEC so late samples (a host whose
+        clock is behind) are counted. Returns number of rollup rows written."""
         now = now or time.time()
         cutoff = float(int(now // 60) * 60)  # start of the current (incomplete) minute
         with self._lock:
@@ -497,7 +526,7 @@ class Database:
                     f"INSERT OR REPLACE INTO samples_1m(host_id, ts, n, {cols}) "
                     f"SELECT host_id, CAST(ts/60 AS INTEGER)*60 AS m, COUNT(*), {agg} "
                     f"FROM samples WHERE ts>=? AND ts<? GROUP BY host_id, m",
-                    (last, cutoff),
+                    (max(0.0, last - self.ROLLUP_REDO_SEC), cutoff),
                 )
                 self._conn.execute(
                     "INSERT OR REPLACE INTO meta(key, value) VALUES ('rollup_ts', ?)", (str(cutoff),)
@@ -554,7 +583,7 @@ class Database:
                     sets.append("started=?"); vals.append(now)
                 if status != row["status"]:
                     sets.append("acked=NULL, acked_by=NULL")   # a new outcome alerts afresh
-            elif beat and row["status"] == "stalled":
+            elif beat and row["status"] in ("stalled", "lost"):   # lost: its host's reports paused (agent restart, Wi-Fi blip)
                 sets.append("status='running', acked=NULL, acked_by=NULL")
             if progress is not None:
                 sets.append("progress=?"); vals.append(max(0.0, min(1.0, float(progress))))
@@ -802,7 +831,8 @@ class Database:
 
     # ------------------------------------------------------------- checks
     CHECK_EDITABLE = ("label", "expires", "notify", "notify_cwd", "notify_log", "cooldown_min", "daily_cap", "target", "owner")
-    CHECK_STATE = ("state", "since", "last_ok", "detail", "last_fired", "fires_day", "fires_n", "open_job", "pending")
+    CHECK_STATE = ("state", "since", "last_ok", "detail", "last_fired", "fires_day", "fires_n", "open_job", "pending",
+                   "known_state", "fire_log")
 
     def checks_list(self, host_id: int | None = None) -> list[dict]:
         sql = "SELECT * FROM host_checks" + (" WHERE host_id=?" if host_id is not None else "") + " ORDER BY host_id, key, target"
@@ -838,6 +868,27 @@ class Database:
             if fields:
                 self._conn.execute(f"UPDATE host_checks SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?", [*fields.values(), cid])
             return _row(self._conn.execute("SELECT * FROM host_checks WHERE id=?", (cid,)).fetchone())
+
+    def check_fire(self, cid: int, fields: dict, **job) -> Optional[dict]:
+        """Queue a check's responder job (job_create kwargs) and claim the check for it, atomically: only if the check
+        has no open job, so two reports for one host evaluated at once can't both fire. Also stores `fields` (fire
+        bookkeeping). Returns the job, or None when another report got there first."""
+        fields = {k: v for k, v in fields.items() if k in self.CHECK_STATE and k != "open_job"}
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                j = self.job_create(**job)
+                cur = self._conn.execute(
+                    f"UPDATE host_checks SET {', '.join(['open_job=?'] + [f'{k}=?' for k in fields])} WHERE id=? AND open_job IS NULL",
+                    [j["id"], *fields.values(), cid])
+                if cur.rowcount != 1:
+                    self._conn.execute("ROLLBACK")
+                    return None
+                self._conn.execute("COMMIT")
+                return j
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def check_delete(self, cid: int, host_id: int | None = None) -> Optional[dict]:
         with self._lock:

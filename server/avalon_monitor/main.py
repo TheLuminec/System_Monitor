@@ -39,7 +39,7 @@ AGENT_COMMANDS = ("respawn",)
 
 
 from .core import (AGENT_SCRIPT, AgentBundle, LiveHub, agent_bundle, authz, client_ip, db, gpu_stall, hub,  # noqa: F401
-                   host_allowed, require_agent, require_operator, require_same_origin, require_viewer, same_origin)
+                   host_allowed, may_change, require_agent, require_operator, require_same_origin, require_viewer, same_origin)
 from . import checks as checks_mod
 from .routes_checks import router as checks_router
 from .routes_ops import job_public, router as ops_router, task_public, tracked_public
@@ -80,7 +80,7 @@ def _summary_of(sample: Optional[dict]) -> dict[str, Any]:
                    "swap_percent": mem.get("swap_percent"), "committed": mem.get("committed"),
                    "commit_limit": mem.get("commit_limit")},
         "disk": {"percent": root.get("percent") if root else None, "used": root.get("used") if root else None,
-                 "total": root.get("total") if root else None, "mountpoint": root.get("mountpoint") if root else None,
+                 "total": root.get("total") if root else None, "free": root.get("free") if root else None, "mountpoint": root.get("mountpoint") if root else None,
                  "count": len(disks), "max_percent": max((d.get("percent") or 0) for d in disks) if disks else None},
         "disk_io": {"read_bps": dio.get("read_bps"), "write_bps": dio.get("write_bps")},
         "network": {"rx_bps": net.get("rx_bps"), "tx_bps": net.get("tx_bps")},
@@ -92,7 +92,9 @@ def _summary_of(sample: Optional[dict]) -> dict[str, Any]:
         "checks": checks,
         "checks_failing": sum(1 for c in checks if not c.get("ok") and c.get("level") != "info"),
         "top_process": max(sample.get("processes", []), key=lambda p: p.get("cpu_percent") or 0, default=None),
-        "backups": [{k: b.get(k) for k in ("name", "state", "last_success", "max_age_sec", "next_run", "error", "snapshot")}
+        # started/max_run_sec: a "running" older than max_run_sec died without writing its end (the UI shows it crit)
+        "backups": [{k: b.get(k) for k in ("name", "state", "started", "finished", "last_success", "max_age_sec",
+                                           "max_run_sec", "next_run", "error", "snapshot", "warnings")}
                     for b in (sample.get("backups") or []) if isinstance(b, dict)],
     }
 
@@ -338,7 +340,9 @@ async def ingest(request: Request):
     agent_bundle.refresh()
     if agent_bundle.available:
         reply["agent"] = {"version": agent_bundle.version, "sha256": agent_bundle.sha256,
-                          "auto_update": settings.agent_auto_update, "files": agent_bundle.companion_hashes()}
+                          "auto_update": settings.agent_auto_update, "files": agent_bundle.companion_hashes(),
+                          "sig": agent_bundle.signature("avalon_agent.py"),
+                          "file_sigs": {n: agent_bundle.signature(n) for n in agent_bundle.COMPANIONS}}
     claude = sample.claude if isinstance(sample.claude, dict) else {}
     if isinstance(claude.get("agents"), list):   # agent 1.5+: refresh tracked sessions, tell the agent which ones they are
         for row in await run_in_threadpool(db.tracked_sync, host.id, claude["agents"], now):
@@ -399,7 +403,7 @@ async def get_config(ident: Identity = Depends(require_viewer)):
         "ranges": RANGES,
         "metrics": list(METRICS),
         "access_enabled": settings.access_enabled,
-        "can_change": ident.method == "access" or settings.trusted_write,
+        "can_change": may_change(ident) is None,
         "public_url": settings.public_url,
         "agent_version": agent_bundle.version,
     }
@@ -463,28 +467,16 @@ async def put_checks(name: str, request: Request, ident: Identity = Depends(requ
     bad = [k for k in body if k not in REMOTE_KEYS]
     if bad:
         raise HTTPException(422, f"not remotely settable: {', '.join(bad)}")
-    settings_out = {k: str(v).strip() for k, v in body.items() if v is not None}
     h = await run_in_threadpool(db.host_by_name, name)
     if not h:
         raise HTTPException(404, "no such host")
-    # Older editors / manage.py send the whole config: check entries become rows (labels/responders of unchanged
-    # entries are kept), everything else is stored as before; the AVM_WATCH_* lists are then re-rendered from rows.
-    wanted = set()
-    for key in checks_mod.CHECK_KEYS:
-        raw = settings_out.pop(key, "")
-        for e in ([raw] if key in checks_mod.SINGLE_KEYS else raw.split(",")):
-            if e.strip():
-                wanted.add((key, e.strip()))
-    for r in await run_in_threadpool(db.checks_list, h.id):
-        if (r["key"], r["target"]) not in wanted:
-            await run_in_threadpool(db.check_delete, r["id"])
-    for key, target in wanted:
-        await run_in_threadpool(db.check_add, h.id, key, target, {}, ident.subject)
-    if (h.check_config or {}).get(checks_mod.MANAGED):   # keep the host hub-managed (see checks.adopt)
-        settings_out[checks_mod.MANAGED] = "1"
-    rev = await run_in_threadpool(db.set_check_config, name, checks_mod.render_settings(settings_out, await run_in_threadpool(db.checks_list, h.id)))
-    log.info("%s updated checks for %s (rev %d)", ident.subject, name, rev)
-    return {"ok": True, "rev": rev, "settings": settings_out}
+    # Only the keys in the body change (as with manage.py checks --set): an AVM_WATCH_* key replaces that kind's
+    # check rows (labels/responders of entries that stay are kept), other keys are stored ("" removes one); other
+    # kinds' rows and settings are untouched and a hub-managed host stays managed (see checks.put_settings).
+    rev = await run_in_threadpool(checks_mod.put_settings, db, h, body, ident.subject)
+    log.info("%s updated checks for %s (rev %d): %s", ident.subject, name, rev, ", ".join(body))
+    h = await run_in_threadpool(db.host_by_name, name)
+    return {"ok": True, "rev": rev, "settings": (h.check_config if h else None) or {}}
 
 
 @app.post("/api/v1/hosts/{name}/command/{cmd}")

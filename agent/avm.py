@@ -3,12 +3,16 @@
 
 One command when you set something off:
 
-    avm run "seed 3 training" -- python train.py --seed 3
+    avm run "seed 3 training" [--log | --no-log] -- python train.py --seed 3
         Runs the command, streams its last lines and a heartbeat to the dashboard,
-        reports the exit code; non-zero -> the task shows red. Exit code is passed through.
+        reports the exit code; non-zero -> the task shows red. Exit code is passed through (killed by a signal:
+        128+n, like a shell, with the signal named in the task's note). The output reaches your terminal byte for
+        byte (progress bars, prompts without a newline). The command ALWAYS runs: when the hub is down, rejects
+        the token or there is no config, avm says "untracked: <reason>" on stderr and runs it anyway.
 
     avm watch "nightly backup" --pid 4242 [--rc-file /path]
-        Tracks an already-running process until it exits (detaches into the background).
+        Tracks an already-running process until it exits (detaches into the background). With --rc-file, a
+        missing or unreadable file at the end means failed, "exit code unknown".
 
     avm task start "data prep" [--expect 300] [--note "..."]   -> prints TASK_ID
     avm task beat  TASK_ID [--progress 0.4] [--log "epoch 3 done"]
@@ -42,7 +46,9 @@ Checks on this host (shown on its dashboard page; agents may manage their own):
 Resources and the wait queue (host-local; opt-in - plain `avm run` behaves exactly as before):
 
     avm run "nymeria b4020" --gpu --exclusive --mem 19G --wait [--max-wait 8h] -- python train.py
-        --gpu / --exclusive  uses the GPU / is a heavy GPU job (one exclusive job at a time; light ones may share)
+        --gpu / --exclusive  uses the GPU / is a heavy GPU job. --exclusive only excludes other --exclusive jobs
+                             (one heavy job at a time); light --gpu jobs are NOT held back by it and may share the
+                             GPU with it - give them --vram to be admitted on measured free VRAM instead
         --mem 19G, --vram 6G what the job expects to use (admission counts it while the job is starting up)
         --wait               queue until it fits: first come first served among jobs competing for the same thing,
                              admitted on MEASURED free memory/VRAM (never RSS) minus declared start-up reservations
@@ -54,6 +60,17 @@ Resources and the wait queue (host-local; opt-in - plain `avm run` behaves exact
     avm queue status [--json]     avm queue drain [--wait]     avm queue resume
         drain: admit nothing new (running jobs finish; --wait returns once the host is idle) - e.g. before a git pull.
       Settings (agent.conf): AVM_QUEUE_HEADROOM_GB (default 2), AVM_QUEUE_SETTLE_SEC (default 180), AVM_QUEUE_DIR.
+      The queue dir (default /run/avm-queue when the installer made it, else /tmp/avm-queue) is shared by every user
+      on the host. avm refuses it unless it is a real directory (not a symlink) owned by root or you, not writable by
+      others unless sticky, in a parent chain with the same properties; files in it are never followed through symlinks.
+
+Task logs and data-use agreements (local switches in agent.conf; the hub cannot set them):
+    AVM_TASK_LOG=off              no output lines leave this host: avm run / watch / task send only name, status,
+                                  rc, timing and note (no log tail, and no command line or working directory either)
+    AVM_TASK_LOG_OFF_DIRS=/data/dua,/srv/cohort   the same for runs whose working directory is inside one of these
+    Read from every agent.conf avm can open; "off" in any of them wins and the directory lists add up. Per run:
+    `avm run --no-log` forces it off, `avm run --log` forces it on. A run with the log off passes AVM_TASK_LOG=off
+    to its child, so nested avm calls stay quiet too (the environment can only turn it off, never on).
 
 Needs the agent's config (server URL + host token). Looked up in order:
 AVM_CONFIG, ~/.config/avalon-agent/agent.conf, /etc/avalon-agent/agent.conf,
@@ -62,6 +79,7 @@ AVM_CONFIG, ~/.config/avalon-agent/agent.conf, /etc/avalon-agent/agent.conf,
 from __future__ import annotations
 
 import argparse
+import codecs
 import getpass
 import json
 import os
@@ -69,6 +87,7 @@ import re
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -79,7 +98,7 @@ import urllib.request
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
-AVM_VERSION = "1.8.0"
+AVM_VERSION = "1.9.0"
 IS_WINDOWS = sys.platform.startswith("win")
 
 
@@ -94,22 +113,44 @@ def _candidates() -> List[str]:
     return [x for x in c if x]
 
 
+OFF_WORDS = ("off", "0", "no", "false")
+
+
+def _read_conf(path: str) -> Optional[Dict[str, str]]:
+    vals: Dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    v = v.strip()
+                    if v[:1] not in ('"', "'"):   # unquoted: an inline comment starts at " #" (same as the agent)
+                        v = re.split(r"\s+#", v, maxsplit=1)[0]
+                    vals.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except (OSError, ValueError):
+        return None
+    return vals
+
+
 def load_config(required: bool = True) -> Dict[str, str]:
     cfg: Dict[str, str] = {}
+    log_off, off_dirs = False, []   # the task-log switches: from EVERY readable config, most restrictive wins
     for path in _candidates():
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    for raw in f:
-                        line = raw.strip()
-                        if line and not line.startswith("#") and "=" in line:
-                            k, _, v = line.partition("=")
-                            cfg.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-            except OSError:
-                continue
+        if not os.path.isfile(path):
+            continue
+        vals = _read_conf(path)
+        if vals is None:
+            continue
+        log_off = log_off or vals.get("AVM_TASK_LOG", "").strip().lower() in OFF_WORDS
+        off_dirs += [d.strip() for d in vals.get("AVM_TASK_LOG_OFF_DIRS", "").split(",") if d.strip()]
+        if "_path" not in cfg:
+            for k, v in vals.items():
+                cfg.setdefault(k, v)
             if cfg.get("AVM_SERVER_URL") and cfg.get("AVM_TOKEN"):
                 cfg["_path"] = path
-                break
+    cfg["AVM_TASK_LOG"] = "off" if log_off else "on"
+    cfg["AVM_TASK_LOG_OFF_DIRS"] = ",".join(off_dirs)
     for k in ("AVM_SERVER_URL", "AVM_TOKEN"):
         if os.environ.get(k):
             cfg[k] = os.environ[k]
@@ -119,13 +160,58 @@ def load_config(required: bool = True) -> Dict[str, str]:
     return cfg
 
 
+def _inside(path: str, dirs: str) -> bool:
+    """Is `path` one of the comma-separated `dirs` or below one of them (symlinks resolved)?"""
+    p = os.path.normcase(os.path.realpath(path))
+    for d in dirs.split(","):
+        d = d.strip()
+        if not d:
+            continue
+        d = os.path.normcase(os.path.realpath(os.path.expanduser(d)))
+        try:
+            if os.path.commonpath([p, d]) == d:
+                return True
+        except ValueError:   # different drives (Windows)
+            continue
+    return False
+
+
+def task_log_on(cfg: Dict[str, str], force: Optional[bool] = None, cwd: Optional[str] = None) -> bool:
+    """May output lines of this run go to the hub? --log/--no-log decide; otherwise AVM_TASK_LOG=off (agent.conf, or
+    inherited from a parent run with the log off) or a cwd inside AVM_TASK_LOG_OFF_DIRS turns it off. Local only."""
+    if force is not None:
+        return force
+    if os.environ.get("AVM_TASK_LOG", "").strip().lower() in OFF_WORDS:
+        return False
+    if cfg.get("AVM_TASK_LOG", "on").strip().lower() in OFF_WORDS:
+        return False
+    try:
+        cwd = cwd or os.getcwd()
+    except OSError:
+        return False
+    return not _inside(cwd, cfg.get("AVM_TASK_LOG_OFF_DIRS", ""))
+
+
+def _say(msg: str) -> None:
+    """stderr that never raises: a closed stderr (`2>&1 | head`) must not cost the exit code or the task's finish."""
+    try:
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
+
 class Hub:
     def __init__(self, cfg: Dict[str, str]):
         self.cfg = cfg
-        self.base = cfg["AVM_SERVER_URL"].rstrip("/") + "/api/v1"
-        self.token = cfg["AVM_TOKEN"]
+        url = cfg.get("AVM_SERVER_URL") or ""
+        self.base = url.rstrip("/") + "/api/v1" if url else ""
+        self.token = cfg.get("AVM_TOKEN") or ""
+        self.last_error = ""
 
     def call(self, path: str, body: Optional[dict] = None, method: str = "POST", timeout: float = 10.0, raw: Optional[bytes] = None) -> dict:
+        if not self.base or not self.token:
+            raise RuntimeError("no agent config found (AVM_SERVER_URL / AVM_TOKEN)")
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
         req = urllib.request.Request(self.base + path, method=method, data=data,
                                      headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.token,
@@ -133,20 +219,43 @@ class Hub:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8") or "{}")
 
-    def try_call(self, path: str, body: Optional[dict] = None, method: str = "POST") -> Optional[dict]:
+    def try_call(self, path: str, body: Optional[dict] = None, method: str = "POST", quiet: bool = False) -> Optional[dict]:
+        """Never raises: None (and the reason in last_error) when the hub is down, erroring or rejects the token."""
         try:
-            return self.call(path, body, method)
+            r = self.call(path, body, method)
+            return r if isinstance(r, dict) else {}
         except urllib.error.HTTPError as e:
-            sys.stderr.write("avm: hub rejected %s: HTTP %s %s\n" % (path, e.code, e.read().decode(errors="replace")[:160]))
+            try:
+                detail = e.read().decode(errors="replace")[:160]
+            except Exception:
+                detail = ""
+            self.last_error = "hub rejected %s: HTTP %s %s" % (path, e.code, detail)
         except Exception as e:
-            sys.stderr.write("avm: cannot reach hub for %s: %s\n" % (path, e))
+            self.last_error = ("cannot reach hub for %s: %s" % (path, e)) if self.base and self.token else str(e)
+        if not quiet:
+            _say("avm: %s\n" % self.last_error)
         return None
 
 
-def _start(hub: Hub, name: str, source: str, expect: Optional[float], command: Optional[str], pid: Optional[int], note: Optional[str]) -> int:
-    body = {"name": name, "source": source, "expect_beat": expect, "command": command, "cwd": os.getcwd(), "pid": pid,
-            "user": _user(), "meta": {"hostname": socket.gethostname(), "note": note} if note else {"hostname": socket.gethostname()}}
-    r = hub.call("/tasks", body)
+def _task_body(name: str, source: str, expect: Optional[float], command: Optional[str], pid: Optional[int],
+               note: Optional[str], log_on: bool = True, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The task as the hub sees it. With the task log off, the command line and working directory stay local too."""
+    meta = dict(meta) if meta else {"hostname": socket.gethostname()}
+    if note:
+        meta["note"] = note
+    cwd: Optional[str] = None
+    if log_on:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            pass
+    return {"name": name, "source": source, "expect_beat": expect, "command": command if log_on else None, "cwd": cwd,
+            "pid": pid, "user": _user(), "meta": meta}
+
+
+def _start(hub: Hub, name: str, source: str, expect: Optional[float], command: Optional[str], pid: Optional[int], note: Optional[str],
+           log_on: bool = True) -> int:
+    r = hub.call("/tasks", _task_body(name, source, expect, command, pid, note, log_on))
     return int(r["id"])
 
 
@@ -174,6 +283,93 @@ def _fmt_dur(s: float) -> str:
 QUEUE_POLL = 5.0
 QUEUE_BEAT = 30.0
 EXIT_GAVE_UP = 124     # --max-wait expired (like timeout(1))
+MIN_BEAT = 5.0         # floor for --beat
+WATCH_RC_GRACE = 5.0   # avm watch: how long to wait for the rc file after the process is gone (its wrapper writes it)
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)   # a FIFO planted under a ticket's name must not hang every reader
+_BINARY = getattr(os, "O_BINARY", 0)
+
+
+class QueueUnsafe(Exception):
+    """The queue directory (or a file in it) is in a state another local user could abuse: refuse, don't work around."""
+
+
+def _open_queue_file(path: str, create: bool = False) -> Any:
+    """Open a file in the shared queue dir without following a symlink or blocking on a FIFO; regular files only.
+    create=True: read-write, created 0644 if missing; falls back to read-only on someone else's file (enough to lock)."""
+    flags = _NOFOLLOW | _NONBLOCK | _BINARY
+    writable = create
+    try:
+        fd = os.open(path, (os.O_RDWR | os.O_CREAT if create else os.O_RDONLY) | flags, 0o644)
+    except PermissionError:
+        if not create:
+            raise
+        fd, writable = os.open(path, os.O_RDONLY | flags), False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise QueueUnsafe("%s is not a regular file" % path)
+        if writable and not IS_WINDOWS and st.st_uid == os.getuid():
+            os.fchmod(fd, 0o644)   # readable by the other users of the queue whatever our umask
+    except BaseException:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "r+b" if writable else "rb")
+
+
+def _write_atomic(directory: str, path: str, data: bytes) -> None:
+    """Write `path` in the queue dir: a fresh mkstemp file (O_EXCL, never a planted one), then an atomic rename,
+    which replaces a symlink at `path` instead of writing through it."""
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            if not IS_WINDOWS:
+                os.fchmod(f.fileno(), 0o644)
+        for attempt in range(20):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if not IS_WINDOWS or attempt == 19:   # POSIX: a file of another user in a sticky dir - refuse
+                    raise
+                time.sleep(0.05)   # Windows: someone is reading it right now
+    finally:
+        try:
+            if os.path.lexists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _dir_problem(d: str, uid: Optional[int], final: bool) -> Optional[str]:
+    """Why another local user could take over directory `d` (None = safe): a symlink (final component), not a dir,
+    owned by someone other than root/us, or world-writable without the sticky bit. Group write is the owner's choice
+    (with user private groups and umask 002 every directory is g+w) and is not refused."""
+    try:
+        st = os.lstat(d) if final else os.stat(d)
+    except OSError as e:
+        return "cannot stat %s: %s" % (d, e.strerror)
+    if stat.S_ISLNK(st.st_mode):
+        return "%s is a symlink" % d
+    if not stat.S_ISDIR(st.st_mode):
+        return "%s is not a directory" % d
+    if uid is None:   # Windows: ACLs, not modes; the default lives under %ProgramData%
+        return None
+    if st.st_uid not in (0, uid):
+        return "%s is owned by uid %d (not root or you)" % (d, st.st_uid)
+    if st.st_mode & stat.S_IWOTH and not st.st_mode & stat.S_ISVTX:
+        return "%s is writable by others and not sticky (mode %o)" % (d, stat.S_IMODE(st.st_mode))
+    return None
+
+
+def _default_queue_dir() -> str:
+    if IS_WINDOWS:
+        return os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "AvalonAgent", "queue")
+    # /run/avm-queue (root-owned, 1777) only exists when the installer made it - no user can plant it there;
+    # otherwise /tmp/avm-queue, accepted only after the ownership checks in Queue._dir
+    return "/run/avm-queue" if os.path.isdir("/run/avm-queue") else "/tmp/avm-queue"
 
 
 def _size_gb(v: Optional[str]) -> Optional[float]:
@@ -285,18 +481,42 @@ class Queue:
 
     @staticmethod
     def _dir(cfg: Dict[str, str]) -> str:
-        d = os.environ.get("AVM_QUEUE_DIR") or cfg.get("AVM_QUEUE_DIR") or (
-            os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "AvalonAgent", "queue") if IS_WINDOWS else "/tmp/avm-queue")
+        """The shared queue dir, created if missing. Tickets must be visible to every user on the host (root's backup
+        and a user's training share the GPU), so it can't be per-user; instead it must be one nobody else controls:
+        a real directory owned by root or us, sticky if others may write, in a parent chain with the same properties.
+        Anything else is refused with the reason - no silent fallback to a private dir that would split the queue."""
+        d = os.path.abspath(os.environ.get("AVM_QUEUE_DIR") or cfg.get("AVM_QUEUE_DIR") or _default_queue_dir())
+        uid = None if IS_WINDOWS else os.getuid()
+        fix = "remove it (or ask its owner / root to), or set AVM_QUEUE_DIR in agent.conf"
+        parent = os.path.dirname(d)
+        if not IS_WINDOWS:
+            chain = os.path.realpath(parent)
+            while True:   # a parent another user can write to (non-sticky) could swap the queue dir under us
+                why = _dir_problem(chain, uid, final=False)
+                if why:
+                    raise QueueUnsafe("refusing queue dir %s: %s" % (d, why))
+                if os.path.dirname(chain) == chain:
+                    break
+                chain = os.path.dirname(chain)
         try:
-            os.makedirs(d, exist_ok=True)
-            if not IS_WINDOWS and os.stat(d).st_uid == os.getuid():
+            if IS_WINDOWS:
+                os.makedirs(d, exist_ok=True)
+            else:
+                os.mkdir(d, 0o700)   # private until we know it is ours, then opened up below
+        except FileExistsError:
+            pass
+        except OSError as e:
+            raise QueueUnsafe("cannot create queue dir %s: %s" % (d, e.strerror))
+        why = _dir_problem(d, uid, final=True)
+        if why:
+            raise QueueUnsafe("refusing queue dir: %s; %s" % (why, fix))
+        if uid is not None and os.lstat(d).st_uid == uid and stat.S_IMODE(os.lstat(d).st_mode) != 0o1777:
+            try:
                 os.chmod(d, 0o1777)   # shared by every user on the host; sticky: only owners remove their tickets
-            probe = os.path.join(d, ".probe-%d" % os.getpid())
-            open(probe, "w").close()
-            os.remove(probe)
-        except OSError:
-            d = os.path.join(tempfile.gettempdir(), "avm-queue-" + _user())
-            os.makedirs(d, exist_ok=True)
+            except OSError:
+                pass
+        if not os.access(d, os.W_OK | os.X_OK):
+            raise QueueUnsafe("queue dir %s is not writable by you (it should be mode 1777); %s" % (d, fix))
         return d
 
     def _path(self, tid: str, ext: str) -> str:
@@ -304,8 +524,8 @@ class Queue:
 
     def _alive(self, tid: str) -> bool:
         try:
-            f = open(self._path(tid, ".lock"), "rb")
-        except OSError:
+            f = _open_queue_file(self._path(tid, ".lock"))
+        except (OSError, QueueUnsafe):
             return False
         try:
             if _try_lock(f):   # we got it: its owner is gone
@@ -340,51 +560,45 @@ class Queue:
                 self._forget(tid)
                 continue
             try:
-                with open(self._path(tid, ".json"), encoding="utf-8") as f:
-                    out.append(json.load(f))
-            except (OSError, ValueError):
-                continue   # being rewritten right now
-        return sorted(out, key=lambda t: t.get("seq", ""))
+                with _open_queue_file(self._path(tid, ".json")) as f:
+                    t = json.loads(f.read().decode("utf-8"))
+                if isinstance(t, dict):
+                    out.append(t)
+            except (OSError, ValueError, QueueUnsafe):
+                continue   # being rewritten right now (or not a ticket at all)
+        return sorted(out, key=lambda t: str(t.get("seq", "")))
 
     def register(self, info: Dict[str, Any]) -> None:
-        tid = "%019d-%d" % (int(time.time() * 1e6), os.getpid())
-        self._lockf = open(self._path(tid, ".lock"), "w")   # lock first, then publish: a visible ticket is always locked
-        self._lockf.write("x")
+        for attempt in range(5):   # lock first, then publish: a visible ticket is always locked
+            tid = "%019d-%d" % (int(time.time() * 1e6), os.getpid())
+            try:   # O_EXCL: never adopt (or write through) a file someone planted under our name
+                fd = os.open(self._path(tid, ".lock"), os.O_RDWR | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _BINARY, 0o644)
+                break
+            except FileExistsError:
+                time.sleep(0.002)
+        else:
+            raise QueueUnsafe("cannot create a queue ticket in %s: the names are taken" % self.dir)
+        if not IS_WINDOWS:
+            os.fchmod(fd, 0o644)
+        self._lockf = os.fdopen(fd, "r+b")
+        self._lockf.write(b"x")
         self._lockf.flush()
         if not _try_lock(self._lockf):
             raise OSError("cannot lock queue ticket in %s" % self.dir)
-        try:
-            os.chmod(self._path(tid, ".lock"), 0o644)
-        except OSError:
-            pass
         self.me = dict(info, id=tid, seq=tid, pid=os.getpid(), user=_user(), queued_at=time.time())
         self.save()
 
     def save(self) -> None:
         if not self.me:
             return
-        path = self._path(self.me["id"], ".json")
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.me, f)
-        try:
-            os.chmod(tmp, 0o644)
-        except OSError:
-            pass
-        for attempt in range(20):
-            try:
-                os.replace(tmp, path)
-                return
-            except PermissionError:   # Windows: someone is reading it right now
-                time.sleep(0.05)
+        _write_atomic(self.dir, self._path(self.me["id"], ".json"), json.dumps(self.me).encode("utf-8"))
 
     def release(self) -> None:
         if self.me:
-            for ext in (".json", ".json.tmp"):
-                try:
-                    os.remove(self._path(self.me["id"], ext))
-                except OSError:
-                    pass
+            try:
+                os.remove(self._path(self.me["id"], ".json"))
+            except OSError:
+                pass
         if self._lockf:
             _unlock(self._lockf)
             self._lockf.close()
@@ -396,9 +610,9 @@ class Queue:
 
     def draining(self) -> Optional[str]:
         try:
-            with open(os.path.join(self.dir, "DRAIN"), encoding="utf-8") as f:
-                return f.read().strip() or "draining"
-        except OSError:
+            with _open_queue_file(os.path.join(self.dir, "DRAIN")) as f:
+                return f.read(500).decode("utf-8", "replace").strip() or "draining"
+        except (OSError, QueueUnsafe):
             return None
 
     def impossible(self, res: Dict[str, Any]) -> Optional[str]:
@@ -426,10 +640,10 @@ class Queue:
             return False, "host is draining (%s); `avm queue resume` reopens it" % drain, len(ahead) + 1
         if ahead:
             return False, "behind '%s'%s" % (ahead[0].get("name"), " and %d more" % (len(ahead) - 1) if len(ahead) > 1 else ""), len(ahead) + 1
-        if me.get("gpu") == "exclusive":
+        if me.get("gpu") == "exclusive":   # one heavy job at a time; shared --gpu jobs are never held back by it
             holder = next((t for t in running if t.get("gpu") == "exclusive"), None)
             if holder:
-                return False, "GPU in exclusive use by '%s'" % holder.get("name"), 1
+                return False, "one --exclusive GPU job at a time: '%s' is running" % holder.get("name"), 1
         settling = [t for t in running if now - (t.get("started_at") or 0) < self.settle]
         if me.get("mem_gb"):
             avail, _ = _mem_gb()
@@ -451,9 +665,9 @@ class Queue:
     def try_admit(self) -> Tuple[bool, str, int]:
         """Check and, if it fits, mark this ticket running - atomically, so two jobs can't both take the same free memory."""
         try:
-            lockf = open(os.path.join(self.dir, "admit.lock"), "a+")
-        except OSError:
-            lockf = open(os.path.join(self.dir, "admit.lock"), "r")
+            lockf = _open_queue_file(os.path.join(self.dir, "admit.lock"), create=True)
+        except OSError as e:   # e.g. ELOOP: someone planted a symlink there
+            raise QueueUnsafe("cannot use %s: %s" % (os.path.join(self.dir, "admit.lock"), e))
         try:
             _try_lock(lockf, blocking=True)
             ok, why, pos = self.check()
@@ -506,91 +720,228 @@ def cmd_run(args: argparse.Namespace, hub: Hub) -> int:
     except ValueError as e:
         sys.stderr.write("avm run: %s\n" % e)
         return 2
+    args.task_log = task_log_on(hub.cfg, getattr(args, "log_force", None))
     if res or args.wait:
         return _run_queued(args, hub, command, shown, res, max_wait)
-    beat_every = max(5.0, float(args.beat))
-    expect = beat_every * 2
-    tid = _start(hub, args.name, "run", expect, shown, None, args.note)
-    sys.stderr.write("avm: task #%d '%s' started (%s)\n" % (tid, args.name, shown[:80]))
-    return _execute(hub, args, command, tid, beat_every)
+    beat_every = max(MIN_BEAT, float(args.beat))
+    expect = beat_every * 2   # the hub marks it stalled after 1.5 x expect = 3 x beat without a beat
+    # the hub never stands between the user and the command: down, erroring or a rotated token -> run it untracked
+    tid = _try_start(hub, _task_body(args.name, "run", expect, shown, None, args.note, args.task_log))
+    if tid is None:
+        _say("avm: untracked: %s - running the command anyway\n" % hub.last_error)
+    else:
+        _say("avm: task #%d '%s' started (%s)%s\n" % (tid, args.name, shown[:80], "" if args.task_log else " [task log off: no output sent]"))
+    return _execute(hub, args, command, tid, beat_every, None if args.task_log else dict(os.environ, AVM_TASK_LOG="off"))
+
+
+_LINE_BREAK = re.compile(r"(\r\n|\r|\n)")
+
+
+class _Tail:
+    """Whole lines of the child's output, for the hub only (the terminal gets the raw bytes). A lone \\r - a progress
+    bar redrawing itself - overwrites the current line instead of starting a new one, so tqdm makes one line, not
+    thousands; the line still being drawn is available as partial() for the heartbeat."""
+    MAX = 2000
+
+    def __init__(self) -> None:
+        self._dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._held = ""   # a trailing \r: CRLF or a redraw, the next chunk tells
+        self.cur = ""     # the line being written
+        self.shown = ""   # what the last redraw left on screen
+
+    def feed(self, data: bytes, final: bool = False) -> List[str]:
+        text = self._held + self._dec.decode(data, final)
+        self._held = ""
+        if text.endswith("\r") and not final:
+            text, self._held = text[:-1], "\r"
+        out: List[str] = []
+        for part in _LINE_BREAK.split(text):
+            if part in ("\n", "\r\n"):
+                out.append(self.cur or self.shown)
+                self.cur = self.shown = ""
+            elif part == "\r":
+                if self.cur:
+                    self.shown = self.cur
+                self.cur = ""
+            elif part:
+                self.cur = (self.cur + part)[-self.MAX:]
+        if final and (self.cur or self.shown):
+            out.append(self.cur or self.shown)
+            self.cur = self.shown = ""
+        return out
+
+    def partial(self) -> str:
+        return self.cur or self.shown
+
+
+class _Passthrough:
+    """Our stdout, written byte for byte as the child produces it (no newline needed: prompts show at once). When the
+    reader goes away (`| head`, a closed terminal) we stop writing but keep draining the child, so it never blocks on a
+    full pipe and its exit code is still reported."""
+
+    def __init__(self) -> None:
+        self.stream = sys.stdout
+        self.broken = False
+        try:
+            self.stream.flush()   # anything printed before goes first
+        except (OSError, ValueError):
+            pass
+
+    def write(self, data: bytes) -> None:
+        if self.broken:
+            return
+        try:
+            buf = getattr(self.stream, "buffer", None)
+            if buf is not None:
+                buf.write(data)
+                buf.flush()
+            else:
+                self.stream.write(data.decode("utf-8", "replace"))
+                self.stream.flush()
+        except (OSError, ValueError):   # BrokenPipeError, EIO on a hung-up tty, a closed stream
+            self.broken = True
+            try:   # no "Exception ignored ... BrokenPipeError" when Python flushes stdout at exit
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, self.stream.fileno())
+                os.close(devnull)
+            except (OSError, ValueError, AttributeError):
+                pass
+
+
+def _signame(n: int) -> str:
+    try:
+        return signal.Signals(n).name
+    except ValueError:
+        return "signal %d" % n
 
 
 def _execute(hub: Hub, args: argparse.Namespace, command: Any, tid: Optional[int], beat_every: float,
              env: Optional[Dict[str, str]] = None) -> int:
-    """Run the command, stream its output through untouched, beat the task, report the exit code (passed through)."""
-    def call(path: str, body: dict) -> None:
-        if tid is not None:
-            hub.try_call(path % tid, body)
+    """Run the command, pass its output through byte for byte, beat the task, report the exit code (passed through;
+    killed by signal n -> 128+n). Neither the hub nor a closed stdout can stop the command or leave the task hanging.
+    With the task log off (args.task_log False) no output line is ever sent - only heartbeats, status, rc and note."""
+    log_on = getattr(args, "task_log", True)
+    failing: List[bool] = []
 
-    tail: deque = deque(maxlen=60)
-    pending: List[str] = []
+    def call(path: str, body: Dict[str, Any]) -> None:
+        if tid is None:
+            return
+        if not log_on:
+            body.pop("log", None)
+        if hub.try_call(path % tid, body, quiet=bool(failing)) is None:
+            failing.append(True)   # say it once, not on every beat
+        else:
+            failing[:] = []
+
+    tail = _Tail()
+    pending: deque = deque(maxlen=40)   # complete lines not yet sent
     lock = threading.Lock()
     t0 = time.time()
     try:
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=isinstance(command, str),
-                                bufsize=1, universal_newlines=True, errors="replace", env=env)
+                                bufsize=0, env=env)
     except OSError as e:
-        call("/tasks/%d/finish", {"status": "failed", "rc": 127, "log": ["cannot start: %s" % e]})
-        sys.stderr.write("avm: cannot start command: %s\n" % e)
+        call("/tasks/%d/finish", {"status": "failed", "rc": 127,
+                                  "note": "cannot start: %s" % (e if log_on else (e.strerror or e.__class__.__name__))})
+        _say("avm: cannot start command: %s\n" % e)
         return 127
     call("/tasks/%d/beat", {"pid": proc.pid})
 
     stop = threading.Event()
 
     def beater() -> None:
+        sent_partial = ""
         while not stop.wait(beat_every):
             with lock:
-                lines, pending[:] = pending[:], []
-            call("/tasks/%d/beat", {"log": lines[-40:]})
+                lines = list(pending)
+                pending.clear()
+                part = tail.partial()
+            if part and part != sent_partial:   # a progress bar mid-redraw: its latest state, once per beat
+                lines.append(part)
+                sent_partial = part
+            call("/tasks/%d/beat", {"log": lines})
 
     th = threading.Thread(target=beater, daemon=True)
     th.start()
 
-    def forward(signum, frame):  # pass Ctrl-C / SIGTERM to the child; we report what happens
+    def forward(signum, frame):  # pass Ctrl-C / SIGTERM / SIGHUP to the child; we report what happens
         try:
             proc.send_signal(signum)
         except Exception:
             pass
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    previous = {}
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):   # SIGHUP: an ssh drop finishes the task instead of stalling it
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
         try:
-            signal.signal(sig, forward)
+            previous[sig] = signal.signal(sig, forward)
         except (ValueError, OSError):
             pass
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        sys.stdout.write(line)
-        sys.stdout.flush()
-        line = line.rstrip("\n")
-        with lock:
-            tail.append(line)
-            pending.append(line)
-    rc = proc.wait()
+    out = _Passthrough()
+    try:
+        assert proc.stdout is not None
+        fd = proc.stdout.fileno()
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            out.write(chunk)
+            with lock:
+                pending.extend(tail.feed(chunk))
+        rc = proc.wait()
+    finally:
+        for sig, handler in previous.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError, TypeError):
+                pass
     stop.set()
     with lock:
-        lines, pending[:] = pending[:], []
+        pending.extend(tail.feed(b"", final=True))
+        lines = list(pending)
+        pending.clear()
+    killed = -rc if (rc < 0 and not IS_WINDOWS) else 0
+    if killed:
+        rc = 128 + killed   # like a shell: 143 for SIGTERM, 129 for SIGHUP
     status = "done" if rc == 0 else "failed"
-    call("/tasks/%d/finish", {"status": status, "rc": rc, "log": lines[-40:],
-                              "note": "%s after %s" % (status, _fmt_dur(time.time() - t0))})
-    sys.stderr.write("avm: task %s %s (rc=%s, %s)\n" % ("#%d" % tid if tid is not None else "(untracked)", status, rc, _fmt_dur(time.time() - t0)))
+    took = _fmt_dur(time.time() - t0)
+    note = ("killed by %s after %s" % (_signame(killed), took)) if killed else "%s after %s" % (status, took)
+    call("/tasks/%d/finish", {"status": status, "rc": rc, "log": lines, "note": note})
+    _say("avm: task %s %s (rc=%s, %s)\n" % ("#%d" % tid if tid is not None else "(untracked)", status, rc,
+                                            note if killed else took))
     return rc
 
 
 def _try_start(hub: Hub, body: Dict[str, Any]) -> Optional[int]:
-    """Create the dashboard task, but never let the hub block a queued job: None when it can't be reached."""
-    r = hub.try_call("/tasks", body)
-    return int(r["id"]) if r and r.get("id") is not None else None
+    """Create the dashboard task, but never let the hub block a job: None (reason in hub.last_error) when it can't."""
+    r = hub.try_call("/tasks", body, quiet=True)
+    try:
+        return int(r["id"])   # type: ignore[index]
+    except (TypeError, KeyError, ValueError):
+        if r is not None:
+            hub.last_error = "the hub answered without a task id"
+        return None
 
 
 def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, res: Dict[str, Any], max_wait: Optional[float]) -> int:
     """avm run with resource tags and/or --wait: declare, queue until it fits, then run exactly like a plain avm run."""
-    q = Queue(hub.cfg)
-    beat_every = max(5.0, float(args.beat))
+    try:
+        q = Queue(hub.cfg)
+    except QueueUnsafe as e:
+        sys.stderr.write("avm: %s\n" % e)
+        return 2
+    beat_every = max(MIN_BEAT, float(args.beat))
+    log_on = getattr(args, "task_log", True)
     meta: Dict[str, Any] = {"hostname": socket.gethostname(), "resources": res}
     if args.note:
         meta["note"] = args.note
-    body = {"name": args.name, "source": "run", "command": shown, "cwd": os.getcwd(), "pid": None, "user": _user(), "meta": meta}
+    body = _task_body(args.name, "run", None, shown, None, None, log_on, meta)
+    body["meta"] = meta   # the same dict: queue position and code identity are added to it below
     env = dict(os.environ)
+    if not log_on:
+        env["AVM_TASK_LOG"] = "off"   # nested avm calls in the job stay quiet too
 
     parent = os.environ.get("AVM_QUEUE_HOLD")
     if parent and q._alive(parent):   # nested inside a queued job: use its reservation, never wait behind it
@@ -599,6 +950,8 @@ def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, re
         tid = _try_start(hub, dict(body, expect_beat=beat_every * 2))
         if tid is not None:
             env["AVM_TASK_ID"] = str(tid)
+        else:
+            _say("avm: untracked: %s - running the command anyway\n" % hub.last_error)
         return _execute(hub, args, command, tid, beat_every, env)
 
     if args.wait:
@@ -620,10 +973,15 @@ def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, re
 
                 def interrupted(signum, frame):
                     raise KeyboardInterrupt
-                try:
-                    signal.signal(signal.SIGTERM, interrupted)
-                except (ValueError, OSError):
-                    pass
+                previous = {}
+                for name in ("SIGTERM", "SIGHUP"):   # killed or hung up while waiting: finish the task as cancelled
+                    sig = getattr(signal, name, None)
+                    if sig is None:
+                        continue
+                    try:
+                        previous[sig] = signal.signal(sig, interrupted)
+                    except (ValueError, OSError):
+                        pass
                 last_beat, last_why = time.time(), why
                 try:
                     while True:
@@ -654,10 +1012,11 @@ def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, re
                     sys.stderr.write("avm: '%s' cancelled while queued\n" % args.name)
                     return 130
                 finally:
-                    try:
-                        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-                    except (ValueError, OSError):
-                        pass
+                    for sig, handler in previous.items():
+                        try:
+                            signal.signal(sig, handler)
+                        except (ValueError, OSError, TypeError):
+                            pass
                 meta["queue"] = {"since": since, "waited": time.time() - since}
                 sys.stderr.write("avm: '%s' admitted after %s\n" % (args.name, _fmt_dur(time.time() - since)))
             else:
@@ -675,8 +1034,9 @@ def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, re
             hub.try_call("/tasks/%d/beat" % tid, {"status": "running", "meta": {k: meta[k] for k in ("queue", "code") if k in meta}})
         if tid is not None:
             env["AVM_TASK_ID"] = str(tid)
-        sys.stderr.write("avm: task %s '%s' started [%s] (%s)\n" % ("#%d" % tid if tid is not None else "(hub unreachable: untracked)",
-                                                                   args.name, _res_text(res), shown[:80]))
+            _say("avm: task #%d '%s' started [%s] (%s)\n" % (tid, args.name, _res_text(res), shown[:80]))
+        else:
+            _say("avm: untracked: %s - running '%s' [%s] anyway\n" % (hub.last_error, args.name, _res_text(res)))
         return _execute(hub, args, command, tid, beat_every, env)
     finally:
         q.release()
@@ -772,12 +1132,19 @@ def cmd_check(args: argparse.Namespace, hub: Hub) -> int:
 
 
 def cmd_queue(args: argparse.Namespace, cfg: Dict[str, str]) -> int:
-    q = Queue(cfg)
+    try:
+        q = Queue(cfg)
+    except QueueUnsafe as e:
+        sys.stderr.write("avm: %s\n" % e)
+        return 2
     flag = os.path.join(q.dir, "DRAIN")
     if args.op == "drain":
         if not q.draining():
-            with open(flag, "w", encoding="utf-8") as f:
-                f.write("drained by %s at %s" % (_user(), time.strftime("%Y-%m-%d %H:%M")))
+            try:   # never through a planted DRAIN symlink
+                _write_atomic(q.dir, flag, ("drained by %s at %s" % (_user(), time.strftime("%Y-%m-%d %H:%M"))).encode("utf-8"))
+            except OSError as e:
+                sys.stderr.write("avm: cannot drain: %s\n" % e)
+                return 1
         print("draining: queued jobs will not start; running ones finish (`avm queue resume` to reopen)")
         if args.wait:
             while True:
@@ -793,6 +1160,9 @@ def cmd_queue(args: argparse.Namespace, cfg: Dict[str, str]) -> int:
             print("resumed: queued jobs may start again")
         except FileNotFoundError:
             print("not draining")
+        except OSError as e:   # sticky dir: only its owner (or root) can remove another user's DRAIN
+            sys.stderr.write("avm: cannot resume: %s (%s; ask whoever drained it, or root)\n" % (e.strerror, q.draining() or "DRAIN"))
+            return 1
         return 0
     ts = q.tickets()
     avail, total = _mem_gb()
@@ -847,32 +1217,60 @@ def cmd_watch(args: argparse.Namespace, hub: Hub) -> int:
             kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), "watch", args.name, "--pid", str(args.pid), "--beat", str(args.beat)]
-                         + (["--rc-file", args.rc_file] if args.rc_file else []), env=env, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+        argv = [sys.executable, os.path.abspath(__file__), "watch", args.name, "--pid", str(args.pid), "--beat", str(args.beat)]
+        if args.rc_file:
+            argv.append("--rc-file=" + os.path.abspath(args.rc_file))
+        if args.note:
+            argv.append("--note=" + args.note)   # one token: a note starting with "-" stays a note
+        subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
         sys.stderr.write("avm: watching pid %d as '%s' in the background\n" % (args.pid, args.name))
         return 0
-    beat_every = max(5.0, float(args.beat))
-    tid = _start(hub, args.name, "watch", beat_every * 2, None, args.pid, args.note)
-    while _pid_alive(args.pid):
-        time.sleep(beat_every)
-        hub.try_call("/tasks/%d/beat" % tid, {})
+    beat_every = max(MIN_BEAT, float(args.beat))
+    tid = _start(hub, args.name, "watch", beat_every * 2, None, args.pid, args.note, task_log_on(hub.cfg))
+    last = time.time()
+    while _pid_alive(args.pid):   # look often, beat every beat_every: the end is reported promptly
+        time.sleep(min(1.0, beat_every))
+        if time.time() - last >= beat_every:
+            last = time.time()
+            hub.try_call("/tasks/%d/beat" % tid, {})
     rc: Optional[int] = None
-    if args.rc_file and os.path.isfile(args.rc_file):
-        try:
-            with open(args.rc_file) as f:
-                rc = int(f.read().strip())
-        except (OSError, ValueError):
-            rc = None
-    status = "failed" if (rc is not None and rc != 0) else "done"
-    hub.try_call("/tasks/%d/finish" % tid, {"status": status, "rc": rc, "note": "process exited" + ("" if rc is not None else " (exit code unknown)")})
+    status, note = "done", "process exited (exit code unknown)"
+    if args.rc_file:
+        rc, why = _read_rc(args.rc_file)
+        if rc is None:   # it died before writing it (crash, OOM kill): that is not a success
+            status, note = "failed", "process exited; exit code unknown (%s)" % why
+        else:
+            status, note = ("done" if rc == 0 else "failed"), "process exited"
+    hub.try_call("/tasks/%d/finish" % tid, {"status": status, "rc": rc, "note": note})
     return 0
+
+
+def _read_rc(path: str, grace: Optional[float] = None) -> Tuple[Optional[int], str]:
+    """(exit code, why not): waits up to WATCH_RC_GRACE for a wrapper to write it after the process is gone."""
+    deadline = time.time() + (WATCH_RC_GRACE if grace is None else grace)
+    while True:
+        try:
+            with open(path) as f:
+                return int(f.read().strip()), ""
+        except FileNotFoundError:
+            why = "rc file missing"
+        except ValueError:
+            why = "rc file holds no exit code"
+        except OSError as e:
+            return None, "rc file unreadable: %s" % (e.strerror or e)
+        if time.time() >= deadline:
+            return None, why
+        time.sleep(0.2)
 
 
 # -------------------------------------------------------------------- task
 def cmd_task(args: argparse.Namespace, hub: Hub) -> int:
+    log_on = task_log_on(hub.cfg)
+    if not log_on and getattr(args, "log", None):
+        sys.stderr.write("avm: the task log is off here (AVM_TASK_LOG / AVM_TASK_LOG_OFF_DIRS): --log lines not sent\n")
+        args.log = None
     if args.op == "start":
-        tid = _start(hub, args.name, "task", args.expect, None, None, args.note)
+        tid = _start(hub, args.name, "task", args.expect, None, None, args.note, log_on)
         print(tid)
         return 0
     if args.op == "list":
@@ -969,10 +1367,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p = sub.add_parser("run", help="run a command as a tracked task")
     p.add_argument("name")
-    p.add_argument("--beat", default=30, type=float, help="heartbeat seconds (default 30; stalled after 2x)")
+    p.add_argument("--beat", default=30, type=float,
+                   help="heartbeat seconds (default 30, at least 5); the dashboard shows it stalled after 3x this with no beat")
     p.add_argument("--note", default=None)
-    p.add_argument("--gpu", action="store_true", help="uses the GPU (light jobs may share it)")
-    p.add_argument("--exclusive", action="store_true", help="heavy GPU job: one exclusive job at a time (implies --gpu)")
+    lg = p.add_mutually_exclusive_group()
+    lg.add_argument("--log", dest="log_force", action="store_const", const=True, default=None,
+                    help="send output lines to the hub even where AVM_TASK_LOG / AVM_TASK_LOG_OFF_DIRS say off")
+    lg.add_argument("--no-log", dest="log_force", action="store_const", const=False,
+                    help="send no output lines (nor command line / cwd) to the hub for this run")
+    p.add_argument("--gpu", action="store_true",
+                   help="uses the GPU; light job: may share it, also with a running --exclusive job (add --vram to be admitted on free VRAM)")
+    p.add_argument("--exclusive", action="store_true",
+                   help="heavy GPU job (implies --gpu): waits only for another --exclusive job; does not hold back light --gpu jobs")
     p.add_argument("--mem", default=None, help="RAM it expects to use, e.g. 19G")
     p.add_argument("--vram", default=None, help="VRAM it expects to use, e.g. 6G")
     p.add_argument("--wait", action="store_true", help="queue until it fits (first come, first served)")
@@ -982,14 +1388,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = sub.add_parser("watch", help="track an already-running pid")
     p.add_argument("name")
     p.add_argument("--pid", required=True, type=int)
-    p.add_argument("--beat", default=30, type=float)
-    p.add_argument("--rc-file", default=None, help="file the process writes its exit code to (optional)")
+    p.add_argument("--beat", default=30, type=float, help="heartbeat seconds (default 30); stalled after 3x this with no beat")
+    p.add_argument("--rc-file", default=None, help="file the process writes its exit code to (optional; missing at the end = failed)")
     p.add_argument("--note", default=None)
     p.add_argument("--foreground", action="store_true")
 
     p = sub.add_parser("task", help="manual lifecycle: start / beat / done / fail / list")
     tp = p.add_subparsers(dest="op", required=True)
-    s = tp.add_parser("start"); s.add_argument("name"); s.add_argument("--expect", type=float, default=None, help="seconds between beats before it counts as stalled"); s.add_argument("--note")
+    s = tp.add_parser("start"); s.add_argument("name"); s.add_argument("--expect", type=float, default=None, help="expected seconds between beats; stalled after 1.5x this with no beat"); s.add_argument("--note")
     s = tp.add_parser("beat"); s.add_argument("id"); s.add_argument("--progress", type=float); s.add_argument("--log", action="append"); s.add_argument("--note")
     s = tp.add_parser("done"); s.add_argument("id"); s.add_argument("--note"); s.add_argument("--log", action="append")
     s = tp.add_parser("fail"); s.add_argument("id"); s.add_argument("--rc", type=int, default=1); s.add_argument("--note"); s.add_argument("--log", action="append")
@@ -1016,7 +1422,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         s.add_argument("--cwd", help="working dir for a --notify new session")
         s.add_argument("--with-log", action="store_true", help="include related avm task log tails in the alert")
         s.add_argument("--cooldown", help="minimum time between alerts, e.g. 30m (default 30m)")
-        s.add_argument("--daily-cap", type=int, help="alerts per day at most (default 6)")
+        s.add_argument("--daily-cap", type=int, help="alerts per rolling 24 h at most (default 6)")
     s = cp.add_parser("add"); s.add_argument("kind", choices=("process", "file", "tcp", "mount", "content", "marker", "nonempty", "unit", "job", "memory"))
     s.add_argument("target"); check_opts(s)
     s = cp.add_parser("set"); s.add_argument("id", type=int); s.add_argument("--target"); s.add_argument("--no-log", action="store_true"); check_opts(s)
@@ -1039,7 +1445,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.command = command or [c for c in (args.command or []) if c != "--"]
     if args.cmd == "queue":   # host-local: works without (or before) any hub config
         return cmd_queue(args, load_config(required=False))
-    hub = Hub(load_config())
+    hub = Hub(load_config(required=args.cmd != "run"))   # avm run works without a hub (untracked): the command always runs
     try:
         return {"run": cmd_run, "watch": cmd_watch, "task": cmd_task, "results": cmd_results, "agent": cmd_agent, "check": cmd_check}[args.cmd](args, hub)
     except urllib.error.HTTPError as e:

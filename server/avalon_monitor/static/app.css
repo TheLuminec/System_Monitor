@@ -186,7 +186,7 @@ main { padding: 20px; max-width: 1800px; margin: 0 auto; }
 
 .tables { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 16px; }
 @media (max-width: 440px) { .tables { grid-template-columns: 1fr; } }
-.table-card { padding: 14px; }
+.table-card { padding: 14px; min-width: 0; }   /* a grid item: let .table-wrap scroll instead of the card outgrowing its column (E-35) */
 .table-card h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
@@ -194,6 +194,7 @@ th { text-align: left; font-weight: 500; color: var(--ink-3); font-size: 11px; t
 td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; white-space: nowrap; }
 tr:last-child td { border-bottom: 0; }
 td.r, th.r { text-align: right; }
+td.wrap { white-space: normal; min-width: 110px; }   /* long GPU names wrap instead of pushing columns out of view */
 td .bar { display: inline-block; width: 90px; height: 5px; border-radius: 999px; background: var(--surface-3); vertical-align: middle; margin-left: 8px; overflow: hidden; }
 td .bar i { display: block; height: 100%; background: var(--c, var(--m-disk)); border-radius: 999px; }
 .kvlist { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 12.5px; }
@@ -412,6 +413,8 @@ details.transcripts[open] > summary { margin-bottom: 10px; }
 .btn.active { background: color-mix(in srgb, var(--accent) 18%, transparent); border-color: var(--accent); }
 .btn.danger { color: var(--s-crit); border-color: color-mix(in srgb, var(--s-crit) 50%, transparent); }
 .btn.small { padding: 3px 10px; font-size: 12px; }
+.btn:disabled, .iconbtn:disabled, .prompt-box textarea:disabled { opacity: 0.5; cursor: not-allowed; }
+.ro-link { text-decoration: underline; text-underline-offset: 2px; color: var(--s-warn); }
 
 .detail-head .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
 .detail-head .detail-meta { flex: 1 1 300px; min-width: 0; }

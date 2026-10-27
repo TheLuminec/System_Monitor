@@ -97,6 +97,14 @@ class AgentBundle:
             out[name] = cache[name][1]
         return out
 
+    def signature(self, name: str) -> Optional[str]:
+        """The release signature shipped beside a file (agent/<name>.sig, made by deploy/sign-release.py). Agents
+        refuse updates without a valid one; the hub only passes it along and cannot make one."""
+        try:
+            return (self.path.parent / (name + ".sig")).read_text().strip() or None
+        except OSError:
+            return None
+
     def sibling(self, name: str) -> Optional[bytes]:
         """Another file shipped beside the agent script (e.g. avm.py)."""
         p = self.path.parent / name
@@ -177,16 +185,27 @@ def require_same_origin(request: Request) -> None:
         raise HTTPException(403, "cross-origin request refused")
 
 
+def may_change(ident: Identity) -> Optional[str]:
+    """None if this viewer may change things, else why not. Changing anything needs a Cloudflare Access identity
+    (and, when AVM_OPERATORS is set, one on that list). Trusted-network viewers - tailnet devices, local processes -
+    are read-only unless AVM_TRUSTED_WRITE is on. The dashboard greys out its controls with the same answer."""
+    if ident.method != "access":
+        if settings.trusted_write:
+            return None
+        where = settings.public_url or "the public dashboard address"
+        return f"read-only here: changes need your Cloudflare Access login - open {where}"
+    if settings.operators and ident.subject.lower() not in settings.operators:
+        return f"{ident.subject} may view but not change things (AVM_OPERATORS)"
+    return None
+
+
 def require_operator(request: Request) -> Identity:
-    """Changing anything needs a Cloudflare Access identity (and, when AVM_OPERATORS is set, one on that list).
-    Trusted-network viewers - tailnet devices, local processes - are read-only unless AVM_TRUSTED_WRITE is on."""
+    """Guard for every dashboard route that changes state (see may_change)."""
     ident = require_viewer(request)
     require_same_origin(request)
-    if ident.method != "access" and not settings.trusted_write:
-        where = settings.public_url or "the public dashboard address"
-        raise HTTPException(403, f"read-only here: changes need your Cloudflare Access login - open {where}")
-    if settings.operators and ident.method == "access" and ident.subject.lower() not in settings.operators:
-        raise HTTPException(403, f"{ident.subject} may view but not change things (AVM_OPERATORS)")
+    why = may_change(ident)
+    if why:
+        raise HTTPException(403, why)
     return ident
 
 

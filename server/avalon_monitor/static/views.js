@@ -1,5 +1,6 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct, backupHealth } from "./core.js?v=1.11.1";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct, backupHealth,
+         canChange, roTip, guard, modeAllowed, actionsAllowed } from "./core.js?v=1.12.0";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
@@ -19,12 +20,14 @@ export function taskAlerting(t, now = Date.now() / 1000) {
   return !(hours > 0) || now - (t.ended || t.updated) < hours * 3600;
 }
 export async function ackTasks(ids, { host, undo = false } = {}) {
+  if (!canChange()) return 0;   // read-only viewer: opening a task just shows it (the buttons say why)
   try {
     const r = await post("/api/v1/tasks/ack", { ids, host, undo });
     return r.changed;
   } catch (e) { toast(e.message, true); return 0; }
 }
 export async function ackJobs(ids, { undo = false } = {}) {
+  if (!canChange()) return 0;
   try {
     const r = await post("/api/v1/claude/jobs/ack", { ids, undo });
     return r.changed;
@@ -98,11 +101,11 @@ async function fillTaskDetail(el, id) {
   log.scrollTop = log.scrollHeight;
   const actions = h("div", { class: "actions" });
   if (TASK_PROBLEM.has(t.status)) {
-    actions.append(t.acked
+    actions.append(guard(t.acked
       ? h("button", { class: "btn small", title: "Make this task alert again", onclick: () => ackTasks([t.id], { undo: true }) }, "Restore alert")
-      : h("button", { class: "btn small", title: "Stop alerting on this task (it stays in the list)", onclick: () => ackTasks([t.id]) }, "Acknowledge"));
+      : h("button", { class: "btn small", title: "Stop alerting on this task (it stays in the list)", onclick: () => ackTasks([t.id]) }, "Acknowledge")));
   }
-  if (t.status !== "running" && t.status !== "queued") actions.append(h("button", { class: "btn small danger", onclick: async () => { try { await post(`/api/v1/tasks/${t.id}`, undefined, "DELETE"); } catch (e) { toast(e.message, true); } } }, "Delete"));
+  if (t.status !== "running" && t.status !== "queued") actions.append(guard(h("button", { class: "btn small danger", onclick: async () => { try { await post(`/api/v1/tasks/${t.id}`, undefined, "DELETE"); } catch (e) { toast(e.message, true); } } }, "Delete")));
   if (t.status === "running" || t.status === "stalled" || t.status === "queued") actions.append(h("span", { class: "muted", style: "font-size:12px" }, t.status === "queued" ? "waiting on its host's queue · cancel it with Ctrl-C where it was started" : "live · updates as the task reports"));
   el.append(actions);
 }
@@ -371,7 +374,14 @@ async function renderConsole() {
 
   // ---- prompt box
   const ta = h("textarea", { placeholder: `Ask Claude on ${host.display_name}… (Ctrl+Enter to send)`, spellcheck: "true" });
-  const mode = h("select", { title: "Permission mode" }, ...Object.entries(MODE_LABEL).map(([k, l]) => h("option", { value: k, class: k === "full" ? "mode-full" : "" }, l)));
+  // this host's own caps (agent.conf, E-04); older agents report none: unknown, nothing greyed out
+  const policy = c?.policy || null;
+  v.policy = policy;
+  const capTip = policy ? `this host allows up to ${MODE_LABEL[policy.max_mode] || policy.max_mode} (AVM_MAX_JOB_MODE in its agent.conf)` : "";
+  const mode = h("select", { title: policy ? "Permission mode · " + capTip : "Permission mode" }, ...Object.entries(MODE_LABEL).map(([k, l]) => {
+    const ok = modeAllowed(k, policy);
+    return h("option", { value: k, class: k === "full" ? "mode-full" : "", disabled: ok ? null : "", title: ok ? null : capTip }, ok ? l : `${l} - above this host's limit`);
+  }));
   const cwd = h("input", { class: "cwd", list: "cwd-list", placeholder: "working directory (default: home)", value: cwds[0] || "", spellcheck: "false" });
   const dl = h("datalist", { id: "cwd-list" }, ...cwds.map((x) => h("option", { value: x })));
   const tracked = trackedOn(host.name);
@@ -404,16 +414,21 @@ async function renderConsole() {
   const avail = !c ? h("div", { class: "muted", style: "font-size:12.5px" }, host.status === "online" ? "This host's agent predates Claude support (needs 1.3). It updates itself on its next report once the hub is upgraded." : `Host is ${host.status}; prompts queue until it reports.`)
     : agentIsSystem(c) ? h("div", { class: "chip warn", style: "white-space:normal", title: "From an admin PowerShell in the agent folder" },
         "The agent runs as SYSTEM, so it can't see your Claude sessions. Reinstall it as you: install-windows.ps1 -Upgrade -AsCurrentUser")
+    : policy?.jobs === false ? h("div", { class: "chip warn", style: "white-space:normal", title: "AVM_ALLOW_ROOT_JOBS is off in its agent.conf" },
+        `The agent runs as ${c.user || "root"}, so it refuses prompts and session restarts here (they would run unconfined with full privileges). Run the agent as a normal user to use them.`)
     : !c.available ? h("div", { class: "chip bad" }, "claude CLI not found on this host")
     : desktopOnly(c) ? h("div", { class: "chip", style: "white-space:normal" }, "Claude Desktop only: sessions are listed and trackable; prompting needs the Claude Code CLI") : null;
-  if (desktopOnly(c) || agentIsSystem(c)) {   // the hub would refuse these prompts anyway
+  if (desktopOnly(c) || agentIsSystem(c) || policy?.jobs === false) {   // the hub or the agent would refuse these prompts anyway
     for (const el of [ta, sendBtn, mode, resume, cwd, model]) el.disabled = true;
     ta.placeholder = desktopOnly(c) ? `Prompting ${host.display_name} needs the Claude Code CLI installed there (Claude Desktop's built-in copy only runs inside the app).` : ta.placeholder;
-  }
+  } else if (!canChange()) { guard(ta); guard(sendBtn); ta.placeholder = roTip(); }   // options stay browsable: they show this host's caps
   const continueIn = (sid, dir) => { resume.value = sid; if (dir) cwd.value = dir; ta.focus(); toast("Next prompt continues this session"); };
 
   // ---- tracked sessions (registered; kept when stopped or the host is offline)
   const canAct = (c?.features || []).includes("agent_actions");   // c is the raw report: the summary's "actions" flag is not in it
+  const actBlock = !canAct ? (host.status === "online" ? "needs agent 1.5 on this host" : "host offline")
+    : !actionsAllowed(policy) ? (policy.jobs === false ? "this agent runs as root/SYSTEM and refuses restart/stop (AVM_ALLOW_ROOT_JOBS in its agent.conf)"
+      : "restart/stop is off on this host (AVM_ALLOW_ACTIONS in its agent.conf)") : null;
   const trackedCard = h("div", { class: "card table-card" },
     h("h3", {}, `Tracked agents on ${host.display_name}`, h("span", { class: "muted", style: "font-weight:400;font-size:12px;margin-left:8px" },
       "stay listed when stopped · track one below, or run ", h("code", {}, "avm agent track"), " inside it")));
@@ -422,17 +437,17 @@ async function renderConsole() {
   for (const t of tracked) {
     const st = trackedState(t, host), pend = pendingAction(t);
     const ago = t.last_activity ? fmt.ago(Date.now() / 1000 - t.last_activity) : "";
-    const btn = (label, cls, onclick, extra = {}) => h("button", { class: "btn small " + cls, onclick, ...extra }, label);
+    const btn = (label, cls, onclick, extra = {}) => guard(h("button", { class: "btn small " + cls, onclick, ...extra }, label));
     const actions = [];
     if (pend) actions.push(h("span", { class: "chip warn" }, `${pend.action} ${pend.status === "queued" ? (host.status === "online" ? "queued…" : "queued until the host is back") : "running…"}`));
     else if (t.kind === "desktop") {   // owned by the Desktop app: nothing to restart or prompt from here
       if (!t.live) actions.push(h("span", { class: "muted", style: "font-size:12px" }, "reopen it in Claude Desktop"));
       if (!t.live && t.session_id && !desktopOnly(c)) actions.push(btn("Prompt it", "", () => continueIn(t.session_id, t.cwd), { title: "continue this conversation with the Claude Code CLI on this host (claude -p --resume)" }));
     } else if (!t.live || host.status !== "online") {
-      actions.push(btn("Restart", "primary", () => trackedAction(t, "restart"), canAct ? { title: t.kind === "background" ? "claude respawn: same agent, same conversation" : "resume as a background agent" }
-        : { disabled: "", title: host.status === "online" ? "needs agent 1.5 on this host" : "host offline" }));
+      actions.push(btn("Restart", "primary", () => trackedAction(t, "restart"), !actBlock ? { title: t.kind === "background" ? "claude respawn: same agent, same conversation" : "resume as a background agent" }
+        : { disabled: "", title: actBlock }));
       if (t.session_id && !desktopOnly(c)) actions.push(btn("Prompt it", "", () => continueIn(t.session_id, t.cwd), { title: "send one prompt that continues this conversation (claude -p --resume)" }));
-    } else if (t.kind === "background") actions.push(btn("Stop", "danger", () => { if (confirm(`Stop ${t.name || t.key}?`)) trackedAction(t, "stop"); }, canAct ? {} : { disabled: "", title: "needs agent 1.5 on this host" }));
+    } else if (t.kind === "background") actions.push(btn("Stop", "danger", () => { if (confirm(`Stop ${t.name || t.key}?`)) trackedAction(t, "stop"); }, !actBlock ? {} : { disabled: "", title: actBlock }));
     actions.push(btn("Untrack", "", async () => { if (!confirm(`Stop tracking ${t.name || t.key}? (The session itself is not touched.)`)) return; try { await post(`/api/v1/claude/tracked/${t.id}`, undefined, "DELETE"); } catch (e) { toast(e.message, true); } }, { style: "margin-left:auto" }));
     tbox.append(h("div", { class: "session tracked" },
       h("div", { class: "t" }, h("span", { class: "trk-dot " + st.cls, title: st.why || "" }), h("b", {}, t.name || t.key.slice(0, 8)),
@@ -448,7 +463,8 @@ async function renderConsole() {
   v.right.append(trackedCard);
 
   v.right.append(h("div", { class: "card prompt-box" },
-    h("div", { style: "display:flex;align-items:center;gap:8px" }, h("b", {}, host.display_name), h("span", { class: "muted", style: "font-size:12px" }, c ? `claude ${c.version || "?"} · runs as ${c.user || "?"}` : ""), h("span", { class: "spacer" }), avail),
+    h("div", { style: "display:flex;align-items:center;gap:8px" }, h("b", {}, host.display_name), h("span", { class: "muted", style: "font-size:12px" }, c ? `claude ${c.version || "?"} · runs as ${c.user || "?"}` : ""),
+      policy && policy.jobs !== false ? h("span", { class: "chip", title: capTip }, `up to ${MODE_LABEL[policy.max_mode] || policy.max_mode}`) : null, h("span", { class: "spacer" }), avail),
     ta, dl,
     h("div", { class: "opts" }, mode, resume, cwd, model, sendBtn),
   ));
@@ -464,7 +480,7 @@ async function renderConsole() {
           h("span", { class: "muted", style: "font-size:11px" }, `${KIND_LABEL[a.kind] || a.kind || ""}${a.live ? "" : (a.kind === "desktop" ? " · closed" : " · stopped")}${a.state && a.state !== "done" ? " · " + a.state : ""}`),
           reachChip(a),
           h("span", { class: "muted", style: "margin-left:auto;white-space:nowrap" }, a.last_activity ? fmt.ago(Date.now() / 1000 - a.last_activity) : ""),
-          h("button", { class: "btn small", onclick: () => trackSession(host.name, a) }, "Track")),
+          guard(h("button", { class: "btn small", onclick: () => trackSession(host.name, a) }, "Track"))),
         a.detail || a.last_said ? h("div", { class: "snip" }, a.detail || a.last_said) : null));
     }
     v.right.append(h("div", { class: "card table-card" }, h("h3", {}, `Other sessions on ${host.display_name}`,
@@ -480,8 +496,8 @@ async function renderConsole() {
           h("span", { class: "muted", style: "margin-left:auto;white-space:nowrap" }, fmt.ago(Date.now() / 1000 - s.last_activity)), s.dashboard_job ? h("span", { class: "chip", style: "font-size:10px" }, "from dashboard") : null),
         s.first_prompt ? h("div", { class: "snip" }, h("b", {}, "started with: "), s.first_prompt) : null,
         h("div", { class: "actions" },
-          h("button", { class: "btn small", onclick: () => continueIn(s.session_id, s.cwd) }, "Continue this session"),
-          known.has(s.session_id) ? null : h("button", { class: "btn small", onclick: () => trackSession(host.name, { key: s.session_id, session_id: s.session_id, cwd: s.cwd, name: (s.first_prompt || "").slice(0, 60), kind: "interactive" }) }, "Track"))));
+          guard(h("button", { class: "btn small", onclick: () => continueIn(s.session_id, s.cwd) }, "Continue this session")),
+          known.has(s.session_id) ? null : guard(h("button", { class: "btn small", onclick: () => trackSession(host.name, { key: s.session_id, session_id: s.session_id, cwd: s.cwd, name: (s.first_prompt || "").slice(0, 60), kind: "interactive" }) }, "Track")))));
     }
     v.right.append(h("details", { class: "card table-card transcripts" }, h("summary", {}, `Recent transcripts on ${host.display_name}`,
       h("span", { class: "muted", style: "font-weight:400;font-size:12px;margin-left:8px" }, `${sessions.length} in the last 24 h · from ~/.claude`)), box));
@@ -505,7 +521,7 @@ function renderJobs() {
     v.jobsEl.append(h("div", { class: `card job ${j.status}${j.id === v.job ? " sel" : ""}`, onclick: () => { v.job = j.id; renderJobs(); renderTranscript(); } },
       h("span", { class: "dot" }),
       h("div", {}, h("div", {}, j.title), h("div", { class: "meta" }, `${j.status} · ${j.action ? "session " + j.action : MODE_LABEL[j.mode] || j.mode} · ${fmt.when(j.created)}${j.created_by ? " · " + j.created_by : ""}${j.cost_usd != null ? " · " + fmt.usd(j.cost_usd) : ""}`)),
-      (j.status === "queued" || j.status === "running") ? h("button", { class: "btn small danger", onclick: async (e) => { e.stopPropagation(); try { await post(`/api/v1/claude/jobs/${j.id}/cancel`, {}); } catch (err) { toast(err.message, true); } } }, "Cancel") : h("span", { class: "muted num", style: "font-size:11px" }, j.num_turns != null ? `${j.num_turns} turn${j.num_turns === 1 ? "" : "s"}` : ""),
+      (j.status === "queued" || j.status === "running") ? guard(h("button", { class: "btn small danger", onclick: async (e) => { e.stopPropagation(); try { await post(`/api/v1/claude/jobs/${j.id}/cancel`, {}); } catch (err) { toast(err.message, true); } } }, "Cancel")) : h("span", { class: "muted num", style: "font-size:11px" }, j.num_turns != null ? `${j.num_turns} turn${j.num_turns === 1 ? "" : "s"}` : ""),
     ));
   }
 }
@@ -523,8 +539,11 @@ async function renderTranscript() {
     h("b", {}, `#${j.id}`), h("span", { class: "chip " + (j.status === "failed" ? "bad" : j.status === "done" ? "ok" : j.status === "running" ? "" : "warn") }, j.status),
     h("span", { class: "muted", style: "font-size:12px" }, `${j.action ? "session " + j.action : MODE_LABEL[j.mode] || j.mode}${j.cwd ? " · " + j.cwd : ""}${j.session_id ? " · session " + j.session_id.slice(0, 8) : ""}${j.duration_ms ? " · " + fmt.dur(j.duration_ms / 1000) : ""}${j.cost_usd != null ? " · " + fmt.usd(j.cost_usd) : ""}`),
     h("span", { class: "spacer" }),
-    j.session_id && (j.status === "done" || j.status === "failed") ? h("button", { class: "btn small", onclick: () => { v.resumeSession = j.session_id; renderConsole(); } }, "Continue this conversation") : null,
+    j.session_id && (j.status === "done" || j.status === "failed") ? guard(h("button", { class: "btn small", onclick: () => { v.resumeSession = j.session_id; renderConsole(); } }, "Continue this conversation")) : null,
   );
+  // E-06: this host's agent may send only a summary (answer, tool names) or nothing but the status
+  const tl = v.policy?.transcript;
+  const limited = tl === "summary" || tl === "off" ? h("div", { class: "chip warn", style: "align-self:flex-start;white-space:normal" }, `transcript limited on this host (AVM_JOB_TRANSCRIPT=${tl})`) : null;
   if (j.action) {   // restart/stop of a tracked session: no conversation, just what the CLI said
     el.append(head, h("div", { class: "muted", style: "font-size:12.5px" }, `${j.action} of ${j.target?.name || j.target?.key || "?"}${j.created_by ? " · by " + j.created_by : ""}`));
     if (j.result) el.append(h("div", { class: "result-box" + (j.status === "failed" ? " err" : "") }, j.result));
@@ -532,7 +551,7 @@ async function renderTranscript() {
     if (j.error && j.error !== j.result) el.append(h("div", { class: "result-box err" }, j.error));
     return;
   }
-  el.append(head, h("div", { class: "msg user" }, h("div", { class: "who" }, "prompt" + (j.created_by ? " · " + j.created_by : "")), h("div", { class: "body" }, j.prompt)));
+  el.append(head, ...(limited ? [limited] : []), h("div", { class: "msg user" }, h("div", { class: "who" }, "prompt" + (j.created_by ? " · " + j.created_by : "")), h("div", { class: "body" }, j.prompt)));
   for (const ev of events) el.append(...eventNodes(ev));
   if (j.status === "running") el.append(h("div", { class: "msg assistant", "data-f": "live" }, h("div", { class: "body" }, h("span", { class: "cursor" }))));
   else if (j.status === "queued") el.append(h("div", { class: "muted" }, "Waiting for the agent to pick this up…"));
@@ -602,8 +621,10 @@ export function computeAlerts() {
     for (const c of s.checks || []) if (!c.ok && c.level !== "info") out.push({ level: c.level === "warning" ? "warn" : "crit", what: `${c.kind === "rule" ? "" : c.kind + " check: "}${c.name}`, why: c.detail || "", host: host.name, go: `#/host/${encodeURIComponent(host.name)}`, ts: s.ts });
     for (const b of s.backups || []) {
       const bh = backupHealth(b, now);
-      if (bh.level !== "ok" && b.state !== "running") out.push({ level: bh.level, what: `${bh.label}: ${b.name}`, why: b.error || `last success ${fmt.when(b.last_success)}${b.next_run ? " · next run " + fmt.when(b.next_run) : ""}`,
-        host: host.name, go: `#/host/${encodeURIComponent(host.name)}`, ts: b.finished || b.last_success });
+      if (bh.alert) out.push({ level: bh.level, what: `${bh.label}: ${b.name}`,
+        why: bh.stale ? `started ${fmt.when(b.started)} and never finished - killed (OOM, reboot, SIGKILL) or hung · last success ${fmt.when(b.last_success)}`
+          : b.error || `last success ${fmt.when(b.last_success)}${b.next_run ? " · next run " + fmt.when(b.next_run) : ""}`,
+        host: host.name, go: `#/host/${encodeURIComponent(host.name)}`, ts: bh.stale ? b.started : b.finished || b.last_success });
     }
     if (host.agent_update_error) out.push({ level: "warn", what: "agent self-update failed", why: host.agent_update_error, host: host.name, go: `#/host/${encodeURIComponent(host.name)}`, ts: s.ts });
     if (s.memory?.committed != null && s.memory?.commit_limit && (100 * s.memory.committed) / s.memory.commit_limit >= commitWarnPct(host)) out.push({ level: "warn", what: "memory commit pressure", why: `committed ${fmt.bytes(s.memory.committed)} of ${fmt.bytes(s.memory.commit_limit)}`, host: host.name, go: `#/host/${encodeURIComponent(host.name)}`, ts: s.ts });
@@ -646,17 +667,17 @@ export async function renderAlerts() {
       // Opening a task alert counts as having checked it: acknowledge, then show the task.
       const open = () => { if (a.task) ackTasks([a.task]); navigate(a.go); };
       const ack = a.task ? () => ackTasks([a.task]) : a.job ? () => ackJobs([a.job]) : null;
-      const dismiss = ack ? h("button", { class: "btn small", title: `Acknowledge: stop alerting, keep the ${a.task ? "task" : "prompt"}`, onclick: (e) => { e.stopPropagation(); ack(); } }, "Dismiss") : null;
+      const dismiss = ack ? guard(h("button", { class: "btn small", title: `Acknowledge: stop alerting, keep the ${a.task ? "task" : "prompt"}`, onclick: (e) => { e.stopPropagation(); ack(); } }, "Dismiss")) : null;
       list.append(h("div", { class: "card alert " + a.level, onclick: open }, h("span", { class: "dot" }), h("div", {}, h("div", { class: "what" }, a.what), h("div", { class: "why" }, a.why)), h("div", { class: "host" }, a.host, dismiss ? " " : null, dismiss)));
     }
     dismissAll.style.display = alerts.some((a) => a.task || a.job) ? "" : "none";
     emit_badges();
   };
-  const dismissAll = h("button", { class: "btn small", title: "Acknowledge every task and failed-prompt alert shown (tasks and prompts are kept)", onclick: () => {
+  const dismissAll = guard(h("button", { class: "btn small", title: "Acknowledge every task and failed-prompt alert shown (tasks and prompts are kept)", onclick: () => {
     const shown = computeAlerts(), tasks = shown.filter((a) => a.task).map((a) => a.task), jobs = shown.filter((a) => a.job).map((a) => a.job);
     if (tasks.length) ackTasks(tasks);
     if (jobs.length) ackJobs(jobs);
-  } }, "Dismiss all task/prompt alerts");
+  } }, "Dismiss all task/prompt alerts"));
   redraw();
   app.append(h("div", { class: "page-head" }, h("h2", {}, "Alerts"), h("span", { class: "muted" }, "what needs attention right now"), h("div", { class: "filters" }, dismissAll)), list);
   state.alertsView = { redraw };

@@ -25,13 +25,13 @@ import json, sys
 c = json.load(open(sys.argv[1]))
 for k in ("name", "repository", "password_file", "paths"):
     assert c.get(k), f"config is missing {k!r}"
-c.setdefault("unit", "avalon-backup"); c.setdefault("schedule", "*-*-* 03:30")
+c.setdefault("unit", "avalon-backup"); c.setdefault("schedule", "*-*-* 03:30"); c.setdefault("max_run_sec", 43200)
 c["timer"] = c["unit"] + ".timer"
 print(json.dumps(c, indent=2))
 EOF
 )
 get() { python3 -I -c 'import json,sys; v=json.loads(sys.argv[1]).get(sys.argv[2]); print("" if v is None else v)' "$CONF" "$1"; }
-NAME=$(get name); REPO=$(get repository); PASS=$(get password_file); UNIT=$(get unit); SCHED=$(get schedule); MNT=$(get require_mount)
+NAME=$(get name); REPO=$(get repository); PASS=$(get password_file); UNIT=$(get unit); SCHED=$(get schedule); MNT=$(get require_mount); MAXRUN=$(get max_run_sec)
 AVM_CONF="/home/${SUDO_USER:-root}/.config/avalon-agent/agent.conf"; [ -f "$AVM_CONF" ] || AVM_CONF=/etc/avalon-agent/agent.conf
 [ -z "$MNT" ] || mountpoint -q "$MNT" || { echo "$MNT is not mounted - mount it first"; exit 1; }
 
@@ -39,6 +39,9 @@ command -v restic >/dev/null || apt-get install -y -o Acquire::Retries=3 restic
 echo "restic: $(restic version)"
 if [ ! -s "$PASS" ]; then
   (umask 077; openssl rand -base64 30 > "$PASS"); NEWPASS=1
+  # shown right away (terminal only, never the log): a later step failing must not leave a password nobody has seen
+  { echo; echo "  RESTIC PASSWORD for $REPO - save it in your password manager NOW:"; echo; echo "      $(cat "$PASS")"; echo
+    echo "  Without it the backup cannot be restored if this machine's disk dies."; echo; } >&3
 fi
 chmod 600 "$PASS"
 if [ -f "$REPO/config" ]; then echo "repository: $REPO (existing, kept)"
@@ -62,7 +65,7 @@ ExecStart=/usr/bin/python3 -I /usr/local/lib/avalon-backup/avm.py run --beat 60 
 Nice=19
 IOSchedulingClass=idle
 CPUSchedulingPolicy=batch
-TimeoutStartSec=12h
+TimeoutStartSec=$MAXRUN
 EOF
 cat > "/etc/systemd/system/$UNIT.timer" <<EOF
 [Unit]
@@ -81,10 +84,10 @@ systemctl enable --now "$UNIT.timer"
 systemctl list-timers "$UNIT.timer" --no-pager --no-legend || true   # no `| head`: under pipefail its SIGPIPE ended the script
 
 echo "== status file"
+# keeps a status from a real run (a failure stays visible); `/usr/local/sbin/$UNIT --seed --force` overwrites it
 "/usr/local/sbin/$UNIT" --seed || echo "(no snapshot yet - the card fills in after the first run)"
 if [ "$NOW" = "--now" ]; then systemctl start --no-block "$UNIT.service"; echo "backup started: watch the '$NAME' task"; fi
 
 if [ -n "${NEWPASS:-}" ]; then
-  { echo; echo "  RESTIC PASSWORD for $REPO - save it in your password manager NOW:"; echo; echo "      $(cat "$PASS")"; echo
-    echo "  Without it the backup cannot be restored if this machine's disk dies."; echo; } >&3
+  echo "  (reminder: the new restic password for $REPO was printed above - save it before closing this terminal)" >&3
 fi

@@ -37,6 +37,18 @@ Configuration (env vars override the config file; file is KEY=VALUE lines):
     AVM_CLAUDE_HOME     directory holding .claude/ (default: this user's home)
     AVM_LOG_LEVEL       info
 
+Local policy - only this file sets these; the hub can never override them:
+    AVM_MAX_JOB_MODE    plan    highest permission mode a dashboard prompt may run with here:
+                                plan | acceptEdits | full (full = --dangerously-skip-permissions)
+    AVM_ALLOW_ACTIONS   true    allow restart/stop of tracked Claude sessions from the dashboard
+    AVM_ALLOW_ROOT_JOBS false   run Claude prompts/actions when this agent runs as root/SYSTEM (refused otherwise)
+    AVM_JOB_TRANSCRIPT  full    what a prompt's transcript sends to the hub: full | summary (final answer and tool
+                                names only - no tool inputs/results or intermediate text) | off (status only)
+    AVM_CONTENT_ROOTS   (none)  directories a hub-added content check may read from; content checks listed in this
+                                file are always allowed, any other target must resolve (symlinks followed) inside one
+    AVM_UPDATE_PUBKEYS  (built-in) Ed25519 public keys (hex, comma list) whose signature a self-update must carry
+    AVM_STATE_DIR       directory for state kept across restarts (default: beside the config file)
+
 The hub may override the AVM_WATCH_* / AVM_PROCESSES / AVM_TAGS / AVM_MEM_AVAILABLE_WARN_GB
 settings remotely (set from the dashboard); they arrive in the reply to each push and
 take effect on the next sample. A "respawn" command in the reply makes the agent re-exec
@@ -74,7 +86,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.8.1"
+AGENT_VERSION = "1.9.0"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -108,7 +120,22 @@ DEFAULTS = {
     "AVM_CLAUDE_BIN": "",
     "AVM_CLAUDE_HOME": "",
     "AVM_LOG_LEVEL": "info",
+    "AVM_MAX_JOB_MODE": "plan",
+    "AVM_ALLOW_ACTIONS": "true",
+    "AVM_ALLOW_ROOT_JOBS": "false",
+    "AVM_JOB_TRANSCRIPT": "full",
+    "AVM_CONTENT_ROOTS": "",
+    "AVM_UPDATE_PUBKEYS": "",
+    "AVM_STATE_DIR": "",
 }
+
+
+def conf_value(raw: str) -> str:
+    """KEY=value -> value: an unquoted value ends at " #" (an inline comment), then surrounding quotes are dropped."""
+    v = raw.strip()
+    if v[:1] not in ('"', "'"):
+        v = re.split(r"\s+#", v, maxsplit=1)[0]
+    return v.strip().strip('"').strip("'")
 
 
 def load_config(path: Optional[str]) -> Dict[str, str]:
@@ -120,7 +147,7 @@ def load_config(path: Optional[str]) -> Dict[str, str]:
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, _, v = line.partition("=")
-                cfg[k.strip()] = v.strip().strip('"').strip("'")
+                cfg[k.strip()] = conf_value(v)
     for k in DEFAULTS:
         if os.environ.get(k):
             cfg[k] = os.environ[k]
@@ -129,6 +156,10 @@ def load_config(path: Optional[str]) -> Dict[str, str]:
 
 def _csv(value: str) -> List[str]:
     return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def _on(value: Optional[str]) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _run(cmd: List[str], timeout: float = 5.0) -> Optional[str]:
@@ -742,10 +773,37 @@ def collect_processes(top_n: int) -> List[Dict[str, Any]]:
     if not _proc_primed:
         _proc_primed = True  # first call returns 0.0 for cpu_percent; still useful for memory
     procs.sort(key=lambda x: ((x["cpu_percent"] or 0), (x["mem_percent"] or 0)), reverse=True)
-    return procs[:top_n]
+    top = procs[:top_n]
+    for x in top:   # Claude Code's native binary is a versioned file (~/.local/share/claude/versions/2.1.311)
+        paths = []
+        for get in ("exe", "cmdline"):   # each may be denied on its own (another user's process)
+            try:
+                v = getattr(psutil.Process(x["pid"]), get)()
+                paths += v[:1] if isinstance(v, list) else [v]
+            except (psutil.Error, OSError):
+                pass
+        if any("/claude/versions/" in (s or "").replace("\\", "/") for s in paths):
+            x["name"] = "claude"
+    return top
 
 
 # ---- checks --------------------------------------------------------------
+def content_allowed(cfg: Dict[str, str], path: str) -> bool:
+    """A content check sends a file's first line to the hub, so its target is the agent's call, not the hub's: paths
+    in this host's own agent.conf, or files that resolve (symlinks followed) inside a local AVM_CONTENT_ROOTS dir."""
+    if path in _csv(cfg.get(LOCAL_CONTENT_KEY, cfg["AVM_WATCH_CONTENT"])):
+        return True
+    real = os.path.realpath(path)
+    for root in _csv(cfg.get("AVM_CONTENT_ROOTS", "")):
+        r = os.path.realpath(root)
+        try:
+            if os.path.commonpath([real, r]) == r and real != r:
+                return True
+        except ValueError:   # Windows: different drives
+            continue
+    return False
+
+
 def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
     checks: List[Dict[str, Any]] = []
     watch_procs = _csv(cfg["AVM_WATCH_PROCESSES"])
@@ -790,6 +848,10 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
                        "detail": ("mounted at " + path) if mounted else ("NOT mounted: " + path)})
     for path in _csv(cfg["AVM_WATCH_CONTENT"]):
         name = os.path.basename(path) or path
+        if not content_allowed(cfg, path):
+            checks.append({"name": name, "kind": "content", "ok": False, "key": "AVM_WATCH_CONTENT", "src": path,
+                           "detail": "refused: not listed in this host's agent.conf and not under AVM_CONTENT_ROOTS"})
+            continue
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 line = f.readline().strip()
@@ -800,10 +862,14 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
     for item in _csv(cfg["AVM_WATCH_MARKERS"]):
         import glob as _glob
         pattern, _, regex = item.partition("::")
-        try:
-            matches = sorted(_glob.glob(os.path.expanduser(pattern)), key=lambda f: -os.stat(f).st_mtime)
-        except OSError:
-            matches = []
+        stamped = []
+        for f in _glob.glob(os.path.expanduser(pattern)):
+            try:
+                stamped.append((os.stat(f).st_mtime, f))
+            except OSError:   # removed between the glob and the stat: not a marker any more
+                continue
+        mtimes = {f: m for m, f in stamped}
+        matches = [f for _m, f in sorted(stamped, reverse=True)]
         if regex:
             try:
                 rx = re.compile(regex)
@@ -821,8 +887,7 @@ def collect_checks(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
             matches = failed
         label = os.path.basename(pattern) or pattern
         if matches:
-            newest = matches[0]
-            age = time.time() - os.stat(newest).st_mtime
+            age = time.time() - mtimes[matches[0]]   # no second stat: a marker removed meanwhile must not drop every check
             names = ", ".join(os.path.basename(m) for m in matches[:3]) + (" ..." if len(matches) > 3 else "")
             checks.append({"name": label, "kind": "marker", "ok": False, "value": float(len(matches)), "key": "AVM_WATCH_MARKERS", "src": item,
                            "detail": "%d file%s: %s (newest %s ago)" % (len(matches), "s" if len(matches) != 1 else "", names, _fmt_age(age))})
@@ -926,6 +991,31 @@ class ClaudeRunner:
         self._agents: List[Dict[str, Any]] = []
         self._agents_at = -1e9
         self._agents_busy = False
+
+    MODE_RANK = {"plan": 0, "acceptEdits": 1, "full": 2}
+
+    def policy(self) -> Dict[str, Any]:
+        """This host's own limits on what the hub may ask (agent.conf only - never overridden by the hub)."""
+        cap = self.cfg["AVM_MAX_JOB_MODE"].strip()
+        transcript = self.cfg["AVM_JOB_TRANSCRIPT"].strip().lower()
+        return {"max_mode": cap if cap in self.MODE_RANK else "plan", "actions": _on(self.cfg["AVM_ALLOW_ACTIONS"]),
+                "jobs": not (_running_as_root() and not _on(self.cfg["AVM_ALLOW_ROOT_JOBS"])),
+                "transcript": transcript if transcript in ("full", "summary", "off") else "summary"}
+
+    def _refusal(self, job: Dict[str, Any]) -> Optional[str]:
+        p = self.policy()
+        if not p["jobs"]:
+            return ("refused: this agent runs as %s and AVM_ALLOW_ROOT_JOBS is off - a prompt here would run unconfined "
+                    "with full privileges; run the agent as a normal user to use prompts" % _whoami())
+        if job.get("action"):
+            return None if p["actions"] else "refused: AVM_ALLOW_ACTIONS is off in this host's agent.conf"
+        mode = job.get("mode") or "plan"
+        if mode not in self.MODE_RANK:
+            return "refused: unknown permission mode %r" % mode
+        if self.MODE_RANK[mode] > self.MODE_RANK[p["max_mode"]]:
+            return ("refused: %s mode is above this host's limit (AVM_MAX_JOB_MODE=%s in its agent.conf; "
+                    "the hub cannot raise it)" % (mode, p["max_mode"]))
+        return None
 
     def _find_claude(self) -> Optional[str]:
         """The first `claude` that actually runs: PATH hits, then the usual install locations (service units often run
@@ -1245,7 +1335,7 @@ class ClaudeRunner:
             queued = [q["id"] for q in self.queue]
         return {"available": bool(self.bin), "bin": self.bin, "version": self.check_version(), "user": _whoami(), "home": self.home,
                 "sessions": _safe(self.sessions, default=[]), "processes": _safe(self.processes, default=[]),
-                "agents": _safe(self.agents, default=[]), "features": self.FEATURES,
+                "agents": _safe(self.agents, default=[]), "features": self.FEATURES, "policy": self.policy(),
                 "bin_source": "desktop" if self._is_desktop_bundle(self.bin) else ("cli" if self.bin else None),
                 "running_job": running, "queued_jobs": queued}
 
@@ -1298,6 +1388,12 @@ class ClaudeRunner:
             self._post("/claude/jobs/%d/finish" % jid, {"status": "cancelled"})
             self._done()
             return
+        refusal = self._refusal(job)
+        if refusal:
+            log.warning("claude job #%d %s", jid, refusal)
+            self._post("/claude/jobs/%d/finish" % jid, {"status": "failed", "error": refusal})
+            self._done()
+            return
         if not self.bin:
             self._post("/claude/jobs/%d/finish" % jid, {"status": "failed", "error": "claude CLI not found on this host"})
             self._done()
@@ -1345,6 +1441,7 @@ class ClaudeRunner:
         log.info("claude job #%d started (mode=%s, cwd=%s)", jid, mode, cwd)
 
         stderr_tail: deque = deque(maxlen=30)
+        transcript = self.policy()["transcript"]
 
         def drain_err() -> None:
             assert proc.stderr is not None
@@ -1382,7 +1479,9 @@ class ClaudeRunner:
                 session_id = ev["session_id"]
             if ev.get("type") == "result":
                 final = ev
-            batch.append(_compact_event(ev))
+            compact = _compact_event(ev, transcript)
+            if compact is not None:
+                batch.append(compact)
             if time.monotonic() - last_flush > 1.0 or len(batch) >= 50:
                 flush()
             if jid in self.cancel_ids and not cancelled:
@@ -1398,8 +1497,13 @@ class ClaudeRunner:
         err = None
         if status == "failed":
             err = (final.get("result") if final.get("is_error") else None) or ("\n".join(stderr_tail)[-800:] or "exit code %s" % rc)
+            if transcript == "off":
+                err = "claude failed (exit code %s); details kept on this host (AVM_JOB_TRANSCRIPT=off)" % rc
+        result = (final.get("result") or "")[:20000] or None
+        if transcript == "off" and result:
+            result = "(answer kept on %s: AVM_JOB_TRANSCRIPT=off)" % socket.gethostname()
         self._post("/claude/jobs/%d/finish" % jid, {
-            "status": status, "session_id": final.get("session_id") or session_id, "result": (final.get("result") or "")[:20000] or None,
+            "status": status, "session_id": final.get("session_id") or session_id, "result": result,
             "cost_usd": final.get("total_cost_usd"), "duration_ms": final.get("duration_ms"), "num_turns": final.get("num_turns"), "error": err})
         log.info("claude job #%d %s (rc=%s)", jid, status, rc)
         self._done()
@@ -1487,9 +1591,22 @@ class ClaudeRunner:
         log.info("claude %s of %s: %s%s", action, key or sid, "ok" if ok else "failed", " -> " + new_key if new_key else "")
 
 
-def _compact_event(ev: Dict[str, Any]) -> Dict[str, Any]:
-    """Trim bulky fields so the hub stores what the UI needs (text, tool names/inputs, results)."""
+def _compact_event(ev: Dict[str, Any], level: str = "full") -> Optional[Dict[str, Any]]:
+    """Trim bulky fields so the hub stores what the UI needs (text, tool names/inputs, results). AVM_JOB_TRANSCRIPT
+    (local only) narrows that on hosts whose files must not leave them: "summary" keeps tool names and the final
+    answer - no tool inputs, tool results, intermediate text or thinking; "off" keeps only session/result metadata."""
     t = ev.get("type")
+    if level in ("summary", "off") and t not in ("system", "result"):
+        if level == "off":
+            return None
+        if t not in ("assistant", "user"):
+            return {"type": t or "raw"}
+        content = (ev.get("message") or {}).get("content")
+        parts = [{"type": "tool_use", "name": c.get("name"), "input": ""} for c in (content if isinstance(content, list) else [])
+                 if isinstance(c, dict) and c.get("type") == "tool_use"]
+        return {"type": t, "parts": parts, "model": (ev.get("message") or {}).get("model")} if parts else None
+    if t == "result" and level == "off":
+        return {k: ev.get(k) for k in ("type", "subtype", "is_error", "duration_ms", "num_turns", "total_cost_usd", "session_id") if k in ev}
     if t == "assistant" or t == "user":
         msg = ev.get("message") or {}
         content = msg.get("content")
@@ -1604,7 +1721,8 @@ def collect_tailscale() -> Optional[Dict[str, Any]]:
 
 _BACKUP_KEYS = {"v", "name", "tool", "repository", "paths", "keep", "max_age_sec", "state", "started", "finished",
                 "duration_sec", "last_success", "next_run", "checked", "snapshot", "files", "bytes_scanned", "bytes_added",
-                "files_new", "files_changed", "warnings", "snapshots", "repo_bytes", "target_free_bytes", "error", "seeded"}
+                "files_new", "files_changed", "warnings", "snapshots", "repo_bytes", "target_free_bytes", "error", "seeded",
+                "max_run_sec"}
 
 
 def collect_backups(cfg: Dict[str, str]) -> Optional[List[Dict[str, Any]]]:
@@ -1676,19 +1794,34 @@ REMOTE_KEYS = (
 )
 
 
-class RemoteConfig:
-    """Hub-pushed settings layered over the local config file."""
+LOCAL_CONTENT_KEY = "_LOCAL_AVM_WATCH_CONTENT"   # agent.conf's own content checks (always allowed, see content_allowed)
 
-    def __init__(self, base: Dict[str, str]):
+
+class RemoteConfig:
+    """Hub-pushed settings layered over the local config file. The last applied set is kept on disk, so the first
+    sample after a restart already carries the hub-added checks (otherwise they flip to "unknown" for one push and a
+    check that failed meanwhile looks like a fresh failure - or none)."""
+
+    def __init__(self, base: Dict[str, str], state_path: Optional[str] = None):
         self.base = dict(base)
         self.rev: Optional[int] = None
         self.overrides: Dict[str, str] = {}
+        self.state_path = state_path
+        if state_path:
+            try:
+                with open(state_path, encoding="utf-8") as f:
+                    saved = json.load(f)
+                self.rev = saved.get("rev")
+                self.overrides = {k: str(v) for k, v in (saved.get("settings") or {}).items() if k in REMOTE_KEYS}
+            except (OSError, ValueError, AttributeError):
+                pass
 
     def apply(self, reply: Dict[str, Any]) -> bool:
         cfg = reply.get("config")
         if not isinstance(cfg, dict):
             if self.rev is not None:  # hub cleared the remote settings
                 self.rev, self.overrides = None, {}
+                self._save()
                 return True
             return False
         rev = cfg.get("rev")
@@ -1696,12 +1829,141 @@ class RemoteConfig:
             return False
         self.rev = rev
         self.overrides = {k: str(v) for k, v in (cfg.get("settings") or {}).items() if k in REMOTE_KEYS}
+        self._save()
         return True
+
+    def _save(self) -> None:
+        if not self.state_path:
+            return
+        tmp = self.state_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"rev": self.rev, "settings": self.overrides}, f)
+            os.replace(tmp, self.state_path)
+        except OSError as e:
+            log.warning("cannot save remote settings to %s: %s", self.state_path, e)
 
     def effective(self) -> Dict[str, str]:
         out = dict(self.base)
         out.update(self.overrides)
+        out[LOCAL_CONTENT_KEY] = self.base["AVM_WATCH_CONTENT"]
         return out
+
+
+def state_path(cfg: Dict[str, str], config_path: Optional[str], name: str) -> Optional[str]:
+    """A file in AVM_STATE_DIR, else beside the config file, else beside this script - the first writable one (a root
+    install's unit makes /etc read-only and only its own /opt dir writable). None, logged, when none is."""
+    dirs = [cfg["AVM_STATE_DIR"]] if cfg["AVM_STATE_DIR"] else \
+        [os.path.dirname(os.path.abspath(config_path)) if config_path else "", os.path.dirname(_SELF_PATH)]
+    for d in dirs:
+        if d and os.path.isdir(d) and os.access(d, os.W_OK):
+            return os.path.join(d, name)
+    log.warning("no writable state dir (tried %s): %s is not kept across restarts - set AVM_STATE_DIR",
+                ", ".join(d for d in dirs if d) or "none", name)
+    return None
+
+
+# ------------------------------------------------------- release signatures
+# Self-updates (this script and avm.py) must carry an Ed25519 signature by one of these release keys - checked here,
+# against keys the hub cannot change - so whoever controls the hub or its code directory cannot push code to the fleet.
+# Signed with deploy/sign-release.py; a key change ships as a release signed by the previous key.
+RELEASE_PUBKEYS: Tuple[str, ...] = ("45734ed87354b599cd84443561f599d36c10f8cee7e985507703b085572a4d72",)   # 2026-10-26
+
+
+def release_message(name: str, data: bytes) -> bytes:
+    """What a release signature covers: the file's name and the sha256 of its content (line endings normalised)."""
+    return ("avalon-release:v1:%s:%s" % (name, hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest())).encode()
+
+
+_ED_P = 2 ** 255 - 19
+_ED_Q = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_SQRT_M1 = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_add(a, b):
+    p = _ED_P
+    A, B = (a[1] - a[0]) * (b[1] - b[0]) % p, (a[1] + a[0]) * (b[1] + b[0]) % p
+    C, D = 2 * a[3] * b[3] * _ED_D % p, 2 * a[2] * b[2] % p
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % p, G * H % p, F * G % p, E * H % p)
+
+
+def _ed_mul(s, pt):
+    out = (0, 1, 1, 0)
+    while s > 0:
+        if s & 1:
+            out = _ed_add(out, pt)
+        pt = _ed_add(pt, pt)
+        s >>= 1
+    return out
+
+
+def _ed_decode(b):
+    if len(b) != 32:
+        return None
+    y = int.from_bytes(b, "little")
+    sign, y = y >> 255, y & ((1 << 255) - 1)
+    if y >= _ED_P:
+        return None
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_P - 2, _ED_P) % _ED_P
+    if x2 == 0:
+        if sign:
+            return None
+        x = 0
+    else:
+        x = pow(x2, (_ED_P + 3) // 8, _ED_P)
+        if (x * x - x2) % _ED_P:
+            x = x * _ED_SQRT_M1 % _ED_P
+        if (x * x - x2) % _ED_P:
+            return None
+        if (x & 1) != sign:
+            x = _ED_P - x
+    return (x, y, 1, x * y % _ED_P)
+
+
+_ED_GY = 4 * pow(5, _ED_P - 2, _ED_P) % _ED_P
+_ED_G = _ed_decode(_ED_GY.to_bytes(32, "little"))
+
+
+def ed25519_verify(pubkey: bytes, msg: bytes, sig: bytes) -> bool:
+    """RFC 8032 Ed25519 verification in pure Python (no dependency on the hosts; ~10 ms, once per update)."""
+    if len(sig) != 64:
+        return False
+    A, R = _ed_decode(pubkey), _ed_decode(sig[:32])
+    s = int.from_bytes(sig[32:], "little")
+    if A is None or R is None or s >= _ED_Q:
+        return False
+    h = int.from_bytes(hashlib.sha512(sig[:32] + pubkey + msg).digest(), "little") % _ED_Q
+    left, right = _ed_mul(s, _ED_G), _ed_add(R, _ed_mul(h, A))
+    return (left[0] * right[2] - right[0] * left[2]) % _ED_P == 0 and (left[1] * right[2] - right[1] * left[2]) % _ED_P == 0
+
+
+def release_keys(cfg: Dict[str, str]) -> List[bytes]:
+    keys = []
+    for k in list(RELEASE_PUBKEYS) + _csv(cfg.get("AVM_UPDATE_PUBKEYS", "")):   # local keys add, never replace:
+        # a key rotation shipped in a release must still reach hosts that also trust a key of their own
+        try:
+            keys.append(bytes.fromhex(k))
+        except ValueError:
+            log.warning("ignoring malformed AVM_UPDATE_PUBKEYS entry %r", k)
+    return keys
+
+
+def signature_ok(cfg: Dict[str, str], name: str, data: bytes, sig_b64: Optional[str]) -> Optional[str]:
+    """None when `data` carries a valid release signature for `name`, else why not."""
+    import base64
+    keys = release_keys(cfg)
+    if not keys:
+        return "no release key configured (RELEASE_PUBKEYS / AVM_UPDATE_PUBKEYS) - refusing unsigned code"
+    if not sig_b64:
+        return "the hub sent no signature for %s - refusing unsigned code" % name
+    try:
+        sig = base64.b64decode(sig_b64, validate=True)
+    except ValueError:
+        return "malformed signature for %s" % name
+    msg = release_message(name, data)
+    return None if any(ed25519_verify(k, msg, sig) for k in keys) else "bad signature for %s - not installing" % name
 
 
 # ---------------------------------------------------------- self-update
@@ -1748,6 +2010,9 @@ def self_update(cfg: Dict[str, str], info: Dict[str, Any]) -> bool:
     got = hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
     if got != want:
         return _update_failed("hash mismatch (hub says %s, got %s) - not installing" % (want[:12], got[:12]))
+    why = signature_ok(cfg, "avalon_agent.py", data, info.get("sig"))   # the hash only proves we got what the hub meant
+    if why:
+        return _update_failed(why)
     try:
         compile(data, _SELF_PATH, "exec")  # never install a script that cannot even parse
     except SyntaxError as e:
@@ -1776,7 +2041,7 @@ def self_update(cfg: Dict[str, str], info: Dict[str, Any]) -> bool:
         return _update_failed("cannot replace %s: %s (running as %s)" % (_SELF_PATH, e, _whoami()))
     _UPDATE_STATE["error"] = None
     _SELF_SHA["value"] = got
-    _refresh_companion(cfg, "avm.py")
+    _refresh_companion(cfg, "avm.py", (info.get("file_sigs") or {}).get("avm.py"))
     log.info("self-update: installed agent %s (%s), respawning", info.get("version", "?"), got[:12])
     return True
 
@@ -1807,11 +2072,11 @@ def sync_companions(cfg: Dict[str, str], info: Dict[str, Any]) -> None:
         if last and last[0] == want and time.monotonic() < last[1]:
             continue
         _COMPANION_TRIED[name] = (want, time.monotonic() + 600)
-        _refresh_companion(cfg, name)
+        _refresh_companion(cfg, name, (info.get("file_sigs") or {}).get(name))
 
 
-def _refresh_companion(cfg: Dict[str, str], name: str) -> None:
-    """Best-effort: keep avm.py (the task CLI) next to this script in step with the hub."""
+def _refresh_companion(cfg: Dict[str, str], name: str, sig: Optional[str]) -> None:
+    """Best-effort: keep avm.py (the task CLI) next to this script in step with the hub - signed releases only."""
     url = cfg["AVM_SERVER_URL"].rstrip("/") + "/api/v1/agent/file/" + name
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + cfg["AVM_TOKEN"], "User-Agent": "avalon-agent/" + AGENT_VERSION})
     try:
@@ -1819,6 +2084,10 @@ def _refresh_companion(cfg: Dict[str, str], name: str) -> None:
             data = r.read()
             want = r.headers.get("X-File-Sha256", "")
         if want and hashlib.sha256(data).hexdigest() != want:
+            return
+        why = signature_ok(cfg, name, data, sig)
+        if why:
+            log.warning("self-update: %s", why)
             return
         compile(data, name, "exec")
         dest = os.path.join(os.path.dirname(_SELF_PATH), name)
@@ -1833,6 +2102,14 @@ def _refresh_companion(cfg: Dict[str, str], name: str) -> None:
         log.info("self-update: refreshed %s", name)
     except Exception as e:
         log.warning("self-update: could not refresh %s: %s", name, e)
+
+
+def _running_as_root() -> bool:
+    """root on POSIX; SYSTEM (or another machine account, NAME$) on Windows."""
+    if IS_WINDOWS:
+        user = (os.environ.get("USERNAME") or _whoami() or "").upper()
+        return user == "SYSTEM" or user.endswith("$")
+    return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
 def _whoami() -> str:
@@ -1852,7 +2129,7 @@ def respawn() -> None:
                 stream.flush()
         except Exception:
             pass
-    args = [sys.executable] + sys.argv
+    args = [sys.executable] + (["-I"] if sys.flags.isolated else []) + sys.argv   # keep isolated mode (-I) across respawns
     if IS_WINDOWS:
         # execv on Windows starts a new process and exits this one; quote to survive spaces in paths.
         args = ['"%s"' % a if " " in a else a for a in args]
@@ -1912,7 +2189,9 @@ def main(argv=None) -> int:
 
     log.info("avalon-agent %s on %s -> %s every %.0fs", AGENT_VERSION, host_info(cfg)["hostname"], cfg["AVM_SERVER_URL"], interval)
     psutil.cpu_percent(interval=None, percpu=True)  # prime
-    remote = RemoteConfig(cfg)
+    remote = RemoteConfig(cfg, state_path(cfg, args.config, "remote-config.json"))
+    if remote.rev is not None:
+        log.info("using saved remote settings rev %s until the hub replies", remote.rev)
     if cfg["AVM_CLAUDE"].strip().lower() in ("1", "true", "yes", "on"):
         _CLAUDE = ClaudeRunner(cfg)
         log.info("claude code: %s", _CLAUDE.bin or "not found on PATH (sessions will still be listed)")

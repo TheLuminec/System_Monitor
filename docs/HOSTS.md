@@ -1,7 +1,20 @@
 # Per-host agent configuration
 
 Ready-to-use `agent.conf` contents for the current fleet. Tokens come from
-`avalon-monitor-manage add-host <name>` on AVALON.
+`avalon-monitor-manage add-host <name>` on AVALON. Every key, with its default, is in
+[`agent/agent.conf.example`](../agent/agent.conf.example).
+
+> **The hub owns the check lists.** On its first report with checks (agent 1.7+), the hub adopts a host's
+> `AVM_WATCH_*` / `AVM_MEM_AVAILABLE_WARN_GB` entries as check rows and from then on pushes every list in each reply,
+> empty ones included. Editing those lines in `agent.conf` afterwards has **no effect**. Change checks on the host
+> page (**Checks**), with `avm check add/rm` on the host, or with
+> `avalon-monitor-manage checks <host> --set AVM_WATCH_TCP=127.0.0.1:11434` (only the keys given change). The
+> `AVM_WATCH_*` lines below are what seeds a freshly enrolled host.
+>
+> **Local policy stays local.** `AVM_MAX_JOB_MODE` (default `plan`), `AVM_ALLOW_ACTIONS`, `AVM_ALLOW_ROOT_JOBS`,
+> `AVM_JOB_TRANSCRIPT`, `AVM_CONTENT_ROOTS`, `AVM_UPDATE_PUBKEYS` and `AVM_STATE_DIR` are read only from the host's own
+> `agent.conf` (or the agent's environment); the hub can't set them ([SECURITY.md](SECURITY.md#agent-local-policy)). An agent running as root or
+> SYSTEM refuses dashboard prompts, responder alerts and session restart/stop unless `AVM_ALLOW_ROOT_JOBS=true`.
 
 > **Interpreter isolation.** Both installers create a venv **owned by the agent**
 > (`/opt/avalon-agent/venv` on Linux, `%ProgramData%\AvalonAgent\venv` on Windows)
@@ -20,8 +33,8 @@ time by `gated_launch.sh` inside a `systemd --user` scope `xrsec-<job>.scope`
 with a hard `MemoryMax`, and each writes `~/xrsec_markers/<job>.done`
 containing `rc=… oom_kill=… peak_mb=…` on exit. The config below watches
 *that* design; the old runner heartbeat / `current.txt` lines would only show
-red forever. (These same checks can be set from the dashboard's host page
-instead of the file — the hub pushes them to the agent.)
+red forever. (Once the hub has adopted these checks, change them on the host
+page, not here: see the note at the top.)
 
 ```ini
 AVM_SERVER_URL=http://avalon:8787
@@ -83,6 +96,10 @@ sudo nano /etc/avalon-agent/agent.conf
 sudo systemctl restart avalon-agent
 ```
 
+A root agent refuses Claude prompts and actions (`AVM_ALLOW_ROOT_JOBS=false`). Its unit runs with
+`ProtectSystem=strict`, so `/etc/avalon-agent` is read-only to it: it keeps `remote-config.json` beside the agent
+script in `/opt/avalon-agent` instead (set `AVM_STATE_DIR` to choose another writable dir).
+
 ### Windows agents and self-update (1.2.x → 1.3+)
 
 Agents older than 1.3.1 running under `pythonw.exe` (the scheduled task) write
@@ -113,23 +130,45 @@ AVM_TAGS=RTX 5060 Ti, torch 2.10.0+cu130, numpy 2.4.2
 
 The box is a tagged Tailscale device without SSH, so copy `agent\` over by
 whatever route works (git, USB) and run `install\install-windows.ps1` from an
-elevated PowerShell. The Scheduled Task runs as SYSTEM at boot.
+elevated PowerShell. By default the Scheduled Task runs as SYSTEM at boot.
 
-## AVALON (this hub) — `/etc/avalon-agent/agent.conf`
+**Windows: SYSTEM vs. your user.** A SYSTEM install (the default; LAPTOP-C runs this way) reports metrics and
+checks, but refuses prompts and session restart/stop from the dashboard (`AVM_ALLOW_ROOT_JOBS=false`). For prompts,
+install with `-AsCurrentUser` (or switch with `.\install\install-windows.ps1 -Upgrade -AsCurrentUser`): the agent then
+runs as you at logon, with your Claude login. Settings pushed by the hub are kept in
+`C:\ProgramData\AvalonAgent\remote-config.json`.
+
+## AVALON (this hub) — `~/.config/avalon-agent/agent.conf`
+
+AVALON's agent is a **rootless user service** (`systemctl --user status avalon-agent`, linger enabled), not the root
+system unit: prompts run as the operator, with their Claude login. `deploy/backup/install-restic-backup.sh` points the
+backup unit's `avm` at this file (`AVM_CONFIG`, found via `$SUDO_USER`). To move an old root install over:
+`sudo ./deploy/upgrade.sh --rootless-agent` (copies `/etc/avalon-agent/agent.conf`, disables the root unit). Fresh
+install:
+
+```bash
+./agent/install/install-linux.sh --user --server http://127.0.0.1:8787 --token avm_… --name avalon
+```
 
 ```ini
 AVM_SERVER_URL=http://127.0.0.1:8787
 AVM_TOKEN=avm_…
 AVM_HOSTNAME=avalon
 AVM_INTERVAL=5
-AVM_TAGS=no GPU - data + coordination
+AVM_TAGS=hub, data + coordination
+# shared host: keep task output from data-use-agreement projects on this machine (see below)
+#AVM_TASK_LOG_OFF_DIRS=<project dir>
+```
+
+Checks it was seeded with (now held by the hub: change them on AVALON's host page):
+
+```ini
 AVM_WATCH_PROCESSES=nginx,cloudflared,tailscaled
 AVM_WATCH_TCP=127.0.0.1:11434
 AVM_WATCH_MOUNTS=/mnt/DataHoarder
 ```
 
-(AVALON's RX 5700 XT is detected via sysfs and will show as a GPU; the tag
-text is the coordinator's wording for the training role, not the hardware.)
+AVALON's GPU is a **GTX 1080 Ti** (Pascal), reported through `nvidia-smi` like any NVIDIA card.
 
 ## Raspberry Pi 5 / other Linux
 
@@ -150,9 +189,26 @@ Linux with restic: write a config like [`deploy/backup/avalon.json`](../deploy/b
 sudo deploy/backup/install-restic-backup.sh deploy/backup/<host>.json [--now]
 ```
 
-It installs restic, creates the repository and its password if they don't exist (the password is printed once - keep
-it somewhere other than that machine), installs `deploy/backup/restic-backup.py` as a nightly systemd timer wrapped in
-`avm run` (each run is a task on the dashboard), and seeds the status file from an existing repository.
+It installs restic, creates the repository and its password if they don't exist (the password is printed once, as
+soon as it is created - keep it somewhere other than that machine), installs `deploy/backup/restic-backup.py` as a
+nightly systemd timer wrapped in `avm run` (each run is a task on the dashboard; `TimeoutStartSec` is the config's
+`max_run_sec`), and seeds the status file from an existing repository. The backup runs even when the hub is down
+(`avm run` then runs it untracked); only the dashboard task is missing.
+
+What the card shows, from the last run's `state`:
+
+* **ok**: the snapshot has everything.
+* **partial** (amber): a snapshot was saved, but restic skipped unreadable files or a missing source path (restic exit
+  code 3), or a SQLite copy failed, so the snapshot holds the previous copy of that database. `error` says what is
+  missing. `last_success` still advances: everything else in the snapshot is restorable, so the stale alert keeps
+  meaning "no usable snapshot for `max_age_sec`".
+* **failed** (red): no snapshot, or the run was stopped (SIGTERM from `systemctl stop` or the timeout, SIGINT,
+  SIGHUP) or crashed. `restic-backup.py` writes `failed` before it exits.
+* **running**: a run is in progress. A `running` state older than `max_run_sec` shows red: only SIGKILL or power
+  loss can leave it behind.
+
+Re-seeding: `sudo /usr/local/sbin/<unit> --seed` keeps a status written by a real run (`ok`, `partial`, `failed` or
+`running`), so re-running the installer never turns a failure into "ok"; add `--force` to overwrite it.
 
 Any other backup tool can feed the card by writing the same JSON (all keys optional except `name`; times are Unix
 seconds, sizes bytes):
@@ -160,9 +216,44 @@ seconds, sizes bytes):
 | key | meaning |
 |---|---|
 | `name`, `tool`, `repository`, `paths`, `keep` | what is backed up where, and the retention (`{"daily": 7, ...}`) |
-| `state` | `running`, `ok` or `failed` (the last run) |
+| `state` | `running`, `ok`, `partial` (amber: a snapshot was saved, but without some files or source paths, or with an old copy of a database) or `failed` (the last run) |
 | `started`, `finished`, `duration_sec`, `next_run` | the last run and the next scheduled one |
-| `last_success`, `max_age_sec` | drives the chip colour and the stale alert |
-| `snapshot`, `files`, `bytes_scanned`, `bytes_added`, `files_new`, `files_changed`, `warnings` | the last run's result |
+| `last_success`, `max_age_sec` | drives the chip colour and the stale alert (a `partial` run counts as a success here: its snapshot is restorable) |
+| `max_run_sec` | a `running` state older than this (default 43200 = the unit's 12 h `TimeoutStartSec`) shows red: the run was killed without writing its end |
+| `snapshot`, `files`, `bytes_scanned`, `bytes_added`, `files_new`, `files_changed`, `warnings` | the last run's result (`warnings`: unreadable files + missing paths + failed SQLite copies) |
 | `snapshots`, `repo_bytes`, `target_free_bytes`, `checked` | the repository: snapshots kept, size, free space on its disk, last verify |
-| `error` | why the last run failed |
+| `error` | why the last run failed, or for `partial` what is missing (counts and the first few paths, with why) |
+
+## Hosts with data-use agreements
+
+For a host whose data must not leave it, add to its `agent.conf`:
+
+```ini
+# avm tasks send name, status, exit code, timing and note only: no output lines, no command line, no working dir
+AVM_TASK_LOG=off
+# prompt transcripts carry the final answer and tool names only: no tool inputs, tool results or intermediate text
+AVM_JOB_TRANSCRIPT=summary
+```
+
+and **no** `AVM_CONTENT_ROOTS`, so the hub can't add a content check that reads a file there. Notes:
+
+* `summary` still sends the final answer, which could quote what Claude read. `AVM_JOB_TRANSCRIPT=off` keeps the
+  answer on the host too (the hub sees status only).
+* A content check listed in `agent.conf` itself still sends its file's first line: don't point one at agreement data.
+* Don't create checks with `--with-log` there (it adds task log tails to responder alerts).
+* `avm` takes the switch from every `agent.conf` it can read (`AVM_CONFIG`, `~/.config/avalon-agent/`,
+  `/etc/avalon-agent/`). If other users run `avm` on the host, put it where they read it too, or have them use
+  `avm run --no-log`.
+
+On a shared host like AVALON, where only one project is covered, keep the log on and list that project instead:
+
+```ini
+AVM_TASK_LOG_OFF_DIRS=<project dir>
+```
+
+Runs whose working directory is inside it send no output, command line or cwd, and pass `AVM_TASK_LOG=off` to their
+children so nested `avm` calls stay quiet too. `avm run --log` overrides this per run. Use it only for runs that print
+nothing covered.
+
+Whatever does reach the hub lands in `monitor.db`, which AVALON's nightly backup keeps for months. See
+[SECURITY.md](SECURITY.md#hosts-with-data-use-agreements).

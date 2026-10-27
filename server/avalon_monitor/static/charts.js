@@ -1,5 +1,6 @@
 // Minimal canvas time-series chart + sparkline. No dependencies.
 // TimeChart: multi-series line/area, recessive grid, crosshair tooltip, live append.
+import { esc } from "./core.js?v=1.12.0";
 
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
@@ -39,6 +40,12 @@ function fmtTick(t, step, span) {
 export function fmtTime(t) {
   const d = new Date(t * 1000);
   return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+/** Crosshair tooltip markup: rows [{color, label, value}]. Everything is escaped (E-36): labels may one day come from agents. */
+export function tipHtml(time, rows) {
+  return `<div class="t">${esc(time)}</div>` + rows.map((r) =>
+    `<div class="row"><span><i style="background:${esc(r.color)}"></i>${esc(r.label)}</span><b class="num">${esc(r.value)}</b></div>`).join("");
 }
 
 export class TimeChart {
@@ -197,8 +204,7 @@ export class TimeChart {
         }
       }
       if (rows.length) {
-        this.tip.innerHTML = `<div class="t">${fmtTime(tAt)}</div>` + rows.map((r) =>
-          `<div class="row"><span><i style="background:${r.s.color}"></i>${r.s.label}</span><b class="num">${this.opts.format(r.v, true)}</b></div>`).join("");
+        this.tip.innerHTML = tipHtml(fmtTime(tAt), rows.map((r) => ({ color: r.s.color, label: r.s.label, value: this.opts.format(r.v, true) })));
         this.tip.style.display = "block";
         const tw = this.tip.offsetWidth;
         let left = x + 12; if (left + tw > W - 4) left = x - tw - 12;

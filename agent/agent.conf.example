@@ -1,37 +1,94 @@
-# Avalon Monitor agent configuration (KEY=VALUE). Environment variables override.
+# Avalon Monitor agent configuration (KEY=VALUE, one per line; comments on their own line - text after a value is
+# part of the value). Non-empty environment variables of the same name override the file.
+# Location: ~/.config/avalon-agent/agent.conf (rootless install), /etc/avalon-agent/agent.conf (root install),
+# C:\ProgramData\AvalonAgent\agent.conf (Windows). Commented-out lines show the defaults.
 
+# --- Connection -----------------------------------------------------------------
 # Hub address over Tailscale (MagicDNS name or 100.x.y.z IP) - never the public domain.
 AVM_SERVER_URL=http://avalon:8787
-# Token from `manage.py add-host <name>` on AVALON.
-AVM_TOKEN=
-
+# Token from `avalon-monitor-manage add-host <name>` on AVALON (shown once).
+AVM_TOKEN=avm_REPLACE_ME
+# Seconds between samples.
 AVM_INTERVAL=5
+# Name reported to the hub (default: the machine's hostname).
 #AVM_HOSTNAME=
+#AVM_LOG_LEVEL=info
+
+# --- What is reported -------------------------------------------------------------
+# Chips on the host page, comma list. The hub can override this.
 #AVM_TAGS=gpu,training
-
-# Top-N processes by CPU to report (0 disables).
+# Top-N processes by CPU (0 disables). The hub can override this.
 AVM_PROCESSES=8
+# Filesystem types left out of the disk list.
+#AVM_DISK_EXCLUDE_FS=squashfs,tmpfs,devtmpfs,overlay,autofs,fuse.portal,fuse.gvfsd-fuse,nsfs,proc,sysfs,cgroup,cgroup2,efivarfs,iso9660,udf,vfat
+# Windows only: LibreHardwareMonitor's web server for CPU temp / AMD-Intel GPU data.
+#AVM_LHM_URL=http://localhost:8085/data.json
+# Backup status files for the host's Backups card, comma list (missing files are skipped).
+# Default: /var/lib/avalon-backup/status.json, or C:\ProgramData\avalon-backup\status.json on Windows.
+#AVM_BACKUP_STATUS=
 
-# Liveness checks (optional) - shown as badges on the host card.
+# --- Checks (shown as chips on the host card) ------------------------------------------
+# Once the hub has adopted a host's checks (agent 1.7+, first report with checks), the hub is the source of truth:
+# it sends every list below and editing them here has NO effect. Change them on the host page -> Checks, or with
+# `avalon-monitor-manage checks <host> --set KEY=VALUE`. For a new host, these lines seed the hub's list.
 #   process names or command-line substrings:
 #AVM_WATCH_PROCESSES=queue_runner.sh,ollama
 #   heartbeat files with max age in seconds (path:seconds):
 #AVM_WATCH_FILES=/home/user/.queue/heartbeat:120
 #   TCP ports that should be open:
 #AVM_WATCH_TCP=127.0.0.1:11434
-#   paths that must be mounted (removable / network volumes a job depends on):
+#   paths that must be mount points (removable / network volumes a job depends on):
 #AVM_WATCH_MOUNTS=/run/media/user/Data
-#   small text files whose first line is shown on the card (e.g. "current job"):
+#   small text files whose first line is shown on the card and sent to the hub (e.g. "current job"):
 #AVM_WATCH_CONTENT=/srv/queue/current.txt
-#   globs that must match nothing - a crashed run announces itself with a marker file:
+#   globs that must match nothing; glob::regex counts only files whose content matches (no commas in the regex):
 #AVM_WATCH_MARKERS=/srv/queue/*.failed
-#   files that should never be empty - an empty queue is a warning, not success:
+#   files that should have at least one non-blank line - an empty queue is a warning:
 #AVM_WATCH_NONEMPTY=/srv/queue/queue.txt
+#   systemd units to show the state of: [system:|user:|user@NAME:]name-or-glob
+#AVM_WATCH_UNITS=user:xrsec-queue.service
+#   like UNITS, but an active match means "a job is running" (drives the hub's GPU-stall rule):
+#AVM_WATCH_JOBS=user:xrsec-*.scope
+#   amber chip when MemAvailable drops below this many GB:
+#AVM_MEM_AVAILABLE_WARN_GB=8
 
-# Windows only: LibreHardwareMonitor's web server for CPU temp / AMD-Intel GPU data.
-#AVM_LHM_URL=http://localhost:8085/data.json
-
-# Replace this script with the hub's copy when the hub is upgraded (verified by hash), then respawn.
+# --- Updates and Claude Code ------------------------------------------------------------
+# Replace this script (and avm.py) with the hub's copy when it changes - only if it carries a valid release signature.
 AVM_AUTO_UPDATE=true
+# Report Claude Code sessions here and run prompts sent from the dashboard (false opts the machine out).
+#AVM_CLAUDE=true
+# Path to the `claude` CLI (default: found on PATH / the usual install locations).
+#AVM_CLAUDE_BIN=
+# Directory holding .claude/ (default: this user's home).
+#AVM_CLAUDE_HOME=
 
-AVM_LOG_LEVEL=info
+# --- Local policy: only this file sets these; the hub can never override them (docs/SECURITY.md) ---
+# Highest permission mode a dashboard prompt may use here: plan | acceptEdits | full. Higher requests are refused.
+#AVM_MAX_JOB_MODE=plan
+# Allow restart/stop of tracked Claude sessions from the dashboard.
+#AVM_ALLOW_ACTIONS=true
+# Run prompts / actions when this agent runs as root or SYSTEM (refused by default: they would run unconfined).
+#AVM_ALLOW_ROOT_JOBS=false
+# What a prompt's transcript sends to the hub: full | summary (final answer + tool names only) | off (status only).
+#AVM_JOB_TRANSCRIPT=full
+# Directories a hub-added content check may read from (comma list; symlinks are resolved). Content checks listed in
+# this file are always allowed. Empty: hub-added content checks are refused.
+#AVM_CONTENT_ROOTS=
+# Extra Ed25519 release public keys (hex, comma list) a self-update may be signed with, on top of the keys built
+# into the agent (RELEASE_PUBKEYS) - never instead of them, so key rotations shipped in releases still arrive.
+#AVM_UPDATE_PUBKEYS=
+# Where remote-config.json (the hub's last settings, kept across restarts) is written. Default: beside this file, if
+# writable, else beside the agent script (a root Linux install's unit makes /etc read-only: /opt/avalon-agent is used).
+#AVM_STATE_DIR=
+
+# --- avm (the task CLI reads this file too) ------------------------------------------------
+# off = no output lines, command line or working directory of avm tasks leave this host (name, status, rc, timing and
+# note still do). "off" in any agent.conf avm can read wins. Per run: avm run --log / --no-log.
+#AVM_TASK_LOG=on
+# Same, only for runs whose working directory is inside one of these (comma list).
+#AVM_TASK_LOG_OFF_DIRS=
+# Queue (`avm run --wait`, --gpu/--mem/--vram): free-RAM headroom in GB, how long a started job's declared
+# reservation counts, and the shared queue directory (default /run/avm-queue if it exists, else /tmp/avm-queue).
+#AVM_QUEUE_HEADROOM_GB=2
+#AVM_QUEUE_SETTLE_SEC=180
+#AVM_QUEUE_DIR=

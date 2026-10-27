@@ -3,12 +3,13 @@ agent results back to rows; and check responders - when a check goes from ok to 
 that host (read-only) so it can look into it, even if it was offline when the check failed.
 
 Designed with the agents that run the long jobs (XRSec on AVALON and Miami): responders report, they never act.
-Guardrails: ok -> failing transitions only, per-check cooldown, daily cap, one open alert per check until it
-recovers, held while the target session is mid-turn, plan (read-only) mode only, and the alert carries paths, ids
+Guardrails: ok -> failing transitions only, per-check cooldown, a cap per rolling 24 h, one open alert per check until
+it recovers, held while the target session is mid-turn, plan (read-only) mode only, and the alert carries paths, ids
 and exit codes but no file contents or log lines unless the check owner opted in (--with-log).
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Any, Optional
@@ -87,17 +88,47 @@ def render_settings(current: dict, rows: list[dict], now: Optional[float] = None
 def adopt(db: Any, host: Any, sample: dict) -> Optional[int]:
     """First report from an agent that tags its results (1.7+): make every check it runs from agent.conf a row, then
     mark the host managed so the rendered lists are complete. Without this, adding one process check from the hub
-    would replace (and silently drop) agent.conf's whole process list. Returns the new settings revision, if any."""
+    would replace (and silently drop) agent.conf's whole process list. Returns the new settings revision, if any.
+    Waits for a report with at least one tagged check: the agent sends an empty list when its check collector fails,
+    and adopting that would push empty lists over every agent.conf check for good (and a host with no checks at all
+    loses nothing by staying unmanaged until its first one)."""
     cfg = host.check_config or {}
     if cfg.get(MANAGED) or _version((sample.get("host") or {}).get("agent_version")) < (1, 7):
         return None   # already managed, or an agent that can't say where its checks come from
     results = [c for c in (sample.get("checks") or []) if c.get("key") in CHECK_KEYS and c.get("src") not in (None, "")]
+    if not results:
+        return None
     have = {(r["key"], r["target"]) for r in db.checks_list(host.id)}
     for c in results:
         if (c["key"], c["src"]) not in have:
             db.check_add(host.id, c["key"], str(c["src"]), {}, "agent.conf")
     db.set_check_config(host.name, render_settings({**cfg, MANAGED: "1"}, db.checks_list(host.id)))
     return host.check_rev + 1
+
+
+def put_settings(db: Any, host: Any, body: dict, by: Optional[str]) -> int:
+    """Set some of a host's remote settings (PUT /hosts/{name}/checks, manage.py checks --set/--clear). Only the keys
+    in `body` change: an AVM_WATCH_* key replaces that kind's rows with its entries (rows of entries that stay keep
+    their labels, responders and state; "" removes them all), any other key is stored ("" or None removes it).
+    Rows of other kinds and settings not in the body are untouched, and a hub-managed host stays managed.
+    Returns the new revision."""
+    cfg = {k: v for k, v in (host.check_config or {}).items() if k not in CHECK_KEYS}
+    rows = db.checks_list(host.id)
+    for key, raw in body.items():
+        value = "" if raw is None else str(raw).strip()
+        if key not in CHECK_KEYS:
+            if value:
+                cfg[key] = value
+            else:
+                cfg.pop(key, None)
+            continue
+        wanted = [e.strip() for e in ([value] if key in SINGLE_KEYS else value.split(",")) if e.strip()]
+        for r in rows:
+            if r["key"] == key and r["target"] not in wanted:
+                db.check_delete(r["id"])
+        for target in wanted:
+            db.check_add(host.id, key, target, {}, by)
+    return db.set_check_config(host.name, render_settings(cfg, db.checks_list(host.id)))
 
 
 def _base(p: str) -> str:
@@ -174,8 +205,26 @@ def alert_prompt(host: str, r: dict, c: Optional[dict], tasks: list[dict], now: 
     return "\n".join(lines)
 
 
+CAP_WINDOW_SEC = 86400.0   # daily_cap counts alerts in this rolling window
+
+
+def _recent_fires(r: dict, now: float) -> list[float]:
+    """This check's alert times within the cap window."""
+    try:
+        times = json.loads(r.get("fire_log") or "null")
+    except ValueError:
+        times = None
+    if not isinstance(times, list):   # a row from before fire_log: its per-day count, all at its last alert
+        times = [r["last_fired"]] * int(r.get("fires_n") or 0) if r.get("last_fired") else []
+    return [float(t) for t in times if isinstance(t, (int, float)) and now - t < CAP_WINDOW_SEC]
+
+
 def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], list[dict]]:
-    """Update each check's state from a report and fire responders. Returns (changed check rows, created jobs)."""
+    """Update each check's state from a report and fire responders. Returns (changed check rows, created jobs).
+    A check missing from a report is "unknown" (e.g. the first report after an agent restart, before the hub's
+    settings are applied again); that neither restarts its clock nor its alert: a check that was ok, goes unknown and
+    comes back failing alerts like an ok -> failing one. An alert that can't go out yet (cooldown, cap, target
+    mid-turn, nothing to prompt) stays pending and fires on a later report if the check is still failing."""
     rows = db.checks_list(host.id)
     if not rows:
         return [], []
@@ -184,7 +233,6 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
     agents = claude.get("agents") or []
     can_prompt = bool(claude.get("available")) and claude.get("bin_source") != "desktop"
     can_fork = "fork_session" in (claude.get("features") or [])
-    today = time.strftime("%Y-%m-%d", time.localtime(now))
     changed, jobs = [], []
     tasks_cache: Optional[list] = None
 
@@ -193,9 +241,14 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
             continue
         c = matched.get(r["id"])
         state = "unknown" if c is None else ("failing" if (not c.get("ok") and c.get("level") != "info") else "ok")
+        known = r.get("known_state") or (r.get("state") if r.get("state") in ("ok", "failing") else None)
         upd: dict[str, Any] = {}
         if state != r.get("state"):
-            upd.update(state=state, since=now)
+            upd["state"] = state
+            if state != "unknown" and state != known:
+                upd["since"] = now
+        if state != "unknown" and state != r.get("known_state"):
+            upd["known_state"] = state
         detail = (c.get("detail") or "")[:300] if c else None
         if c is not None and KIND_OF_KEY.get(r["key"]) != "content" and detail != r.get("detail"):
             upd["detail"] = detail
@@ -204,19 +257,21 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                 upd["last_ok"] = now
             if r.get("open_job") or r.get("pending"):
                 upd.update(open_job=None, pending=0)   # recovered: the alert is over
-        fire = state == "failing" and r.get("notify") and not r.get("open_job") and (r.get("state") == "ok" or r.get("pending"))
+        elif not r.get("notify") and r.get("pending"):
+            upd["pending"] = 0   # responder removed: nothing left to send
+
+        def hold() -> None:   # fire on a later report, if still failing
+            if not r.get("pending"):
+                upd["pending"] = 1
+
+        fire = state == "failing" and r.get("notify") and not r.get("open_job") and (known == "ok" or r.get("pending"))
+        fired = _recent_fires(r, now) if fire else []
         if fire:
-            n_today = r["fires_n"] if r.get("fires_day") == today else 0
             cooldown = max(MIN_COOLDOWN_MIN, float(r.get("cooldown_min") or 30)) * 60
-            if n_today >= int(r.get("daily_cap") or 6):
-                fire = False
-                upd["pending"] = 0
-            elif r.get("last_fired") and now - r["last_fired"] < cooldown:
-                fire = False
-                upd["pending"] = 1   # fires once the cooldown is over, if still failing
-            elif not can_prompt:
-                fire = False
-                upd["pending"] = 0
+            if (len(fired) >= int(r.get("daily_cap") or 6) or (r.get("last_fired") and now - r["last_fired"] < cooldown)
+                    or not can_prompt):
+                fire = False   # cap (rolling 24 h) reached, cooling down, or no Claude to prompt on this host
+                hold()
         if fire:
             resume, fork, cwd = None, False, r.get("notify_cwd")
             target = r["notify"]
@@ -228,11 +283,13 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                     live = next((a for a in agents if a.get("key") == t["key"] or (t.get("session_id") and a.get("session_id") == t["session_id"])), None)
                     cwd = cwd or t.get("cwd")
                     if live and live.get("live"):
-                        if live.get("status") == "busy" or not can_fork:
-                            upd["pending"] = 1   # mid-turn (or this agent can't fork): try again on a later report
+                        if live.get("status") == "busy":
+                            hold()   # mid-turn: try again on a later report
                             fire = False
-                        else:
+                        elif can_fork:
                             resume, fork = t.get("session_id"), True   # live and idle: a copy of its context
+                        # else: live and idle, but this agent can't fork - never write into a live session; a fresh
+                        # read-only session in its working dir handles it (as for an untracked owner / "new")
                     else:
                         resume = t.get("session_id")   # offline: wake it into its own conversation
             if fire:
@@ -241,11 +298,13 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                     tasks_cache = [t for t in recent if t["status"] in ("running", "queued", "stalled") or
                                    (t["status"] == "failed" and now - (t.get("ended") or t["updated"]) < 6 * 3600)]
                 prompt = alert_prompt(host.name, {**r, **upd}, c, tasks_cache, now)
-                j = db.job_create(host.id, prompt, cwd, "plan", None, resume, "check responder", None, None,
-                                  f"alert · {r.get('label') or r['target']}"[:80], fork)
-                jobs.append(j)
-                upd.update(last_fired=now, fires_day=today, fires_n=(r["fires_n"] if r.get("fires_day") == today else 0) + 1,
-                           open_job=j["id"], pending=0)
+                fire_upd = {"last_fired": now, "fire_log": json.dumps(fired + [now]), "fires_n": len(fired) + 1, "pending": 0}
+                j = db.check_fire(r["id"], fire_upd, host_id=host.id, prompt=prompt, cwd=cwd, mode="plan", model=None,
+                                  resume_session=resume, created_by="check responder",
+                                  title=f"alert · {r.get('label') or r['target']}"[:80], fork_session=fork)
+                if j is not None:   # None: another report for this host fired it first
+                    jobs.append(j)
+                    upd.update(fire_upd, open_job=j["id"])
         if upd:
             row = db.check_update(r["id"], upd)
             if row and (set(upd) - {"last_ok", "detail"} or "detail" in upd and state == "failing"):

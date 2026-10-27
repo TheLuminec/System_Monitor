@@ -25,15 +25,41 @@ export function commitWarnPct(host) {
 }
 
 // A backup's health from its status file (deploy/backup/restic-backup.py): crit when nothing has succeeded within
-// max_age_sec (default 26 h) or it never has, warn when the last run failed but an older success is still fresh or
-// the first run is still going, else ok.
+// max_age_sec (default 26 h) or it never has, or when a run has been "running" longer than max_run_sec (default 12 h,
+// the unit's TimeoutStartSec: it was killed without writing its end), warn when the last run failed but an older
+// success is still fresh, when it was partial (snapshot saved without some files) or the first run is still going,
+// else ok. `alert`: worth an Alerts entry (not while a run that may still fix it is going).
 export function backupHealth(b, now = Date.now() / 1000) {
   const age = b?.last_success ? Math.max(0, now - b.last_success) : null;
-  if (age == null) return b?.state === "running" ? { level: "warn", label: "first backup running", age } : { level: "crit", label: "no backup yet", age };
-  if (age > (b.max_age_sec || 93600)) return { level: "crit", label: `last backup ${fmt.ago(age)}`, age };
-  if (b.state === "failed") return { level: "warn", label: "backup failed", age };
-  return { level: "ok", label: b.state === "running" ? "backup running" : `backup ${fmt.ago(age)}`, age };
+  const running = b?.state === "running";
+  if (running && b.started && now - b.started > (b.max_run_sec || 43200))
+    return { level: "crit", label: `backup stuck: "running" for ${fmt.dur(now - b.started)}`, age, stale: true, alert: true };
+  if (age == null) return running ? { level: "warn", label: "first backup running", age, alert: false } : { level: "crit", label: "no backup yet", age, alert: true };
+  if (age > (b.max_age_sec || 93600)) return { level: "crit", label: `last backup ${fmt.ago(age)}`, age, alert: !running };
+  if (b.state === "failed") return { level: "warn", label: "backup failed", age, alert: true };
+  if (b.state === "partial") return { level: "warn", label: `backup partial${b.warnings ? ` (${b.warnings} warning${b.warnings === 1 ? "" : "s"})` : ""}`, age, alert: true };
+  return { level: "ok", label: running ? "backup running" : `backup ${fmt.ago(age)}`, age, alert: false };
 }
+
+// ------------------------------------------------------------ permissions
+// Changes need a Cloudflare Access login (E-01): viewers on the tailnet or localhost are read-only (config.can_change
+// false; an older hub sends no flag = allowed). Layout prefs stay per viewer and are always saved.
+export const canChange = () => state.config?.can_change !== false;
+export const roTip = () => `read-only here: changes need your Cloudflare Access login${state.config?.public_url ? " - open " + state.config.public_url : ""}`;
+/** Disable a write control for a read-only viewer, with the reason as its tooltip. */
+export function guard(el) {
+  if (el && !canChange()) { el.disabled = true; el.title = roTip(); el.classList.add("ro"); }
+  return el;
+}
+// A host's own limits on dashboard prompts (agent.conf, E-04), as its agent reports them in sample.claude.policy:
+// {max_mode, actions, jobs, transcript}. Older agents send none: unknown, so nothing is greyed out.
+export const MODE_RANK = { plan: 0, acceptEdits: 1, full: 2 };
+export function modeAllowed(mode, policy) {
+  if (!policy) return true;
+  if (policy.jobs === false) return false;
+  return (MODE_RANK[mode] ?? 99) <= (MODE_RANK[policy.max_mode] ?? 0);   // the agent treats an unknown cap as plan
+}
+export const actionsAllowed = (policy) => !policy || (policy.actions !== false && policy.jobs !== false);
 
 export const fmt = {
   pct: (v, d = 0) => (v == null ? "—" : v.toFixed(d) + "%"),

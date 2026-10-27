@@ -1,9 +1,10 @@
 // Avalon Monitor dashboard - shell, router, fleet and host views. Zero-build ES modules.
-import { TimeChart, drawSparkline } from "./charts.js?v=1.11.1";
+import { TimeChart, drawSparkline } from "./charts.js?v=1.12.0";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
-         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct, backupHealth } from "./core.js?v=1.11.1";
-import { renderResearch } from "./research.js?v=1.11.1";
-import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.11.1";
+         loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct, backupHealth,
+         canChange, roTip, guard } from "./core.js?v=1.12.0";
+import { renderResearch } from "./research.js?v=1.12.0";
+import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.12.0";
 
 // ------------------------------------------------------------------ shell
 const NAV = [
@@ -60,7 +61,10 @@ function renderTopbar() {
   $("#menu-btn").onclick = () => $("#sidebar").classList.toggle("open");
   if (state.config) {
     const u = state.config.user;
-    $("#user").textContent = u.method === "access" ? u.subject : "tailnet · direct";
+    // read-only viewers (tailnet / localhost, E-01) see why, with a link to where changes can be made
+    const who = u.method === "access" ? u.subject : "tailnet";
+    $("#user").replaceChildren(canChange() ? (u.method === "access" ? who : "tailnet · direct")
+      : h("span", { title: roTip() }, who + " · ", state.config.public_url ? h("a", { href: state.config.public_url, class: "ro-link" }, "read-only") : "read-only"));
     $("#version").textContent = `hub ${state.config.version} · agent ${state.config.agent_version || "?"}`;
   }
 }
@@ -148,7 +152,7 @@ function updateCard(card, host) {
   setMeter(m.cpu, fmt.pct(s.cpu?.percent), s.cpu?.load ? "load " + s.cpu.load[0].toFixed(2) : (s.cpu?.cores ? s.cpu.cores + " cores" : ""), s.cpu?.percent);
   setMeter(m.mem, fmt.pct(s.memory?.percent), s.memory?.total ? `${fmt.bytes(s.memory.used, 1)} of ${fmt.bytes(s.memory.total, 0)}` : "", s.memory?.percent);
   const dpct = s.disk?.percent ?? s.disk?.max_percent;
-  setMeter(m.disk, fmt.pct(dpct), s.disk?.total ? `${fmt.bytes(s.disk.total - s.disk.used, 0)} free` : "", dpct, dpct == null);
+  setMeter(m.disk, fmt.pct(dpct), s.disk?.total ? `${fmt.bytes(s.disk.free ?? s.disk.total - s.disk.used, 0)} free` : "", dpct, dpct == null);
   const g = s.gpus?.[0];
   if (g) {
     setMeter(m.gpu, fmt.pct(g.util_percent), g.mem_percent != null ? `vram ${fmt.pct(g.mem_percent)}` : "", g.util_percent);
@@ -275,9 +279,9 @@ async function renderDetail(name) {
     h("div", { class: "detail-title" }, h("span", { class: "status-dot " + host.status, "data-f": "dot" }), host.display_name),
     h("div", { class: "detail-meta", "data-f": "meta" }),
     h("div", { class: "actions" },
-      h("button", { class: "btn", onclick: () => navigate("#/agents/" + encodeURIComponent(host.name)) }, "Prompt Claude"),
+      h("button", { class: "btn", title: canChange() ? "" : "read-only here: prompts and transcripts can be read, not sent", onclick: () => navigate("#/agents/" + encodeURIComponent(host.name)) }, "Prompt Claude"),
       customizeBtn,
-      h("button", { class: "btn", title: "Ask the agent to re-exec itself on its next push (picks up a new script/config)", onclick: () => sendCommand(host.name, "respawn") }, "Respawn agent")),
+      guard(h("button", { class: "btn", title: "Ask the agent to re-exec itself on its next push (picks up a new script/config)", onclick: () => sendCommand(host.name, "respawn") }, "Respawn agent"))),
   );
   const hiddenBar = h("div", { class: "hidden-panels" });
   const kpis = h("div", { class: "kpis", "data-f": "kpis" });
@@ -365,7 +369,7 @@ function checkForm(cl, c, submit, cancel) {
   const cwd = h("input", { type: "text", value: c?.notify_cwd || "", placeholder: "working dir for a new session", spellcheck: "false", class: "mono" });
   const withLog = h("input", { type: "checkbox" }); withLog.checked = !!c?.notify_log;
   const cooldown = h("input", { type: "number", min: "5", value: c?.cooldown_min ?? 30, title: "minutes between alerts", style: "width:70px" });
-  const cap = h("input", { type: "number", min: "1", max: "48", value: c?.daily_cap ?? 6, title: "alerts per day at most", style: "width:60px" });
+  const cap = h("input", { type: "number", min: "1", max: "48", value: c?.daily_cap ?? 6, title: "alerts per rolling 24 h at most", style: "width:60px" });
   const go = async () => {
     const body = { target: target.value.trim(), label: label.value.trim(), notify: resp.value, notify_cwd: cwd.value.trim(), notify_log: withLog.checked,
       cooldown_min: Number(cooldown.value) || 30, daily_cap: Number(cap.value) || 6 };
@@ -379,9 +383,9 @@ function checkForm(cl, c, submit, cancel) {
     h("div", { class: "row1" }, kind, target, label),
     h("div", { class: "row2" }, h("label", {}, "expires ", ttl), h("label", {}, "responder ", resp), cwd,
       h("label", { title: "add related avm task log tails to the alert prompt (leave off for data-use-agreement data)" }, withLog, " with log tails"),
-      h("label", {}, "cooldown ", cooldown, " min"), h("label", {}, "cap ", cap, "/day"), h("span", { class: "spacer" }),
+      h("label", {}, "cooldown ", cooldown, " min"), h("label", { title: "alerts per rolling 24 h at most" }, "cap ", cap, " per 24 h"), h("span", { class: "spacer" }),
       cancel ? h("button", { class: "btn small", onclick: cancel }, "Cancel") : null,
-      h("button", { class: "btn small primary", onclick: go }, c ? "Save" : "Add check")));
+      guard(h("button", { class: "btn small primary", onclick: go }, c ? "Save" : "Add check"))));
 }
 
 async function renderChecksPanel(name, force = false) {
@@ -404,7 +408,7 @@ async function renderChecksPanel(name, force = false) {
     const cls = st === "ok" ? "ok" : st === "failing" ? (r?.level === "warning" ? "warn" : "bad") : "";
     const respName = !c.notify ? "—" : c.notify === "new" ? "new read-only session" : (cl.responders.find((x) => x.value === c.notify)?.label || "tracked agent (gone)");
     const alert = c.open_job ? h("a", { class: "chip warn", href: `#/agents/${encodeURIComponent(name)}?job=${c.open_job}`, title: "the responder prompt sent for this failure" }, `alert #${c.open_job}`)
-      : c.pending ? h("span", { class: "chip", title: "fires when the target session is idle and the cooldown is over" }, "alert pending") : null;
+      : c.pending ? h("span", { class: "chip", title: "held: the cap (alerts per rolling 24 h) is reached, it is cooling down, the target session is mid-turn, or there is nothing to prompt on this host yet - it goes out on a later report if the check is still failing" }, "alert pending") : null;
     const editTr = h("tr", { class: "check-edit", style: "display:none" });
     const closeEdit = () => { editTr.style.display = "none"; editTr.dataset.open = ""; };
     editTr.append(h("td", { colspan: 6 }, checkForm(cl, c, (body) => patch(c.id, body), closeEdit)));
@@ -412,11 +416,11 @@ async function renderChecksPanel(name, force = false) {
       h("td", {}, h("span", { class: "chip " + cls }, st)),
       h("td", {}, h("div", {}, h("b", {}, c.kind_label), " ", h("code", { title: c.target }, c.kind === "memory" ? `${c.target} GB` : c.target)), c.label ? h("div", { class: "muted small" }, c.label) : null),
       h("td", {}, h("div", { class: "muted" }, (r?.detail ?? c.detail ?? "") || "—"), c.since ? h("div", { class: "small muted" }, `${st} for ${fmt.dur(now - c.since)}`) : null),
-      h("td", {}, h("div", {}, respName), c.notify ? h("div", { class: "small muted" }, `cooldown ${c.cooldown_min} min · ≤${c.daily_cap}/day${c.notify_log ? " · with logs" : ""}`) : null, alert),
+      h("td", {}, h("div", {}, respName), c.notify ? h("div", { class: "small muted" }, `cooldown ${c.cooldown_min} min · ≤${c.daily_cap} per 24 h${c.notify_log ? " · with logs" : ""}`) : null, alert),
       h("td", { class: "small muted" }, c.expires ? `expires in ${fmt.dur(c.expires - now)}` : "", h("div", {}, c.created_by ? `added by ${c.created_by}` : "")),
       h("td", { class: "r nowrap" },
-        h("button", { class: "btn small", onclick: () => { const open = editTr.style.display === "none"; editTr.style.display = open ? "" : "none"; editTr.dataset.open = open ? "1" : ""; } }, "Edit"),
-        h("button", { class: "iconbtn small", title: "remove this check", onclick: async () => { if (!confirm(`Remove the ${c.kind_label} check on ${c.target}?`)) return; try { await post(`/api/v1/checklist/${c.id}`, undefined, "DELETE"); reload(); } catch (e) { toast(e.message, true); } } }, "×"))));
+        guard(h("button", { class: "btn small", onclick: () => { const open = editTr.style.display === "none"; editTr.style.display = open ? "" : "none"; editTr.dataset.open = open ? "1" : ""; } }, "Edit")),
+        guard(h("button", { class: "iconbtn small", title: "remove this check", onclick: async () => { if (!confirm(`Remove the ${c.kind_label} check on ${c.target}?`)) return; try { await post(`/api/v1/checklist/${c.id}`, undefined, "DELETE"); reload(); } catch (e) { toast(e.message, true); } } }, "×")))));
     tbody.append(editTr);
   }
   for (const r of cl.other_results) {
@@ -432,23 +436,23 @@ async function renderChecksPanel(name, force = false) {
     catch (e) { toast(e.message, true); }
   }, closeAdd));
   const settings = h("div", { class: "check-settings" }, ...Object.entries(SETTING_LABELS).map(([k, [lbl, hint]]) =>
-    h("label", {}, h("span", {}, lbl), h("input", { type: "text", value: cl.settings[k] || "", placeholder: hint, "data-key": k, spellcheck: "false" }))),
-    h("button", { class: "btn small", onclick: async () => {
+    h("label", {}, h("span", {}, lbl), guard(h("input", { type: "text", value: cl.settings[k] || "", placeholder: hint, "data-key": k, spellcheck: "false" })))),
+    guard(h("button", { class: "btn small", onclick: async () => {
       const body = {}; for (const i of settings.querySelectorAll("input")) body[i.dataset.key] = i.value.trim();
       try { const r = await post(`/api/v1/hosts/${encodeURIComponent(name)}/check-settings`, body, "PUT"); toast(`Saved revision ${r.rev}`); reload(); } catch (e) { toast(e.message, true); }
-    } }, "Save settings"));
+    } }, "Save settings")));
   const failing = cl.checks.filter((c) => c.state === "failing").length;
   const settingsOpen = !!el.querySelector(".check-settings-wrap")?.open;   // the panel re-renders on every report: keep it open
   el.replaceChildren(...[
     h("h3", {}, "Checks", h("span", { class: "muted head-note" }, `${cl.checks.length} configured${failing ? ` · ${failing} failing` : ""}${status ? " · " + status : ""}`),
-      h("span", { class: "spacer" }), h("button", { class: "btn small primary", onclick: () => { addRow.style.display = ""; addRow.dataset.open = "1"; addRow.querySelector("input")?.focus(); } }, "+ Add check")),
+      h("span", { class: "spacer" }), guard(h("button", { class: "btn small primary", onclick: () => { addRow.style.display = ""; addRow.dataset.open = "1"; addRow.querySelector("input")?.focus(); } }, "+ Add check"))),
     !cl.can_prompt ? h("div", { class: "chip", style: "margin-bottom:8px;white-space:normal" }, "Responders can't run on this host: it has no Claude Code CLI (Claude Desktop's built-in copy only runs inside the app).") : null,
     addRow,
     cl.checks.length || cl.other_results.length
       ? h("div", { class: "table-wrap" }, h("table", { class: "checks-table" }, h("thead", {}, h("tr", {}, h("th", {}, "State"), h("th", {}, "Check"), h("th", {}, "Result"), h("th", {}, "Responder"), h("th", {}, "Expiry"), h("th", {}))), tbody))
       : h("div", { class: "muted", style: "padding:8px 0" }, "No checks on this host yet."),
     h("p", { class: "muted small check-help" }, "Agents can manage these themselves: ", h("code", {}, "avm check add file ~/run/heartbeat:600 --label \"R4 chain\" --notify self --ttl 12h"),
-      ". A responder is prompted read-only when its check goes from ok to failing (cooldown, daily cap, one open alert until the check recovers); it investigates and reports, never acts."),
+      ". A responder is prompted read-only when its check goes from ok to failing (cooldown, a cap per rolling 24 h, one open alert until the check recovers); it investigates and reports, never acts."),
     h("details", { class: "check-settings-wrap", open: settingsOpen ? "" : null }, h("summary", {}, "Host settings"), settings),
   ].filter(Boolean));
 }
@@ -513,7 +517,7 @@ function updateDetail(host) {
     h("td", { title: x.device }, x.mountpoint), h("td", { class: "muted" }, x.fstype), h("td", { class: "r num" }, fmt.pct(x.percent, 1)), h("td", { class: "r num" }, fmt.bytes(x.free, 0)), h("td", { class: "r num" }, fmt.bytes(x.total, 0)), h("td", { class: "r" }, bar(x.percent))))));
   show("gpus", (s.gpus || []).length);
   if ((s.gpus || []).length) body("gpus").append(table(["GPU", "r:Util", "r:VRAM", "r:Temp", "r:Power", "r:Fan", "r:Clock"], s.gpus.map((g) => h("tr", {},
-    h("td", { title: `${g.vendor} via ${g.source}${g.state ? " · " + g.state : ""}` }, `${g.name}${g.state === "suspended" ? " (sleeping)" : ""}`), h("td", { class: "r num" }, fmt.pct(g.util_percent)),
+    h("td", { class: "wrap", title: `${g.vendor} via ${g.source}${g.state ? " · " + g.state : ""}` }, `${g.name}${g.state === "suspended" ? " (sleeping)" : ""}`), h("td", { class: "r num" }, fmt.pct(g.util_percent)),
     h("td", { class: "r num" }, g.mem_used != null && g.mem_total ? `${fmt.bytes(g.mem_used, 1)} / ${fmt.bytes(g.mem_total, 0)}` : fmt.pct(g.mem_percent)),
     h("td", { class: "r num" }, fmt.temp(g.temp_c)), h("td", { class: "r num" }, g.power_w != null ? `${Math.round(g.power_w)}${g.power_limit_w ? " / " + Math.round(g.power_limit_w) : ""} W` : "—"),
     h("td", { class: "r num" }, fmt.pct(g.fan_percent)), h("td", { class: "r num" }, g.clock_mhz != null ? Math.round(g.clock_mhz) + " MHz" : "—")))));
@@ -537,11 +541,11 @@ function updateDetail(host) {
         run ? h("a", { href: `#/tasks?open=${run.id}`, class: "muted", style: "margin-left:8px" }, `last run: task #${run.id} (${run.status})`) : null));
       el.append(h("dl", { class: "kvlist", style: "margin:6px 0 14px" },
         ...[["Last success", b.last_success ? `${fmt.when(b.last_success)} · ${fmt.ago(now - b.last_success)}` : "never"],
-          ["Last run", b.state === "running" ? `running since ${fmt.when(b.started)}` : b.finished ? `${b.state} · ${fmt.when(b.finished)}${b.duration_sec != null ? " · took " + fmt.dur(b.duration_sec) : ""}` : null],
-          ["Error", b.error], ["Next run", b.next_run ? fmt.when(b.next_run) : null],
+          ["Last run", b.state === "running" ? `running since ${fmt.when(b.started)}${bh.stale ? " - never finished: killed (OOM, reboot, SIGKILL) or hung" : ""}` : b.finished ? `${b.state} · ${fmt.when(b.finished)}${b.duration_sec != null ? " · took " + fmt.dur(b.duration_sec) : ""}` : null],
+          [b.state === "partial" ? "Not backed up" : "Error", b.error], ["Next run", b.next_run ? fmt.when(b.next_run) : null],
           ["Snapshot", b.snapshot ? `${b.snapshot}${b.files != null ? ` · ${b.files.toLocaleString()} files` : ""}${b.bytes_scanned != null ? " · " + fmt.bytes(b.bytes_scanned) : ""}` : null],
           ["Last run added", b.bytes_added != null ? `${fmt.bytes(b.bytes_added)} new data${b.files_new != null ? ` · ${b.files_new.toLocaleString()} new / ${(b.files_changed || 0).toLocaleString()} changed files` : ""}` : null],
-          ["Unreadable", b.warnings ? `${b.warnings} file${b.warnings === 1 ? "" : "s"} could not be read (snapshot still saved)` : null],
+          ["Warnings", b.warnings ? `${b.warnings} (unreadable files, missing paths or a failed SQLite copy - the snapshot was still saved)` : null],
           ["Repository", `${b.repository || "?"}${b.repo_bytes != null ? " · " + fmt.bytes(b.repo_bytes) : ""}${b.target_free_bytes != null ? " · " + fmt.bytes(b.target_free_bytes, 0) + " free" : ""}`],
           ["Kept", b.snapshots != null ? `${b.snapshots} snapshot${b.snapshots === 1 ? "" : "s"}${keep ? " · keeps " + keep : ""}` : null],
           ["Verified", b.checked ? `${fmt.when(b.checked)} (part of the data re-read)` : null],
