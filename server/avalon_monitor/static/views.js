@@ -1,5 +1,5 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
-import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.10.5";
+import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct } from "./core.js?v=1.10.6";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
@@ -21,6 +21,12 @@ export function taskAlerting(t, now = Date.now() / 1000) {
 export async function ackTasks(ids, { host, undo = false } = {}) {
   try {
     const r = await post("/api/v1/tasks/ack", { ids, host, undo });
+    return r.changed;
+  } catch (e) { toast(e.message, true); return 0; }
+}
+export async function ackJobs(ids, { undo = false } = {}) {
+  try {
+    const r = await post("/api/v1/claude/jobs/ack", { ids, undo });
     return r.changed;
   } catch (e) { toast(e.message, true); return 0; }
 }
@@ -618,7 +624,7 @@ export function computeAlerts() {
     out.push({ level: "warn", what: `tracked agent stopped mid-task: ${t.name || t.key.slice(0, 8)}`, why: t.detail || "restart it from the Agents tab",
       host: t.host, go: `#/agents/${encodeURIComponent(t.host)}`, ts: t.last_live || t.last_activity });
   }
-  for (const j of state.jobs.values()) if (j.status === "failed" && now - (j.ended || j.created) < 86400) out.push({ level: "warn", what: `claude ${j.action || "prompt"} failed: ${j.title}`, why: (j.error || "").slice(0, 160), host: j.host, go: `#/agents/${encodeURIComponent(j.host)}`, ts: j.ended });
+  for (const j of state.jobs.values()) if (j.status === "failed" && !j.acked && now - (j.ended || j.created) < 86400) out.push({ level: "warn", what: `claude ${j.action || "prompt"} failed: ${j.title}`, why: (j.error || "").slice(0, 160), host: j.host, go: `#/agents/${encodeURIComponent(j.host)}`, ts: j.ended, job: j.id });
   return out.sort((a, b) => (a.level === "crit" ? 0 : 1) - (b.level === "crit" ? 0 : 1) || (b.ts || 0) - (a.ts || 0));
 }
 
@@ -634,13 +640,18 @@ export async function renderAlerts() {
     for (const a of alerts) {
       // Opening a task alert counts as having checked it: acknowledge, then show the task.
       const open = () => { if (a.task) ackTasks([a.task]); navigate(a.go); };
-      const dismiss = a.task ? h("button", { class: "btn small", title: "Acknowledge: stop alerting, keep the task", onclick: (e) => { e.stopPropagation(); ackTasks([a.task]); } }, "Dismiss") : null;
+      const ack = a.task ? () => ackTasks([a.task]) : a.job ? () => ackJobs([a.job]) : null;
+      const dismiss = ack ? h("button", { class: "btn small", title: `Acknowledge: stop alerting, keep the ${a.task ? "task" : "prompt"}`, onclick: (e) => { e.stopPropagation(); ack(); } }, "Dismiss") : null;
       list.append(h("div", { class: "card alert " + a.level, onclick: open }, h("span", { class: "dot" }), h("div", {}, h("div", { class: "what" }, a.what), h("div", { class: "why" }, a.why)), h("div", { class: "host" }, a.host, dismiss ? " " : null, dismiss)));
     }
-    dismissAll.style.display = alerts.some((a) => a.task) ? "" : "none";
+    dismissAll.style.display = alerts.some((a) => a.task || a.job) ? "" : "none";
     emit_badges();
   };
-  const dismissAll = h("button", { class: "btn small", title: "Acknowledge every task alert shown (tasks are kept)", onclick: () => ackTasks(computeAlerts().filter((a) => a.task).map((a) => a.task)) }, "Dismiss all task alerts");
+  const dismissAll = h("button", { class: "btn small", title: "Acknowledge every task and failed-prompt alert shown (tasks and prompts are kept)", onclick: () => {
+    const shown = computeAlerts(), tasks = shown.filter((a) => a.task).map((a) => a.task), jobs = shown.filter((a) => a.job).map((a) => a.job);
+    if (tasks.length) ackTasks(tasks);
+    if (jobs.length) ackJobs(jobs);
+  } }, "Dismiss all task/prompt alerts");
   redraw();
   app.append(h("div", { class: "page-head" }, h("h2", {}, "Alerts"), h("span", { class: "muted" }, "what needs attention right now"), h("div", { class: "filters" }, dismissAll)), list);
   state.alertsView = { redraw };

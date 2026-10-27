@@ -255,6 +255,21 @@ async def jobs_list(ident: Identity = Depends(require_viewer), host: Optional[st
     return {"jobs": [job_public(j) for j in rows]}
 
 
+class JobAck(BaseModel):
+    ids: Optional[list[int]] = None      # None = every failed prompt
+    undo: bool = False
+
+
+@router.post("/claude/jobs/ack")
+async def jobs_ack(body: JobAck, request: Request, ident: Identity = Depends(require_viewer)):
+    """Acknowledge failed prompts so they stop alerting (they stay in the job list)."""
+    require_same_origin(request)
+    rows = await run_in_threadpool(db.job_ack, body.ids, ident.subject, body.undo)
+    for j in rows:
+        await hub.broadcast({"type": "claude_job", "job": job_public(j)})
+    return {"ok": True, "changed": len(rows)}
+
+
 @router.get("/claude/jobs/{job_id}")
 async def job_get(job_id: int, ident: Identity = Depends(require_viewer), after: int = 0):
     j = await run_in_threadpool(db.job_get, job_id)

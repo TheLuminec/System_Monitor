@@ -314,8 +314,10 @@ class Database:
         if "remote_control" not in cols:   # linked to Remote Control: reachable from sessions on other machines
             self._conn.execute("ALTER TABLE claude_tracked ADD COLUMN remote_control INTEGER")
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(claude_jobs)")}
-        for col, ddl in (("action", "TEXT"), ("target", "TEXT"), ("fork_session", "INTEGER NOT NULL DEFAULT 0")):
-            if col not in cols:   # action: restart/stop a tracked session; fork_session: prompt a copy of a live session
+        for col, ddl in (("action", "TEXT"), ("target", "TEXT"), ("fork_session", "INTEGER NOT NULL DEFAULT 0"),
+                         ("acked", "REAL"), ("acked_by", "TEXT")):
+            if col not in cols:   # action: restart/stop a tracked session; fork_session: prompt a copy of a live session;
+                                  # acked: a failed prompt dismissed from Alerts
                 self._conn.execute(f"ALTER TABLE claude_jobs ADD COLUMN {col} {ddl}")
         self._import_legacy_checks()
 
@@ -744,6 +746,26 @@ class Database:
             vals.append(job_id)
             self._conn.execute(f"UPDATE claude_jobs SET {', '.join(sets)} WHERE id=?", vals)
             return _row(self._conn.execute("SELECT * FROM claude_jobs WHERE id=?", (job_id,)).fetchone())
+
+    def job_ack(self, job_ids: list[int] | None = None, by: str | None = None, undo: bool = False,
+                now: float | None = None) -> list[dict]:
+        """Acknowledge (or un-acknowledge) failed prompts so they stop showing in Alerts. Nothing is deleted.
+        job_ids=None means every failed prompt. Returns changed rows."""
+        now = now or time.time()
+        where, vals = ["status='failed'", "acked IS NOT NULL" if undo else "acked IS NULL"], []
+        if job_ids is not None:
+            if not job_ids:
+                return []
+            where.append(f"id IN ({','.join('?' * len(job_ids))})"); vals += job_ids
+        with self._lock:
+            ids = [r["id"] for r in self._conn.execute(f"SELECT id FROM claude_jobs WHERE {' AND '.join(where)}", vals).fetchall()]
+            if ids:
+                marks = ",".join("?" * len(ids))
+                if undo:
+                    self._conn.execute(f"UPDATE claude_jobs SET acked=NULL, acked_by=NULL WHERE id IN ({marks})", ids)
+                else:
+                    self._conn.execute(f"UPDATE claude_jobs SET acked=?, acked_by=? WHERE id IN ({marks})", [now, by, *ids])
+            return [_row(self._conn.execute("SELECT * FROM claude_jobs WHERE id=?", (i,)).fetchone()) for i in ids]
 
     def job_add_events(self, job_id: int, host_id: int, events: list[dict]) -> list[tuple[int, dict]]:
         """Append events; returns [(seq, event)] as stored."""
