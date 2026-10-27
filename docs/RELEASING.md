@@ -25,7 +25,7 @@ tests/run.sh
 
 It runs `pytest tests/`, `bash -n` on every `*.sh`, `node --check` on the dashboard JS and `py_compile` on the agent
 and the backup scripts. It runs every check, then exits non-zero if any failed. It needs the repo's `.venv` (or
-`AVM_TEST_PYTHON=/path/to/python`) and `node`. Create the venv once per checkout:
+`AVM_TEST_PYTHON=/path/to/python`) and `node`. `AVM_TEST_SKIP_PYTEST=1` runs only the static checks (seconds). Create the venv once per checkout:
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r server/requirements.txt -r agent/requirements.txt -c tests/constraints-prod.txt pytest httpx
@@ -40,8 +40,8 @@ python3 -m venv .venv && .venv/bin/pip install -r server/requirements.txt -r age
 | `test_avm.py` | `avm` against a real hub on a loopback port: run/watch/task, untracked runs when the hub is down, exit codes and signals, task-log switches, the queue dir's safety rules (an unsafe dir never stops a job: it runs without admission, F-07), a second user's job on a shared host, a shared `--gpu` job beside an `--exclusive` one, the `--beat` help vs the hub's stall rule |
 | `test_checks.py` | check state across agent restarts, partial `PUT .../checks`, `manage.py checks`, adoption, responder guardrails (rolling cap, held alerts, fork fallback) |
 | `test_db.py` | rollups with late samples, beats reviving lost tasks, one-time legacy check import |
-| `test_backup.py` | `restic-backup.py` against throwaway restic repos (skipped without `restic`): failed on stop/crash, partial, seed |
-| `test_deploy_hub.py` | `deploy-hub.sh` against a temp repo, a fake `systemctl` and a fake hub: origin/main gate, downgrade refusal, test gate, rollback, agent/ only after a healthy restart |
+| `test_backup.py` | `restic-backup.py` against throwaway restic repos (skipped without `restic`): failed on stop/crash, no false "failed" after a saved snapshot, partial, a missing source path keeps `last_success`, seed |
+| `test_deploy_hub.py` | `deploy-hub.sh` against a temp repo, a fake `systemctl`/`git`/`rsync` and a fake hub: origin/main gate (fetch failing or hanging), downgrade refusal, test gate (timeout, one retry of failed tests, static checks under `--skip-tests`), rollback and its provenance, agent/ only after a healthy restart and `.sig` before code, the stale backup-avm warning |
 | `test_release.py` | the agent files carry valid release signatures |
 | `test_sign_release.py` | `sign-release.py` against a temp repo with a bare origin and a temp key: signs only a pushed commit's bytes, refuses a dirty `agent/`, an unpushed commit, a tampered object store, a non-isolated / venv interpreter; its inlined release format equals the agent's |
 | `test_ui.py` | dashboard logic run with node (read-only mode, per-host prompt caps, escaping) and Windows installer ACLs |
@@ -125,24 +125,41 @@ deploy/deploy-hub.sh --status        # live version, deployed commit, last log l
 deploy/deploy-hub.sh --rollback      # put back what was live before the last deploy (agent/ too)
 ```
 
+`--rollback` restores the copy taken before the last **successful** deploy, server/ first: restart, health check,
+and only then `agent/`, like a deploy. It refuses (unless `--rollback --force`) when that copy doesn't belong to what is
+live now: the last deploy-hub.sh deploy isn't the one it undoes (it was already rolled back), or the version on disk or
+on `/healthz` isn't that deploy's (a `sudo upgrade.sh` since). A deploy that fails keeps the previous copy, so
+`--rollback` still undoes the last good deploy. `--status` shows what the copy holds.
+
 What it does, in order:
 
 1. Fetches `origin` and refuses a commit that isn't on `origin/main`. Unpushed work, side branches and a stale local
-   `main` are never deployed.
+   `main` are never deployed. The fetch never prompts and gets 30 s; if it fails, the check uses the last fetched
+   `origin/main` (with a warning).
 2. Takes the commit with `git archive`, so only committed code ships, never the working tree.
 3. Refuses (and points to `sudo ./deploy/upgrade.sh`) when the release needs root: a changed
    `server/requirements.txt`, a changed systemd unit, or a `server/` dir it can't write.
 4. Refuses a lower `__version__` than the deployed one unless `--force` (with a downgrade, every host would
    self-update down too). For a mistake, `--rollback` is the usual way back.
-5. Runs `tests/run.sh` on exactly that tree, with the repo's `.venv`. A failure stops the deploy (full output in
-   `~/.local/state/avalon-monitor-deploy/tests.log`). A checkout without `.venv` fails this gate: create it as in
-   [Tests](#tests). `--skip-tests` skips it, loudly, and is logged.
+5. Runs `tests/run.sh` on exactly that tree, with the repo's `.venv`, for at most 600 s. A failure stops the deploy
+   (full output in `~/.local/state/avalon-monitor-deploy/tests.log`). When only pytest failed, the failed tests get
+   one retry (`pytest --lf`) first; a pass then is logged as flaky in `deploy.log`, and both attempts are in
+   `tests.log`. A timeout or a failed static check is not retried. A checkout without `.venv` fails this gate: create
+   it as in [Tests](#tests). `--skip-tests` skips pytest, loudly, and is logged; the static checks (`bash -n`,
+   `node --check`, `py_compile`) still run.
 6. Copies `server/` into `/opt/avalon-monitor`, restarts the service (allowed without sudo by
    `deploy/polkit/50-avalon-monitor-deploy.rules`), waits for `/healthz` to report the new version, and smoke-tests
    `GET /`, `/api/v1/hosts` and `/api/v1/stats` from localhost. If any of that fails, it restores the previous
    `server/` and restarts it. A copy that fails part-way is restored too, so the code on disk is never a mix of old and new.
 7. Only then copies `agent/`, if `/opt/avalon-monitor/agent` is writable by you. The hub serves it to every host on
-   its next report, so a release that gets rolled back never reaches the fleet. A failed agent copy is restored.
+   its next report, so a release that gets rolled back never reaches the fleet. The `.sig` files go in before the code,
+   so the hub never serves new code with an old signature. A failed agent copy is restored.
+8. Warns when the backup service's own root-owned copy of avm (`/usr/local/lib/avalon-backup/avm.py`, from
+   `deploy/backup/install-restic-backup.sh`) has another `AVM_VERSION` than this release. Deploys can't refresh it and
+   it doesn't self-update. Refresh it from a checkout of the deployed commit with
+   `sudo deploy/backup/install-restic-backup.sh /etc/avalon-backup/config.json`: that re-reads the installed config,
+   keeps the repository, password, schedule and the last run's status, and only re-installs the runner, the config,
+   avm and the units (no `--now`, so no backup starts).
 
 One-time setup: the polkit rule
 (`sudo install -m 644 deploy/polkit/50-avalon-monitor-deploy.rules /etc/polkit-1/rules.d/`; it names the operator's

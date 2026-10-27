@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -119,6 +120,7 @@ class World:
         self.env.update({"PATH": f"{self.bin}:{os.environ['PATH']}", "XDG_STATE_HOME": str(tmp / "state"),
                          "AVM_DEPLOY_ROOT": str(self.root), "AVM_DEPLOY_UNIT_DIR": str(tmp / "units"),
                          "AVM_DEPLOY_HEALTH_URL": self.hub.url, "AVM_DEPLOY_HEALTH_TRIES": "2",
+                         "AVM_DEPLOY_BACKUP_AVM": str(tmp / "no-backup-avm.py"),   # not this box's real one
                          "AVM_TEST_PYTHON": sys.executable})
 
     def git(self, *args, cwd=None):
@@ -150,6 +152,9 @@ class World:
 
     def restarts(self):
         return self.calls.read_text().count("restart") if self.calls.exists() else 0
+
+    def log(self, name):
+        return (self.tmp / "state" / "avalon-monitor-deploy" / name).read_text()
 
     def deployed(self):
         return self.hub.read_version()
@@ -254,3 +259,187 @@ def test_failing_test_suite_refuses_deploy(world):
     assert r.returncode == 0, r.stderr
     assert "WITHOUT running the test suite" in r.stderr
     assert world.deployed() == "1.2.0"
+
+
+def test_rollback_puts_back_the_previous_release_hub_first(world):
+    """F-09: --rollback restored agent/ before the restart, so the hosts got the old agent while the hub that serves it
+    was not yet known to come back. Now, as in a deploy (E-13): server/, restart, health check, and only then agent/.
+    F-08: the copy undoes one deploy - once it is used, a second --rollback is refused."""
+    assert world.deploy("main").returncode == 0
+    assert world.agent() == NEW_AGENT
+    world.hub.agents_seen.clear()
+    r = world.deploy("--rollback")
+    assert r.returncode == 0, r.stderr
+    assert "hub v1.1.0 is live" in r.stdout
+    assert world.deployed() == "1.1.0" and world.hub.version == "1.1.0" and world.restarts() == 2
+    assert (world.root / "server/avalon_monitor/old.py").exists() and (world.root / "server/monitor.db").read_text() == "data"
+    # every request the rolled-back hub answered (the health check) still found the newer agent on disk ...
+    assert world.hub.agents_seen and set(world.hub.agents_seen) == {NEW_AGENT}
+    assert world.agent() == OLD_AGENT   # ... and the old one is back afterwards
+
+    r = world.deploy("--rollback")
+    assert r.returncode != 0 and "does not belong to what is live now" in r.stderr
+    assert world.restarts() == 2
+
+
+def test_rollback_refuses_a_copy_that_does_not_belong_to_the_live_release(world):
+    """F-08: since the deploy, something else (a sudo upgrade.sh) put v1.3.0 live. The rollback copy undoes v1.2.0, not
+    that, so --rollback refuses and touches nothing - unless --force."""
+    assert world.deploy("main").returncode == 0
+    (world.root / "server/avalon_monitor/__init__.py").write_text(version_file("1.3.0"))
+    world.hub.version = "1.3.0"
+    r = world.deploy("--rollback")
+    assert r.returncode != 0
+    assert "does not belong to what is live now" in r.stderr and "has v1.3.0" in r.stderr and "--force" in r.stderr
+    assert world.deployed() == "1.3.0" and world.restarts() == 1 and world.agent() == NEW_AGENT
+
+    r = world.deploy("--force", "--rollback")
+    assert r.returncode == 0, r.stderr
+    assert "--force: rolling back although" in r.stderr
+    assert world.deployed() == "1.1.0" and world.agent() == OLD_AGENT
+
+
+def test_failed_deploy_keeps_the_rollback_copy(world):
+    """F-08: a deploy that failed its health check had already replaced the rollback copy with the release that stayed
+    live, so a later --rollback "restored" what was running anyway. The copy of the last good deploy is kept."""
+    assert world.deploy("main").returncode == 0   # 1.1.0 -> 1.2.0
+    world.write("server/avalon_monitor/web.py", "NEWER = 1\n")
+    world.commit("v1.3.0", version="1.3.0", push=True)
+    world.hub.broken = {"1.3.0": "healthz"}
+    r = world.deploy("main")
+    assert r.returncode != 0 and "rolled back; previous version is live" in r.stderr
+    assert world.deployed() == "1.2.0"
+
+    r = world.deploy("--rollback")
+    assert r.returncode == 0, r.stderr
+    assert world.deployed() == "1.1.0" and world.agent() == OLD_AGENT
+    assert "rollback: to v1.1.0" in world.deploy("--status").stdout
+
+
+@pytest.mark.parametrize("mode", ["fails", "hangs"])
+def test_unreachable_origin_falls_back_to_the_last_fetch(world, mode):
+    """F-10: `git fetch` had no time limit and could prompt on the terminal. It now runs with GIT_TERMINAL_PROMPT=0
+    under a timeout (AVM_DEPLOY_FETCH_TIMEOUT, 30 s); one that fails or hangs falls back to the last fetched
+    origin/main (the offline rule as before), and a hang costs no more than the timeout."""
+    real, seen = shutil.which("git"), world.tmp / "fetch-env"
+    act = "exit 128" if mode == "fails" else "exec sleep 30"
+    world.shim("git", f'for a in "$@"; do [[ "$a" != fetch ]] || {{ echo "prompt=${{GIT_TERMINAL_PROMPT:-unset}}" > {seen}; {act}; }}; done\n'
+                      f'exec {real} "$@"\n')
+    t = time.monotonic()
+    r = world.deploy("main", env={"AVM_DEPLOY_FETCH_TIMEOUT": "1"})
+    assert time.monotonic() - t < 20
+    assert r.returncode == 0, r.stderr
+    assert "cannot fetch origin" in r.stderr and world.deployed() == "1.2.0"
+    assert seen.read_text().strip() == "prompt=0"
+
+
+FAKE_SUITE = """#!/bin/bash
+# stand-in for tests/run.sh: pytest only, with its flags and its summary line
+cd "$(dirname "$0")/.."
+if "$AVM_TEST_PYTHON" -m pytest tests -q -p no:warnings; then echo "ok    pytest"
+else echo "FAIL  pytest" >&2; echo "tests/run.sh: 1 check(s) FAILED: pytest" >&2; exit 1; fi
+echo "tests/run.sh: all checks passed"
+"""
+FLAKY = """import os, pathlib
+D = pathlib.Path(os.environ["FLAKY_DIR"])
+def test_solid():
+    with open(D / "solid", "a") as f:
+        f.write("x")
+def test_flaky():
+    first = not (D / "flaky").exists()
+    (D / "flaky").write_text("ran")
+    assert not (first or os.environ.get("FLAKY_ALWAYS")), "fails"
+"""
+
+
+@pytest.mark.parametrize("always", [False, True])
+def test_failed_tests_are_retried_once(world, always):
+    """F-11: a failure of pytest alone gets one retry of only the failed tests (pytest --lf): a flaky test then passes
+    and the deploy goes ahead (logged as flaky), a real failure fails twice and refuses. Both attempts are in tests.log."""
+    world.write("tests/run.sh", FAKE_SUITE)
+    world.write("tests/test_flaky.py", FLAKY)
+    world.commit("a flaky test", push=True)
+    flaky = world.tmp / "flaky"
+    flaky.mkdir()
+    r = world.deploy("main", env={"FLAKY_DIR": str(flaky), **({"FLAKY_ALWAYS": "1"} if always else {})})
+    log = world.log("tests.log")
+    assert "retry of the failed tests only: tests/test_flaky.py::test_flaky" in log
+    assert (flaky / "solid").read_text() == "x"   # the retry ran only the test that failed
+    if always:
+        assert r.returncode != 0 and "test suite failed" in r.stderr
+        assert log.count("FAILED tests/test_flaky.py::test_flaky") == 2
+        assert world.deployed() == "1.1.0" and world.restarts() == 0
+    else:
+        assert r.returncode == 0, r.stderr
+        assert world.deployed() == "1.2.0"
+        assert "flaky: pytest failed" in world.log("deploy.log")
+
+
+def test_hung_test_suite_times_out(world):
+    """F-11: tests/run.sh ran without a time limit, so a hung test held the deploy forever. It gets one now (600 s,
+    AVM_DEPLOY_TESTS_TIMEOUT); a suite that runs out of time refuses the deploy and is not retried."""
+    world.write("tests/run.sh", "#!/bin/bash\necho started\nsleep 30\n")
+    world.commit("hangs", push=True)
+    t = time.monotonic()
+    r = world.deploy("main", env={"AVM_DEPLOY_TESTS_TIMEOUT": "1"})
+    assert time.monotonic() - t < 20
+    assert r.returncode != 0 and "timed out after 1s" in r.stderr and "retry" not in world.log("tests.log")
+    assert world.deployed() == "1.1.0" and world.restarts() == 0
+
+
+def test_skip_tests_still_runs_the_static_checks(world):
+    """F-11: --skip-tests skipped tests/run.sh altogether. It now runs it with AVM_TEST_SKIP_PYTEST=1 (bash -n,
+    node --check, py_compile: seconds), and a failing static check still refuses the deploy."""
+    world.write("tests/run.sh", '#!/bin/bash\necho "pytest skipped: ${AVM_TEST_SKIP_PYTEST:-no}"\necho "FAIL  bash -n" >&2\nexit 1\n')
+    world.commit("a syntax error", push=True)
+    r = world.deploy("--skip-tests", "main")
+    assert r.returncode != 0
+    assert "static checks failed" in r.stderr and "pytest skipped: 1" in r.stderr and "FAIL  bash -n" in r.stderr
+    assert world.deployed() == "1.1.0" and world.restarts() == 0
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="tests/run.sh's static checks need node")
+def test_run_sh_can_skip_only_pytest(tmp_path):
+    """F-11: AVM_TEST_SKIP_PYTEST=1 makes tests/run.sh run its static checks without pytest (what --skip-tests runs).
+    The bogus AVM_TEST_PYTHON makes a run.sh that still tried pytest fail, instead of recursing into this suite."""
+    r = subprocess.run(["bash", str(ROOT / "tests" / "run.sh")], capture_output=True, text=True, timeout=300,
+                       env={**os.environ, "AVM_TEST_SKIP_PYTEST": "1", "AVM_TEST_PYTHON": str(tmp_path / "no-python")})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "skip  pytest" in r.stdout and "ok    bash -n" in r.stdout and "ok    py_compile" in r.stdout
+
+
+def test_agent_signatures_go_in_place_before_the_code(world):
+    """F-22: a single rsync renames in name order, so agent/avalon_agent.py went live before avalon_agent.py.sig and
+    for a moment the hub served the new code with the old signature. The *.sig files now land first."""
+    world.write("agent/avalon_agent.py.sig", "new-sig\n")
+    world.commit("signed", push=True)
+    (world.root / "agent/avalon_agent.py.sig").write_text("old-sig\n")
+    os.utime(world.root / "agent/avalon_agent.py.sig", (1_600_000_000, 1_600_000_000))   # an earlier deploy (see World)
+    real, order = shutil.which("rsync"), world.tmp / "rsync-order"
+    # copies INTO the deployed agent/ list what they replace, in the order they replace it
+    world.shim("rsync", f'[[ "${{!#}}" != "{world.root}/agent/" ]] || {{ {real} --out-format=%n "$@" >> {order}; exit; }}\n'
+                        f'exec {real} "$@"\n')
+    r = world.deploy("main")
+    assert r.returncode == 0, r.stderr
+    names = order.read_text().split()
+    assert names.index("avalon_agent.py.sig") < names.index("avalon_agent.py"), names
+    assert world.agent() == NEW_AGENT and (world.root / "agent/avalon_agent.py.sig").read_text() == "new-sig\n"
+
+
+@pytest.mark.parametrize("copy", ["1.9.0", "1.9.1", None])
+def test_warns_when_the_backup_services_avm_is_stale(world, copy):
+    """F-05: the root backup unit runs its own copy of avm (from install-restic-backup.sh) that no deploy refreshes. A
+    deploy whose agent/avm.py has another AVM_VERSION warns - it never fails - and prints the command that refreshes
+    it; a current copy, or none, says nothing."""
+    world.write("agent/avm.py", 'AVM_VERSION = "1.9.1"\n')
+    world.commit("avm", push=True)
+    backup = world.tmp / "backup-avm.py"
+    if copy:
+        backup.write_text(f'#!/usr/bin/python3\nAVM_VERSION = "{copy}"\n')
+    r = world.deploy("main", env={"AVM_DEPLOY_BACKUP_AVM": str(backup)})
+    assert r.returncode == 0, r.stderr
+    stale = copy == "1.9.0"
+    assert ("runs its own copy of avm" in r.stderr) == stale, r.stderr
+    if stale:
+        assert f"({backup}, v1.9.0), not this release's v1.9.1" in r.stderr
+        assert f"sudo {world.repo}/deploy/backup/install-restic-backup.sh /etc/avalon-backup/config.json" in r.stderr

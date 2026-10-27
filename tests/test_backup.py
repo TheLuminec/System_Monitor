@@ -4,7 +4,8 @@ a host's backups, and the dashboard's backupHealth (core.js, run with node).
 E-09: a stopped or crashed run writes "failed", never a stale "running"; the UI treats an old "running" as dead.
 E-10: --seed keeps a status written by a real run unless --force.
 E-11: restic exit 3 (unreadable files, missing source paths) and a failed SQLite copy make the run "partial".
-E-32: the installer shows a new password right away; seed() works for repositories that are not local directories."""
+E-32: the installer shows a new password right away; seed() works for repositories that are not local directories.
+F-13: a missing source path does not advance last_success. F-14: a stop after the snapshot is saved is no failure."""
 import json
 import os
 import shutil
@@ -170,7 +171,9 @@ def test_restic_exit_3_is_partial(bk):
     if unreadable:
         assert "1 file unreadable" in st["error"] and str(secret) in st["error"] and "permission denied" in st["error"]
     assert st["warnings"] == (2 if unreadable else 1)
-    assert st["snapshot"] and st["last_success"] >= st["started"]   # the snapshot was saved: last_success advances
+    # the snapshot was saved, but without a configured path: not a success (F-13; the first run, so there is none)
+    assert st["snapshot"] and st["last_success"] is None
+    assert not os.path.exists(bk.config["stamp_file"])
     assert "backup PARTIAL" in r.stdout
 
 
@@ -185,6 +188,52 @@ def test_sqlite_copy_failure_is_partial(bk):
     assert st["state"] == "partial" and st["warnings"] == 1, st
     assert "SQLite copy failed" in st["error"] and "missing.db" in st["error"]
     assert copy.read_text() == "yesterday"   # the previous copy is kept, not half-overwritten
+
+
+@needs_restic
+def test_missing_source_path_does_not_advance_last_success(bk):
+    """F-13: a source path missing every night gave "partial" with last_success advanced each time, so the card stayed
+    amber forever and the 26 h stale alert never fired. A missing path now keeps the last complete run's last_success
+    (and stamp); unreadable files still advance it (the snapshot holds everything else)."""
+    assert bk.run().returncode == 0
+    first = bk.status()["last_success"]
+    stamp = os.stat(bk.config["stamp_file"]).st_mtime_ns
+    time.sleep(0.05)
+
+    gone = str(bk.path / "unmounted")
+    r = bk.run(paths=bk.config["paths"] + [gone])
+    assert r.returncode == 0, r.stdout + r.stderr
+    st = bk.status()
+    assert st["state"] == "partial" and gone in st["error"], st
+    assert st["last_success"] == first and st["finished"] > first   # the run finished, but is not a success
+    assert os.stat(bk.config["stamp_file"]).st_mtime_ns == stamp
+    assert "last success not advanced" in r.stdout
+
+    if os.geteuid() != 0:   # root reads the file anyway
+        secret = bk.path / "src" / "d" / "secret"
+        secret.write_text("x")
+        secret.chmod(0)
+        try:
+            r = bk.run()
+        finally:
+            secret.chmod(0o600)
+        st = bk.status()
+        assert st["state"] == "partial" and "1 file unreadable" in st["error"], st
+        assert st["last_success"] > first and os.stat(bk.config["stamp_file"]).st_mtime_ns > stamp
+
+
+@needs_restic
+def test_sigterm_after_the_snapshot_is_saved_is_not_a_failure(bk):
+    """F-14: a stop (systemd stop, TimeoutStartSec) that lands after the snapshot was saved and pruned - here while the
+    runner lists the snapshots for its statistics - wrote "failed" (a false red). The run is a success: it ends "ok"
+    with exit 0, last_success and the stamp advance, and only the unmeasured statistics keep the previous values."""
+    path = bk.fake_restic('if [ "$1" = snapshots ]; then kill -TERM $PPID; exec sleep 5; fi')
+    r = bk.run(path=path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    st = bk.status()
+    assert st["state"] == "ok" and st["error"] is None and st["snapshot"], st
+    assert st["last_success"] >= st["started"] and os.path.exists(bk.config["stamp_file"])
+    assert "stopped by signal 15 after the snapshot was saved" in r.stdout and "backup OK" in r.stdout
 
 
 def test_problem_text_is_short():
@@ -208,6 +257,8 @@ def test_seed_handles_a_repository_that_is_not_a_directory(bk):
 
 
 def test_installer_prints_a_new_password_before_anything_else_can_fail():
+    """Static (source-text) check: the installer needs root, apt, openssl, systemd and a /dev/tty, so it cannot run
+    under pytest - this pins the order of its lines instead (E-32)."""
     sh = INSTALLER.read_text()
     shown = sh.index('echo "      $(cat "$PASS")"')
     assert sh.index("openssl rand") < shown < sh.index("restic init"), "the new password must be shown right after it is made"
