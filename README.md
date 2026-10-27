@@ -169,7 +169,7 @@ entirely. Details: [docs/SECURITY.md](docs/SECURITY.md#agent-local-policy).
 ## 1. Install the hub on AVALON
 
 ```bash
-git clone <this repo> ~/Projects/System_Monitor && cd ~/Projects/System_Monitor
+git clone <this repo> ~/Projects/avalon-monitor && cd ~/Projects/avalon-monitor
 sudo ./deploy/install-server.sh
 ```
 
