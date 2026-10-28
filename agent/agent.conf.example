@@ -63,7 +63,7 @@ AVM_AUTO_UPDATE=true
 #AVM_CLAUDE_HOME=
 
 # --- Local policy: only this file sets these; the hub can never override them (docs/SECURITY.md) ---
-# Highest permission mode a dashboard prompt may use here: plan | acceptEdits | full. Higher requests are refused.
+# Highest permission mode a dashboard prompt may use here: plan | acceptEdits | auto | full. Higher requests are refused.
 #AVM_MAX_JOB_MODE=plan
 # Allow restart/stop of tracked Claude sessions from the dashboard.
 #AVM_ALLOW_ACTIONS=true

@@ -39,7 +39,7 @@ Configuration (env vars override the config file; file is KEY=VALUE lines):
 
 Local policy - only this file sets these; the hub can never override them:
     AVM_MAX_JOB_MODE    plan    highest permission mode a dashboard prompt may run with here:
-                                plan | acceptEdits | full (full = --dangerously-skip-permissions)
+                                plan | acceptEdits | auto | full (full = --dangerously-skip-permissions)
     AVM_ALLOW_ACTIONS   true    allow restart/stop of tracked Claude sessions from the dashboard
     AVM_ALLOW_ROOT_JOBS false   run Claude prompts/actions when this agent runs as root/SYSTEM (refused otherwise)
     AVM_JOB_TRANSCRIPT  full    what a prompt's transcript sends to the hub: full | summary (final answer and tool
@@ -1028,7 +1028,7 @@ class ClaudeRunner:
         self._cwd_scan: Dict[str, Tuple[int, set]] = {}   # transcript -> (bytes read, every cwd seen in them): I-02
         self._cwd_lock = threading.Lock()
 
-    MODE_RANK = {"plan": 0, "acceptEdits": 1, "full": 2}
+    MODE_RANK = {"plan": 0, "acceptEdits": 1, "auto": 2, "full": 3}   # auto: Claude Code's classifier-checked mode
 
     def policy(self) -> Dict[str, Any]:
         """This host's own limits on what the hub may ask (agent.conf only - never overridden by the hub)."""
