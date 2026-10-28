@@ -15,6 +15,13 @@ ROOTLESS=0
 
 echo "=== 1/3 hub"
 "$REPO_DIR/deploy/install-server.sh"
+# I-15: deploy-hub.sh keeps the deployed commit in the operator's state dir ($STATE/current; --status shows it, the next
+# deploy's rollback copy records it). This install replaced that code, so record HEAD (a clean tree) or "unknown".
+# As the operator, not root: it is their state dir and their checkout (git refuses a repo root does not own).
+if [[ -n "$TARGET_USER" && "$TARGET_USER" != "root" ]]; then
+  sudo -u "$TARGET_USER" -H bash "$REPO_DIR/deploy/deploy-hub.sh" --record-install \
+    || echo "    warning: could not record the installed commit - deploy-hub.sh --status may show the wrong one"
+fi
 
 if [[ $ROOTLESS -eq 1 ]]; then
   [[ -n "$TARGET_USER" && "$TARGET_USER" != "root" ]] || { echo "--rootless-agent needs sudo from your own account (SUDO_USER)"; exit 1; }
