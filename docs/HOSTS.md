@@ -283,9 +283,15 @@ On a shared host like AVALON, where only one project is covered, keep the log on
 AVM_TASK_LOG_OFF_DIRS=<project dir>
 ```
 
-Runs whose working directory is inside it send no output, command line or cwd, and pass `AVM_TASK_LOG=off` to their
-children so nested `avm` calls stay quiet too. `avm run --log` overrides this per run. Use it only for runs that print
-nothing covered.
+Runs whose working directory is inside it send no output, command line, cwd, `--note` text or queue reasons, and
+pass `AVM_TASK_LOG=off` to their children so nested `avm` calls stay quiet too. `avm run --log` overrides this per
+run. Use it only for runs that print nothing covered.
+
+The agent applies the list to Claude too, and fails closed. A session sends no snippets, no name and no `claude`
+process arguments when *any* directory its transcript recorded is inside the list (one started in `~` that later
+works there counts), and also when its directory can't be read at all. A dashboard prompt run there sends at most a
+summary transcript; one that moves there while it runs (a tool input naming a path in the list, or a cwd its
+transcript records) drops to summary from that event on. Events already sent before that point stay on the hub.
 
 Whatever does reach the hub lands in `monitor.db`, which AVALON's nightly backup keeps for months. See
 [SECURITY.md](SECURITY.md#hosts-with-data-use-agreements).

@@ -69,7 +69,8 @@ Resources and the wait queue (host-local; opt-in - plain `avm run` behaves exact
 
 Task logs and data-use agreements (local switches in agent.conf; the hub cannot set them):
     AVM_TASK_LOG=off              no output lines leave this host: avm run / watch / task send only name, status,
-                                  rc, timing and note (no log tail, and no command line or working directory either)
+                                  rc, timing and avm's own status note (no log tail, --note text, queue reasons,
+                                  command line or working directory)
     AVM_TASK_LOG_OFF_DIRS=/data/dua,/srv/cohort   the same for runs whose working directory is inside one of these
     Read from every agent.conf avm can open; "off" in any of them wins and the directory lists add up. Per run:
     `avm run --no-log` forces it off, `avm run --log` forces it on. A run with the log off passes AVM_TASK_LOG=off
@@ -242,9 +243,9 @@ class Hub:
 
 def _task_body(name: str, source: str, expect: Optional[float], command: Optional[str], pid: Optional[int],
                note: Optional[str], log_on: bool = True, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """The task as the hub sees it. With the task log off, the command line and working directory stay local too."""
+    """The task as the hub sees it. With the task log off, the command line, working directory and --note stay local too."""
     meta = dict(meta) if meta else {"hostname": socket.gethostname()}
-    if note:
+    if note and log_on:   # I-01: a note is free text about the work, like its output
         meta["note"] = note
     cwd: Optional[str] = None
     if log_on:
@@ -954,7 +955,7 @@ def _run_without_queue(args: argparse.Namespace, hub: Hub, command: Any, res: Di
     note = "queue disabled (%s): ran without admission control" % why[:300]
     args.queue_note = note   # appended to the finish note by _execute
     meta["queue"] = {"disabled": why[:300]}
-    meta["note"] = "%s; %s" % (args.note, note) if args.note else note
+    meta["note"] = "%s; %s" % (args.note, note) if args.note and getattr(args, "task_log", True) else note
     code = _code_identity(os.getcwd())
     if code:
         meta["code"] = code
@@ -973,13 +974,22 @@ def _run_without_queue(args: argparse.Namespace, hub: Hub, command: Any, res: Di
     return _execute(hub, args, command, tid, beat_every, env)
 
 
+def _queued(since: float, why: str, pos: Any, max_wait: Optional[float], log_on: bool) -> Dict[str, Any]:
+    """meta.queue of a waiting task. The reason names what it waits behind (other jobs): with the task log off it stays
+    here (I-01), like the note."""
+    q = {"since": since, "position": pos, "max_wait": max_wait}
+    if log_on:
+        q["reason"] = why
+    return q
+
+
 def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, res: Dict[str, Any], max_wait: Optional[float]) -> int:
     """avm run with resource tags and/or --wait: declare, queue until it fits, then run exactly like a plain avm run.
     A queue dir that can't be used safely never stops the command: it runs without admission control (F-07)."""
     beat_every = max(MIN_BEAT, float(args.beat))
     log_on = getattr(args, "task_log", True)
     meta: Dict[str, Any] = {"hostname": socket.gethostname(), "resources": res}
-    if args.note:
+    if args.note and log_on:   # I-01: with the task log off, --note and the queue's reasons stay here
         meta["note"] = args.note
     body = _task_body(args.name, "run", None, shown, None, None, log_on, meta)
     body["meta"] = meta   # the same dict: queue position and code identity are added to it below
@@ -1021,7 +1031,7 @@ def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, re
                 ok, why, pos = q.try_admit()
                 if not ok:
                     since = q.me["queued_at"] if q.me else time.time()
-                    meta["queue"] = {"since": since, "reason": why, "position": pos, "max_wait": max_wait}
+                    meta["queue"] = _queued(since, why, pos, max_wait, log_on)
                     tid = _try_start(hub, dict(body, status="queued", expect_beat=max(QUEUE_BEAT, beat_every) * 2))
                     sys.stderr.write("avm: '%s' queued (%s)%s\n" % (args.name, why, "; task #%d" % tid if tid is not None else ""))
 
@@ -1045,9 +1055,11 @@ def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, re
                                 break
                             waited = time.time() - since
                             if max_wait is not None and waited >= max_wait:
-                                note = "gave up after waiting %s (--max-wait): %s" % (_fmt_dur(waited), why)
+                                note = "gave up after waiting %s (--max-wait)" % _fmt_dur(waited)
                                 if tid is not None:
-                                    hub.try_call("/tasks/%d/finish" % tid, {"status": "failed", "rc": EXIT_GAVE_UP, "note": note})
+                                    hub.try_call("/tasks/%d/finish" % tid, {"status": "failed", "rc": EXIT_GAVE_UP,
+                                                                            "note": note + (": " + why if log_on else "")})
+                                note += ": " + why
                                 sys.stderr.write("avm: '%s' %s\n" % (args.name, note))
                                 return EXIT_GAVE_UP
                             if why != last_why:
@@ -1055,7 +1067,7 @@ def _run_queued(args: argparse.Namespace, hub: Hub, command: Any, shown: str, re
                                 last_why = why
                             if time.time() - last_beat >= QUEUE_BEAT:
                                 last_beat = time.time()
-                                meta["queue"] = {"since": since, "reason": why, "position": pos, "max_wait": max_wait}
+                                meta["queue"] = _queued(since, why, pos, max_wait, log_on)
                                 if tid is None:   # the hub was unreachable when we queued: try again
                                     tid = _try_start(hub, dict(body, status="queued", expect_beat=max(QUEUE_BEAT, beat_every) * 2))
                                 else:
@@ -1323,9 +1335,9 @@ def _read_rc(path: str, grace: Optional[float] = None) -> Tuple[Optional[int], s
 # -------------------------------------------------------------------- task
 def cmd_task(args: argparse.Namespace, hub: Hub) -> int:
     log_on = task_log_on(hub.cfg)
-    if not log_on and getattr(args, "log", None):
-        sys.stderr.write("avm: the task log is off here (AVM_TASK_LOG / AVM_TASK_LOG_OFF_DIRS): --log lines not sent\n")
-        args.log = None
+    if not log_on and (getattr(args, "log", None) or getattr(args, "note", None)):   # I-01: --note too
+        sys.stderr.write("avm: the task log is off here (AVM_TASK_LOG / AVM_TASK_LOG_OFF_DIRS): --log lines and --note not sent\n")
+        args.log = args.note = None
     if args.op == "start":
         tid = _start(hub, args.name, "task", args.expect, None, None, args.note, log_on)
         print(tid)

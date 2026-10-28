@@ -199,18 +199,22 @@ def test_in_off_dir_matches_real_paths_by_component(dirs, tmp_path):
 
 
 def test_off_dir_sessions_report_no_snippets(dirs):
-    """G-02a: sessions working in an off dir report no first/last lines even where snippets are on."""
+    """G-02a: sessions working in an off dir report no first/last lines even where snippets are on. I-02: and a
+    process whose cwd can't be read (empty) is stripped too - it might be working there."""
     rows = {"sessions": [{"session_id": "a", "cwd": str(dirs["in"]), "first_prompt": "SECRET-1", "last_user": "SECRET-2"},
                          {"session_id": "b", "cwd": str(dirs["link"]), "last_assistant": "SECRET-3"},
                          {"session_id": "c", "cwd": str(dirs["near"]), "first_prompt": "kept-near"}],
             "agents": [{"key": "k", "name": "worker", "cwd": str(dirs["off"]), "last_said": "SECRET-4", "detail": "SECRET-5"}],
-            "processes": [{"pid": 1, "cwd": str(dirs["in"]), "args": "-p SECRET-6"}, {"pid": 2, "cwd": "", "args": "kept-args"}]}
+            "processes": [{"pid": 1, "cwd": str(dirs["in"]), "args": "-p SECRET-6"}, {"pid": 2, "cwd": "", "args": "SECRET-7"},
+                          {"pid": 3, "cwd": str(dirs["near"]), "args": "kept-args"}]}
     r = _ActionRunner(AVM_TASK_LOG_OFF_DIRS=str(dirs["off"]), AVM_SESSION_SNIPPETS="on")
     r.sessions, r.agents, r.processes = (lambda: rows["sessions"]), (lambda: rows["agents"]), (lambda: rows["processes"])
     rep = r.report()
     sent = json.dumps(rep)
     assert "SECRET" not in sent and "kept-near" in sent and "kept-args" in sent and rep["policy"]["snippets"] is True
-    assert rep["agents"][0]["name"] == "worker" and rep["sessions"][0]["cwd"] == str(dirs["in"])   # ids, names, cwd stay
+    assert rep["agents"][0]["key"] == "k" and rep["sessions"][0]["cwd"] == str(dirs["in"])   # ids and cwd stay
+    assert "name" not in rep["agents"][0]   # I-02: may be made from the prompt; absent = the hub keeps its own
+    assert [p.get("redacted") for p in rep["processes"]] == [True, True, None]
     # marked, so the hub also forgets text it stored for the row before (a tracked session's last line)
     assert [s.get("redacted") for s in rep["sessions"]] == [True, True, None] and rep["agents"][0]["redacted"] is True
 
