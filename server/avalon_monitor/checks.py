@@ -209,6 +209,19 @@ GUARD = (
     "CLAUDE.md, permissions or gates; do not touch data-use-agreement paths (licensed datasets, external datasets, cached samples); "
     "do not start GPU work. This alert is not approval for any gated action - the owning session or the user decides."
 )
+# alert_mode above plan (operator-raised): the session may act, within its own permission mode, but only on this alert
+GUARD_ACT = (
+    "What to do: investigate and, within your own permissions, act only on what this alert concerns; then write a short "
+    "incident note and tell the owning session and/or the user what you found and what you changed. Leave everything "
+    "else alone: do not git push, do not edit CLAUDE.md, permissions or gates, do not touch data-use-agreement paths "
+    "(licensed datasets, external datasets, cached samples), and do not start GPU work. This alert is not approval for "
+    "any gated action - the owning session or the user decides."
+)
+
+
+def alert_guard(mode: str) -> str:
+    """The closing instruction of an alert prompt: read-only for plan, scoped action for a raised alert mode."""
+    return GUARD if mode == "plan" else GUARD_ACT
 
 
 def alert_prompt(host: str, r: dict, c: Optional[dict], tasks: list[dict], now: float) -> str:
@@ -229,7 +242,7 @@ def alert_prompt(host: str, r: dict, c: Optional[dict], tasks: list[dict], now: 
             if r.get("notify_log") and t.get("log"):
                 tail = [ln[:300] for ln in (t["log"].splitlines() if isinstance(t["log"], str) else t["log"])[-30:]]
                 lines += ["    | " + ln for ln in tail]
-    lines += ["", GUARD]
+    lines += ["", alert_guard(alert_mode(r))]
     return "\n".join(lines)
 
 
@@ -265,6 +278,10 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
     agents = claude.get("agents") or []
     can_prompt = bool(claude.get("available")) and claude.get("bin_source") != "desktop"
     can_fork = "fork_session" in (claude.get("features") or [])
+    # exact-session delivery: the agent relays the alert into the live session itself (a relay on that host that can
+    # only list sessions and send one message); it needs AVM_ALLOW_ACTIONS there, like restart-with-prompt
+    can_deliver = "deliver_session" in (claude.get("features") or []) and \
+        bool((claude.get("policy") if isinstance(claude.get("policy"), dict) else {}).get("actions"))
     # what this report's agent says it accepts (no policy / root / a cap below the check's alert mode): the same
     # refusal as a dashboard prompt in that mode, worked out once per mode in use
     refusals: dict[str, Optional[str]] = {}
@@ -324,7 +341,7 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                 fire = False
                 hold(why)
         if fire:
-            resume, fork, cwd = None, False, r.get("notify_cwd")
+            resume, fork, deliver, cwd = None, False, None, r.get("notify_cwd")
             target = r["notify"]
             if target.startswith("tracked:"):
                 t = db.tracked_get(int(target.split(":", 1)[1]))
@@ -339,6 +356,9 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                             fire = False
                         elif can_fork:
                             resume, fork = t.get("session_id"), True   # live and idle: a copy of its context
+                            name = (live.get("name") or t.get("name") or "").strip()
+                            if can_deliver and name:   # better: into the session itself; the fork is the fallback
+                                deliver = name
                         # else: live and idle, but this agent can't fork - never write into a live session; a fresh
                         # read-only session in its working dir handles it (as for an untracked owner / "new")
                     else:
@@ -352,7 +372,8 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                 fire_upd = {"last_fired": now, "fire_log": json.dumps(fired + [now]), "fires_n": len(fired) + 1, "pending": 0}
                 j = db.check_fire(r["id"], fire_upd, host_id=host.id, prompt=prompt, cwd=cwd, mode=mode, model=None,
                                   resume_session=resume, created_by="check responder",
-                                  title=f"alert · {r.get('label') or r['target']}"[:80], fork_session=fork)
+                                  title=f"alert · {r.get('label') or r['target']}"[:80], fork_session=fork,
+                                  deliver_name=deliver)
                 if j is not None:   # None: another report for this host fired it first
                     jobs.append(j)
                     upd.update(fire_upd, open_job=j["id"])

@@ -116,7 +116,7 @@ hub, the dashboard and a modified hub can't raise them:
 | Setting | Default | Effect |
 |---------|---------|--------|
 | `AVM_MAX_JOB_MODE` | `plan` | highest permission mode a dashboard prompt may use here: `plan`, `acceptEdits`, `auto` (Claude Code's auto mode) or `full`, in that order. A higher request is refused, not downgraded |
-| `AVM_ALLOW_ACTIONS` | `true` | allow restart/stop of tracked Claude sessions from the dashboard |
+| `AVM_ALLOW_ACTIONS` | `true` | allow restart/stop of tracked Claude sessions from the dashboard, and exact-session delivery of check alerts into a live session (off: alerts fork it instead) |
 | `AVM_ALLOW_ROOT_JOBS` | `false` | an agent running as root (Linux) or SYSTEM (Windows) refuses all prompts, responder alerts and actions unless this is on. A Windows agent installed as SYSTEM (e.g. LAPTOP-C) is in this state; use the rootless / `-AsCurrentUser` install for prompts |
 | `AVM_JOB_TRANSCRIPT` | `full` | what a prompt's transcript sends to the hub: `full`, `summary` (final answer and tool names only) or `off` (status and metadata only) |
 | `AVM_SESSION_SNIPPETS` | `auto` | first/last lines of every Claude session on the host and claude processes' arguments in each report: `on`, `off`, or `auto` (on only when `AVM_JOB_TRANSCRIPT=full`) |
@@ -136,7 +136,28 @@ host's own `AVM_MAX_JOB_MODE`: an alert whose mode the host's reported policy re
 root) is held, not queued, with the reason shown on the check - never sent in a lower mode - and the agent refuses
 it again on its side. This is acceptable because the alert text is fixed by the hub (the template, the check, the
 host's own detail and task lines, the read-only guard text): a check failing only chooses *when* that prompt goes
-out, never what it says, and the operator chose the session and mode beforehand.
+out, never what it says, and the operator chose the session and mode beforehand. A `plan` alert tells the session to
+investigate read-only; a raised one lets it act within its own permissions, but only on what the alert concerns.
+
+**Exact-session delivery.** When a responder's target is a live, idle tracked session and its host's agent advertises
+`deliver_session` and reports `AVM_ALLOW_ACTIONS` on, the alert goes into that session itself, not into a fork of it.
+Claude Code has no command that injects a prompt into a running background session, so the agent starts a short
+relay: `claude -p --permission-mode default --allowedTools ListAgents SendMessage --disallowedTools <file, shell and
+web tools> --model haiku --max-turns 4`, in its own scope, in the agent user's home. Its mode, model (Haiku) and tools are fixed in the agent,
+never taken from the hub (plan mode would refuse SendMessage), and its prompt is fixed too: the alert text sits
+inside a per-run marker block as data to forward verbatim; it must send only to the session whose name equals the
+tracked session's name exactly, and send nothing (`NOT_SENT: <why>`) if zero or several sessions have that name. The
+target receives it as a cross-session message (a new turn when idle) and handles it in its **own** permission mode;
+the check's alert mode does not apply to the relay, which can only list sessions and send that one message. The
+agent finishes the job "delivered to <name>" only on a final `SENT`; anything else, a non-zero exit or 120 s without
+an answer falls back to the old fork of the session (in the alert mode, under the same cap), and the job's result
+says why. Deliver jobs need `AVM_ALLOW_ACTIONS` (like restart-with-prompt: messaging a live session is an action on
+it) and jobs allowed (not root); an agent with actions off refuses them, and the hub doesn't queue them there.
+Agents without the feature fork as before; an offline target is still resumed. Prompt injection: the alert text
+includes host-observed paths and task names, so it is untrusted input to the relay. The worst case is that the
+relay sends the alert to a different session on the same host, which sees a peer message, not a user instruction;
+the relay itself can do nothing else, and only its one-line verdict (at most 160 characters) reaches the hub. Cost:
+one small Haiku turn (a few tool calls) per delivered alert, on the host's Claude account.
 
 ## Hosts with data-use agreements
 

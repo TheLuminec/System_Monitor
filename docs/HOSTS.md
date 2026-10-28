@@ -23,7 +23,19 @@ Ready-to-use `agent.conf` contents for the current fleet. Tokens come from
 > `"confirm_full": true`). It is still capped by the host's own `AVM_MAX_JOB_MODE`: a host that allows less holds
 > the alert (the reason shows on the check) instead of sending it in a lower mode, so raise both for it to fire.
 > `avm check add/set` can't raise it (403), and on a check an operator raised it can't change the target, the
-> responder or its working dir either (send `alert_mode=plan` to lower it first).
+> responder or its working dir either (send `alert_mode=plan` to lower it first). A `plan` alert says investigate
+> read-only; a raised one lets the session act within its own permissions, only on what the alert concerns.
+>
+> **Exact-session delivery.** An alert for a live, idle tracked session goes into that session itself (agents that
+> advertise `deliver_session`, with `AVM_ALLOW_ACTIONS` on): the agent runs a short relay,
+> `claude -p --permission-mode default --allowedTools ListAgents SendMessage` on Haiku (file, shell and web tools
+> denied, 4 turns, 120 s), that finds the session by its exact name and sends the alert as a cross-session message. The
+> session handles it in its own permission mode; the relay's mode, model and tools are fixed by the agent and the check's
+> alert mode doesn't apply to it. If the relay doesn't answer `SENT` (no or several sessions with that name, an
+> error, a timeout) the agent forks the session as before and the job's result says why. Each delivered alert costs
+> one small Haiku turn. A busy session still holds the alert until it is idle; an offline one is resumed; agents
+> without the feature, or with actions off, fork. Details and the prompt-injection limits are in
+> [SECURITY.md](SECURITY.md#agent-local-policy).
 
 > **Interpreter isolation.** Both installers create a venv **owned by the agent**
 > (`/opt/avalon-agent/venv` on Linux, `%ProgramData%\AvalonAgent\venv` on Windows)
