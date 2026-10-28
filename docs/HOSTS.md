@@ -16,6 +16,14 @@ Ready-to-use `agent.conf` contents for the current fleet. Tokens come from
 > `AVM_ALLOW_DOWNGRADE` and `AVM_STATE_DIR` are read only from the host's own
 > `agent.conf` (or the agent's environment); the hub can't set them ([SECURITY.md](SECURITY.md#agent-local-policy)). An agent running as root or
 > SYSTEM refuses dashboard prompts, responder alerts and session restart/stop unless `AVM_ALLOW_ROOT_JOBS=true`.
+>
+> **Alert mode.** A check's responder alert is a `plan` prompt unless an operator sets the check's *Alert mode*
+> (Checks panel, or `PATCH /api/v1/checklist/<id>` with `{"alert_mode": "auto"}`; modes rank `plan` < `acceptEdits` <
+> `auto` < `full`, and `full` also needs
+> `"confirm_full": true`). It is still capped by the host's own `AVM_MAX_JOB_MODE`: a host that allows less holds
+> the alert (the reason shows on the check) instead of sending it in a lower mode, so raise both for it to fire.
+> `avm check add/set` can't raise it (403), and on a check an operator raised it can't change the target, the
+> responder or its working dir either (send `alert_mode=plan` to lower it first).
 
 > **Interpreter isolation.** Both installers create a venv **owned by the agent**
 > (`/opt/avalon-agent/venv` on Linux, `%ProgramData%\AvalonAgent\venv` on Windows)

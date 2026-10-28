@@ -190,12 +190,19 @@ def public(r: dict, host: Optional[str] = None) -> dict:
     out = dict(r)
     out["kind"] = KIND_OF_KEY.get(r["key"], r["key"])
     out["kind_label"] = KINDS.get(out["kind"], ("", out["kind"]))[1]
+    out["alert_mode"] = alert_mode(r)
     if host:
         out["host"] = host
     return out
 
 
 # ---------------------------------------------------------------- responders
+def alert_mode(r: dict) -> str:
+    """Alert mode: the permission mode a check's responder prompt runs with. NULL (every row from before the column,
+    and every check avm adds) is plan; only an operator route stores anything else (routes_checks.py)."""
+    return r.get("alert_mode") or "plan"
+
+
 GUARD = (
     "What to do: investigate READ-ONLY and report. Write a short incident note and tell the owning session and/or the user "
     "what you found. Do NOT restart, retry, kill or re-queue jobs; do not git pull/push/commit; do not edit configs, "
@@ -245,9 +252,11 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
     A check missing from a report is "unknown" (e.g. the first report after an agent restart, before the hub's
     settings are applied again); that neither restarts its clock nor its alert: a check that was ok, goes unknown and
     comes back failing alerts like an ok -> failing one. An alert that can't go out yet (cooldown, cap, target
-    mid-turn, nothing to prompt, an agent whose policy refuses plan prompts) stays pending, with why in hold_reason,
-    and fires on a later report if the check is still failing."""
-    from .routes_ops import host_policy_refusal   # local import: routes_ops -> core -> db imports this module
+    mid-turn, nothing to prompt, an agent whose policy refuses the check's alert mode) stays pending, with why in
+    hold_reason, and fires on a later report if the check is still failing. Alert mode: each check's responder runs
+    in its own alert_mode (plan unless an operator raised it); a host whose reported cap is below that holds the alert
+    with the reason - it is never sent in a lower mode instead."""
+    from .routes_ops import JOB_MODES, host_policy_refusal   # local import: routes_ops -> core -> db imports this module
     rows = db.checks_list(host.id)
     if not rows:
         return [], []
@@ -256,8 +265,19 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
     agents = claude.get("agents") or []
     can_prompt = bool(claude.get("available")) and claude.get("bin_source") != "desktop"
     can_fork = "fork_session" in (claude.get("features") or [])
-    # what this report's agent says it accepts (no policy / root / below plan): the same refusal as a dashboard prompt
-    refused = host_policy_refusal(host, mode="plan", sample=sample)
+    # what this report's agent says it accepts (no policy / root / a cap below the check's alert mode): the same
+    # refusal as a dashboard prompt in that mode, worked out once per mode in use
+    refusals: dict[str, Optional[str]] = {}
+
+    def refused(mode: str) -> Optional[str]:
+        if mode not in refusals:
+            if mode not in JOB_MODES:   # never guess at a mode the agents don't know
+                refusals[mode] = f"alert mode {mode!r} is not one of {', '.join(JOB_MODES)} (set it again on the dashboard)"
+            else:
+                why = host_policy_refusal(host, mode=mode, sample=sample)
+                refusals[mode] = f"alert mode {mode}: {why}" if why and mode != "plan" else why
+        return refusals[mode]
+
     changed, jobs = [], []
     tasks_cache: Optional[list] = None
 
@@ -296,10 +316,11 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
         if fire:
             cooldown = max(MIN_COOLDOWN_MIN, float(r.get("cooldown_min") or 30)) * 60
             cap = int(r.get("daily_cap") or 6)
-            why = (refused or (None if can_prompt else "no Claude Code CLI to prompt on this host")
+            mode = alert_mode(r)
+            why = (refused(mode) or (None if can_prompt else "no Claude Code CLI to prompt on this host")
                    or (f"daily cap reached ({cap} alerts in 24 h)" if len(fired) >= cap else None)
                    or (f"cooling down ({cooldown / 60:g} min between alerts)" if r.get("last_fired") and now - r["last_fired"] < cooldown else None))
-            if why:   # the host's agent won't take a plan prompt, nothing to prompt, cap (rolling 24 h) or cooldown
+            if why:   # the host's agent won't take a prompt in this mode, nothing to prompt, cap (rolling 24 h) or cooldown
                 fire = False
                 hold(why)
         if fire:
@@ -329,7 +350,7 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                                    (t["status"] == "failed" and now - (t.get("ended") or t["updated"]) < 6 * 3600)]
                 prompt = alert_prompt(host.name, {**r, **upd}, c, tasks_cache, now)
                 fire_upd = {"last_fired": now, "fire_log": json.dumps(fired + [now]), "fires_n": len(fired) + 1, "pending": 0}
-                j = db.check_fire(r["id"], fire_upd, host_id=host.id, prompt=prompt, cwd=cwd, mode="plan", model=None,
+                j = db.check_fire(r["id"], fire_upd, host_id=host.id, prompt=prompt, cwd=cwd, mode=mode, model=None,
                                   resume_session=resume, created_by="check responder",
                                   title=f"alert · {r.get('label') or r['target']}"[:80], fork_session=fork)
                 if j is not None:   # None: another report for this host fired it first

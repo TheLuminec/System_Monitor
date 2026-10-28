@@ -2,7 +2,7 @@
 import { TimeChart, drawSparkline } from "./charts.js?v=1.13.2";
 import { $, h, esc, cssVar, fmt, ICON, levelFor, osLabel, state, api, post, toast, on, emit, RANGE_ORDER, RANGE_SEC,
          loadPrefs, savePrefs, hostLayout, setHostLayout, makeSortable, navigate, commitWarnPct, backupHealth, diskFree,
-         canChange, roTip, guard } from "./core.js?v=1.13.2";
+         canChange, roTip, guard, MODE_RANK } from "./core.js?v=1.13.2";
 import { renderResearch } from "./research.js?v=1.13.2";
 import { renderTasks, renderAgents, renderAlerts, computeAlerts, loadTasks, loadJobs, loadTracked, taskAlerting, ackTasks } from "./views.js?v=1.13.2";
 
@@ -370,9 +370,17 @@ function checkForm(cl, c, submit, cancel) {
   const withLog = h("input", { type: "checkbox" }); withLog.checked = !!c?.notify_log;
   const cooldown = h("input", { type: "number", min: "5", value: c?.cooldown_min ?? 30, title: "minutes between alerts", style: "width:70px" });
   const cap = h("input", { type: "number", min: "1", max: "48", value: c?.daily_cap ?? 6, title: "alerts per rolling 24 h at most", style: "width:60px" });
+  // Alert mode: the responder prompt's permission mode (plan by default); the host's AVM_MAX_JOB_MODE still caps it
+  const alertMode = guard(h("select", { title: "permission mode of the alert prompt; held, not lowered, if the host's agent allows less" },
+    ...Object.keys(MODE_RANK).map((m) => h("option", { value: m }, m))));
+  alertMode.value = c?.alert_mode || "plan";
   const go = async () => {
     const body = { target: target.value.trim(), label: label.value.trim(), notify: resp.value, notify_cwd: cwd.value.trim(), notify_log: withLog.checked,
-      cooldown_min: Number(cooldown.value) || 30, daily_cap: Number(cap.value) || 6 };
+      cooldown_min: Number(cooldown.value) || 30, daily_cap: Number(cap.value) || 6, alert_mode: alertMode.value };
+    if (alertMode.value === "full" && c?.alert_mode !== "full") {
+      if (!confirm("Alerts from this check will run with FULL ACCESS (no permission prompts) when the host allows it. Continue?")) return;
+    }
+    if (alertMode.value === "full") body.confirm_full = true;
     if (ttl.value) body.ttl_sec = Number(ttl.value); else if (c?.expires) body.ttl_sec = 0;
     if (!c) body.kind = kind.value;
     if (!body.target) { target.focus(); return; }
@@ -383,7 +391,8 @@ function checkForm(cl, c, submit, cancel) {
     h("div", { class: "row1" }, kind, target, label),
     h("div", { class: "row2" }, h("label", {}, "expires ", ttl), h("label", {}, "responder ", resp), cwd,
       h("label", { title: "add related avm task log tails to the alert prompt (leave off for data-use-agreement data)" }, withLog, " with log tails"),
-      h("label", {}, "cooldown ", cooldown, " min"), h("label", { title: "alerts per rolling 24 h at most" }, "cap ", cap, " per 24 h"), h("span", { class: "spacer" }),
+      h("label", {}, "cooldown ", cooldown, " min"), h("label", { title: "alerts per rolling 24 h at most" }, "cap ", cap, " per 24 h"),
+      h("label", {}, "Alert mode ", alertMode), h("span", { class: "spacer" }),
       cancel ? h("button", { class: "btn small", onclick: cancel }, "Cancel") : null,
       guard(h("button", { class: "btn small primary", onclick: go }, c ? "Save" : "Add check"))));
 }
@@ -416,7 +425,7 @@ async function renderChecksPanel(name, force = false) {
       h("td", {}, h("span", { class: "chip " + cls }, st)),
       h("td", {}, h("div", {}, h("b", {}, c.kind_label), " ", h("code", { title: c.target }, c.kind === "memory" ? `${c.target} GB` : c.target)), c.label ? h("div", { class: "muted small" }, c.label) : null),
       h("td", {}, h("div", { class: "muted" }, (r?.detail ?? c.detail ?? "") || "—"), c.since ? h("div", { class: "small muted" }, `${st} for ${fmt.dur(now - c.since)}`) : null),
-      h("td", {}, h("div", {}, respName), c.notify ? h("div", { class: "small muted" }, `cooldown ${c.cooldown_min} min · ≤${c.daily_cap} per 24 h${c.notify_log ? " · with logs" : ""}`) : null, alert),
+      h("td", {}, h("div", {}, respName), c.notify ? h("div", { class: "small muted" }, `cooldown ${c.cooldown_min} min · ≤${c.daily_cap} per 24 h${c.notify_log ? " · with logs" : ""}${c.alert_mode && c.alert_mode !== "plan" ? ` · ${c.alert_mode} mode` : ""}`) : null, alert),
       h("td", { class: "small muted" }, c.expires ? `expires in ${fmt.dur(c.expires - now)}` : "", h("div", {}, c.created_by ? `added by ${c.created_by}` : "")),
       h("td", { class: "r nowrap" },
         guard(h("button", { class: "btn small", onclick: () => { const open = editTr.style.display === "none"; editTr.style.display = open ? "" : "none"; editTr.dataset.open = open ? "1" : ""; } }, "Edit")),
@@ -452,7 +461,7 @@ async function renderChecksPanel(name, force = false) {
       ? h("div", { class: "table-wrap" }, h("table", { class: "checks-table" }, h("thead", {}, h("tr", {}, h("th", {}, "State"), h("th", {}, "Check"), h("th", {}, "Result"), h("th", {}, "Responder"), h("th", {}, "Expiry"), h("th", {}))), tbody))
       : h("div", { class: "muted", style: "padding:8px 0" }, "No checks on this host yet."),
     h("p", { class: "muted small check-help" }, "Agents can manage these themselves: ", h("code", {}, "avm check add file ~/run/heartbeat:600 --label \"R4 chain\" --notify self --ttl 12h"),
-      ". A responder is prompted read-only when its check goes from ok to failing (cooldown, a cap per rolling 24 h, one open alert until the check recovers); it investigates and reports, never acts."),
+      ". A responder is prompted (plan mode, read-only, unless its alert mode is raised) when its check goes from ok to failing (cooldown, a cap per rolling 24 h, one open alert until the check recovers); it investigates and reports, never acts."),
     h("details", { class: "check-settings-wrap", open: settingsOpen ? "" : null }, h("summary", {}, "Host settings"), settings),
   ].filter(Boolean));
 }

@@ -103,6 +103,7 @@ const pol = (p) => Object.fromEntries(modes.map((m) => [m, modeAllowed(m, p)]));
 out.unknown = pol(null);
 out.plan = pol({ max_mode: "plan", actions: true, jobs: true, transcript: "full" });
 out.edits = pol({ max_mode: "acceptEdits", actions: true, jobs: true });
+out.auto = pol({ max_mode: "auto", actions: true, jobs: true });
 out.full = pol({ max_mode: "full", actions: true, jobs: true });
 out.bogus = pol({ max_mode: "everything", jobs: true });
 out.root = pol({ max_mode: "full", actions: true, jobs: false });
@@ -119,12 +120,13 @@ def test_dashboard_permission_logic_js():
     assert r["noConfig"] and r["access"] and not r["ro"] and r["oldHub"]
     assert r["tip"] == "read-only here: changes need your Cloudflare Access login - open https://monitor.example.test"
     assert r["tipNoUrl"] == "read-only here: changes need your Cloudflare Access login"
-    assert r["unknown"] == {"plan": False, "acceptEdits": False, "full": False}   # older agents: refused by the hub (F-06)
-    assert r["plan"] == {"plan": True, "acceptEdits": False, "full": False}
-    assert r["edits"] == {"plan": True, "acceptEdits": True, "full": False}
-    assert r["full"] == {"plan": True, "acceptEdits": True, "full": True}
+    assert r["unknown"] == {"plan": False, "acceptEdits": False, "auto": False, "full": False}   # older agents: refused by the hub (F-06)
+    assert r["plan"] == {"plan": True, "acceptEdits": False, "auto": False, "full": False}
+    assert r["edits"] == {"plan": True, "acceptEdits": True, "auto": False, "full": False}
+    assert r["auto"] == {"plan": True, "acceptEdits": True, "auto": True, "full": False}   # auto: between acceptEdits and full
+    assert r["full"] == {"plan": True, "acceptEdits": True, "auto": True, "full": True}
     assert r["bogus"] == r["plan"]   # the agent itself treats an unknown cap as plan
-    assert r["root"] == {"plan": False, "acceptEdits": False, "full": False}
+    assert r["root"] == {"plan": False, "acceptEdits": False, "auto": False, "full": False}
     assert r["act"] == [False, True, False, False]   # no policy (older agent): no restart/stop offered
 
 
