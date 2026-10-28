@@ -143,11 +143,28 @@ export const state = {
   customizing: false,
 };
 
+// An error response's `detail` as text: a string as is; FastAPI's validation list (422) as "field: message; ...";
+// an object by its msg/message, else as JSON (it was shown as "[object Object]").
+export function errorText(detail) {
+  if (detail == null || detail === "") return "";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail.map(d => {
+      if (!d || typeof d !== "object") return String(d);
+      const loc = Array.isArray(d.loc) ? d.loc.filter(p => p !== "body" && p !== "query" && p !== "path").join(".") : "";
+      const msg = d.msg || d.message || JSON.stringify(d);
+      return loc ? `${loc}: ${msg}` : msg;
+    }).join("; ");
+  }
+  if (typeof detail === "object") return detail.msg || detail.message || JSON.stringify(detail);
+  return String(detail);
+}
+
 export async function api(path, opts) {
   const r = await fetch(path, opts);
   if (!r.ok) {
     let msg = r.statusText;
-    try { msg = (await r.json()).detail || msg; } catch (_) { /* ignore */ }
+    try { msg = errorText((await r.json()).detail) || msg; } catch (_) { /* ignore */ }
     throw new Error(`${r.status} ${msg}`);
   }
   return r.json();

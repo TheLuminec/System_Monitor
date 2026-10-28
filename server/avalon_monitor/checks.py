@@ -247,6 +247,7 @@ def alert_prompt(host: str, r: dict, c: Optional[dict], tasks: list[dict], now: 
 
 
 CAP_WINDOW_SEC = 86400.0   # daily_cap counts alerts in this rolling window
+NEW_CHECK_GRACE_SEC = 120.0   # a new check failing from the start alerts once it is still failing this long after creation
 
 
 def _recent_fires(r: dict, now: float) -> list[float]:
@@ -328,7 +329,11 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
             if r.get("hold_reason") != why:
                 upd["hold_reason"] = why
 
-        fire = state == "failing" and r.get("notify") and not r.get("open_job") and (known == "ok" or r.get("pending"))
+        # a check that has never been ok and never alerted (added while its target was already failing) has no ok -> failing
+        # edge to wait for: it alerts once it is still failing NEW_CHECK_GRACE_SEC after creation (time for something
+        # being started to come up), then follows the usual rule
+        never_ok = not r.get("last_ok") and not r.get("last_fired") and now - float(r.get("created") or now) >= NEW_CHECK_GRACE_SEC
+        fire = state == "failing" and r.get("notify") and not r.get("open_job") and (known == "ok" or r.get("pending") or never_ok)
         fired = _recent_fires(r, now) if fire else []
         if fire:
             cooldown = max(MIN_COOLDOWN_MIN, float(r.get("cooldown_min") or 30)) * 60

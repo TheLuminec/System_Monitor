@@ -17,6 +17,10 @@ Ready-to-use `agent.conf` contents for the current fleet. Tokens come from
 > `agent.conf` (or the agent's environment); the hub can't set them ([SECURITY.md](SECURITY.md#agent-local-policy)). An agent running as root or
 > SYSTEM refuses dashboard prompts, responder alerts and session restart/stop unless `AVM_ALLOW_ROOT_JOBS=true`.
 >
+> **When an alert fires.** On an ok → failing change, once (then cooldown, daily cap, one open alert until it
+> recovers). A check that is failing from the moment it's added has no such change: it alerts once it is still
+> failing 2 minutes after creation (time for something being started to come up), then follows the same rule.
+>
 > **Alert mode.** A check's responder alert is a `plan` prompt unless an operator sets the check's *Alert mode*
 > (Checks panel, or `PATCH /api/v1/checklist/<id>` with `{"alert_mode": "auto"}`; modes rank `plan` < `acceptEdits` <
 > `auto` < `full`, and `full` also needs
