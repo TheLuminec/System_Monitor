@@ -1,6 +1,6 @@
 // Tasks, Agents (Claude Code sessions + prompt console) and Alerts views.
 import { $, h, esc, fmt, ICON, state, api, post, toast, on, navigate, commitWarnPct, backupHealth,
-         canChange, roTip, guard, modeAllowed, actionsAllowed } from "./core.js?v=1.13.2";
+         canChange, roTip, guard, modeAllowed, actionsAllowed } from "./core.js?v=1.14.0";
 
 // =================================================================== tasks
 export async function loadTasks(force = false) {
