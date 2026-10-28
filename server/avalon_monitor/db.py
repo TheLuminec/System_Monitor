@@ -977,8 +977,13 @@ class Database:
             self._conn.execute("UPDATE claude_tracked SET key=?, kind='background' WHERE host_id=? AND key=?", (new_key, host_id, old_key))
             return _row(self._conn.execute("SELECT * FROM claude_tracked WHERE host_id=? AND key=?", (host_id, new_key)).fetchone())
 
-    def tracked_sync(self, host_id: int, agents: list, now: float | None = None) -> list[dict]:
-        """Refresh tracked rows from an agent report's `claude.agents`; returns the rows that changed."""
+    TRACK_TEXT = ("detail", "last_said")   # conversation text a tracked row keeps between reports
+
+    def tracked_sync(self, host_id: int, agents: list, now: float | None = None, scrub: bool = False) -> list[dict]:
+        """Refresh tracked rows from an agent report's `claude.agents`; returns the rows that changed.
+        scrub (a data-use host, datause.restricted) or a row the agent marks "redacted" (its snippets stay on the host:
+        AVM_SESSION_SNIPPETS off, or it works in an AVM_TASK_LOG_OFF_DIRS dir): the row's stored text is cleared, not
+        kept - otherwise what was stored before the restriction stays on show for good."""
         now = now or time.time()
         with self._lock:
             rows = [dict(r) for r in self._conn.execute("SELECT * FROM claude_tracked WHERE host_id=?", (host_id,)).fetchall()]
@@ -989,11 +994,14 @@ class Database:
             changed = []
             for r in rows:
                 a = by_key.get(r["key"]) or (by_sid.get(r["session_id"]) if r["session_id"] else None)
+                forget = scrub or bool(a and a.get("redacted"))
                 if a is None:
                     upd = {"live": 0} if r["live"] else {}   # no longer reported at all: certainly not running
                 else:
                     upd = {}
                     for k in self.TRACK_SYNC:
+                        if forget and k in self.TRACK_TEXT:
+                            continue   # cleared below
                         v = a.get(k)
                         if k in ("live", "remote_control"):
                             if k == "remote_control" and v is None:
@@ -1007,6 +1015,8 @@ class Database:
                             upd[k] = v
                     if a.get("live") and (not r["last_live"] or now - r["last_live"] > 60):
                         upd["last_live"] = now   # throttled: a heartbeat, not a change worth broadcasting
+                if forget:
+                    upd.update({k: None for k in self.TRACK_TEXT if r[k] is not None})
                 if upd:
                     self._conn.execute(f"UPDATE claude_tracked SET {', '.join(f'{k}=?' for k in upd)} WHERE id=?", [*upd.values(), r["id"]])
                     if set(upd) - {"last_live", "last_activity"}:

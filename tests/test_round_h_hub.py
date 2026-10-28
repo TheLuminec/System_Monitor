@@ -304,3 +304,42 @@ def test_adopt_keeps_the_hubs_declared_lists(db):
     cfg = db.host_by_id(h.id).check_config
     assert cfg[UNITS] == "user:train.service" and cfg[MOUNT] == "/mnt/data" and cfg[MEM] == "8"
     assert cfg[ck.MANAGED] == "1" and cfg["AVM_TAGS"] == "gpu"
+
+
+# ------------------------------------------------------------------ G-02 / F-04 follow-up: stored tracked-session text
+def _tracked(row, key="bg1"):
+    return core.db.tracked_find(row.id, key)
+
+
+def test_tracked_text_kept_on_a_normal_host(agent, host):
+    """Control: on an unrestricted host a tracked session's last line is stored, and kept while a report lacks it
+    (a session with no transcript yet), as before."""
+    row = host[0]
+    core.db.tracked_add(row.id, "bg1", {"session_id": "s1", "name": "w"}, "test")
+    report_policy(agent, policy=FULL, agents=[{"key": "bg1", "session_id": "s1", "live": True, "last_said": "hello", "detail": "busy"}])
+    report_policy(agent, policy=FULL, agents=[{"key": "bg1", "session_id": "s1", "live": True}])
+    assert (_tracked(row)["last_said"], _tracked(row)["detail"]) == ("hello", "busy")
+
+
+def test_redacted_row_clears_text_stored_before(agent, host):
+    """A row the agent marks redacted (its session works in an AVM_TASK_LOG_OFF_DIRS dir, or snippets are off) clears
+    the text the hub stored for it earlier - an absent key alone would keep it on show for good."""
+    row = host[0]
+    core.db.tracked_add(row.id, "bg1", {"session_id": "s1", "name": "w"}, "test")
+    report_policy(agent, policy=FULL, agents=[{"key": "bg1", "session_id": "s1", "live": True, "last_said": "SECRET", "detail": "SECRET"}])
+    report_policy(agent, policy=FULL, agents=[{"key": "bg1", "session_id": "s1", "live": True, "redacted": True}])
+    t = _tracked(row)
+    assert t["last_said"] is None and t["detail"] is None and t["name"] == "w"
+    assert _flag(row) in (None, "")   # a per-session redaction does not restrict the host
+
+
+def test_data_use_host_clears_all_stored_tracked_text(agent, host):
+    """A restricted host: every tracked row's stored text is cleared on its next report, whatever the row says."""
+    row = host[0]
+    core.db.tracked_add(row.id, "bg1", {"session_id": "s1", "name": "w"}, "test")
+    core.db.tracked_add(row.id, "bg2", {"session_id": "s2", "name": "gone"}, "test")
+    report_policy(agent, policy=FULL, agents=[{"key": "bg1", "session_id": "s1", "live": True, "last_said": "SECRET-1"},
+                                              {"key": "bg2", "session_id": "s2", "live": True, "detail": "SECRET-2"}])
+    report_policy(agent, policy=SUMMARY, agents=[{"key": "bg1", "session_id": "s1", "live": True}])   # bg2 not listed
+    assert "SECRET" not in json.dumps([_tracked(row, "bg1"), _tracked(row, "bg2")])
+    assert "SECRET" not in json.dumps(agent.get("/api/v1/claude/tracked").json())

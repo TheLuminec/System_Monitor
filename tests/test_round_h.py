@@ -211,6 +211,16 @@ def test_off_dir_sessions_report_no_snippets(dirs):
     sent = json.dumps(rep)
     assert "SECRET" not in sent and "kept-near" in sent and "kept-args" in sent and rep["policy"]["snippets"] is True
     assert rep["agents"][0]["name"] == "worker" and rep["sessions"][0]["cwd"] == str(dirs["in"])   # ids, names, cwd stay
+    # marked, so the hub also forgets text it stored for the row before (a tracked session's last line)
+    assert [s.get("redacted") for s in rep["sessions"]] == [True, True, None] and rep["agents"][0]["redacted"] is True
+
+
+def test_snippets_off_marks_every_row_redacted():
+    """AVM_SESSION_SNIPPETS=off: every row is stripped and marked, so the hub clears what it stored earlier."""
+    r = _ActionRunner(AVM_SESSION_SNIPPETS="off")
+    r.sessions, r.agents, r.processes = (lambda: [{"session_id": "a", "last_user": "SECRET"}]), (lambda: [{"key": "k", "detail": "SECRET"}]), (lambda: [])
+    rep = r.report()
+    assert "SECRET" not in json.dumps(rep) and rep["sessions"][0]["redacted"] is True and rep["agents"][0]["redacted"] is True
 
 
 class _P:

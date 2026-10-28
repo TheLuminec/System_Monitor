@@ -93,7 +93,7 @@ except ImportError:  # pragma: no cover
     sys.stderr.write("psutil is required: pip install psutil\n")
     sys.exit(2)
 
-AGENT_VERSION = "1.10.0"
+AGENT_VERSION = "1.10.1"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_MAC = sys.platform == "darwin"
@@ -1373,12 +1373,13 @@ class ClaudeRunner:
             queued = [q["id"] for q in self.queue]
         sessions, processes, agents = _safe(self.sessions, default=[]), _safe(self.processes, default=[]), _safe(self.agents, default=[])
         policy = self.policy()
+        # "redacted": the hub must also forget text it stored for the row earlier (a tracked session's last line), which
+        # a merely absent key can't say - the keys are also absent when a session simply has no transcript yet
+        strip = lambda d: dict({k: v for k, v in d.items() if k not in self.SNIPPET_KEYS}, redacted=True)
         if not policy["snippets"]:   # conversation text of every session on this host stays here: ids, names, state, times only
-            sessions, processes, agents = ([{k: v for k, v in d.items() if k not in self.SNIPPET_KEYS} for d in rows]
-                                           for rows in (sessions, processes, agents))
+            sessions, processes, agents = ([strip(d) for d in rows] for rows in (sessions, processes, agents))
         elif _csv(self.cfg.get("AVM_TASK_LOG_OFF_DIRS", "")):   # G-02: the same, per session, for work in an off dir
-            sessions, processes, agents = ([{k: v for k, v in d.items() if k not in self.SNIPPET_KEYS}
-                                            if in_off_dir(self.cfg, d.get("cwd")) else d for d in rows]
+            sessions, processes, agents = ([strip(d) if in_off_dir(self.cfg, d.get("cwd")) else d for d in rows]
                                            for rows in (sessions, processes, agents))
         return {"available": bool(self.bin), "bin": self.bin, "version": self.check_version(), "user": _whoami(), "home": self.home,
                 "sessions": sessions, "processes": processes,

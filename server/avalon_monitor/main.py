@@ -375,7 +375,8 @@ async def ingest(request: Request):
                           "file_sigs2": {n: agent_bundle.signature(n, ".sig2") for n in agent_bundle.COMPANIONS}}
     claude = sample.claude if isinstance(sample.claude, dict) else {}
     if isinstance(claude.get("agents"), list):   # agent 1.5+: refresh tracked sessions, tell the agent which ones they are
-        for row in await run_in_threadpool(db.tracked_sync, host.id, claude["agents"], now):
+        scrub = datause.restricted(host, {"claude": claude})   # data-use host: stored session text is cleared too
+        for row in await run_in_threadpool(db.tracked_sync, host.id, claude["agents"], now, scrub):
             await hub.broadcast({"type": "claude_tracked", "row": tracked_public(row)})
         tracked = await run_in_threadpool(db.tracked_list, host.id)
         reply["claude_tracked"] = [{"key": t["key"], "session_id": t["session_id"], "kind": t["kind"]} for t in tracked]
