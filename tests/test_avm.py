@@ -297,8 +297,8 @@ def test_log_off_task_cli(env, capsys):
     assert env.run("task", "done", str(tid), "--log", "secret done", "--note", "fine") == 0
     assert env.sent_lines() == []
     t = env.task(tid)
-    assert not t["log"] and t["status"] == "done" and t["note"] == "fine" and t["cwd"] is None
-    assert "--log lines not sent" in capsys.readouterr().err
+    assert not t["log"] and t["status"] == "done" and not t["note"] and t["cwd"] is None   # I-01: no --note either
+    assert "--log lines and --note not sent" in capsys.readouterr().err
 
 
 def test_log_off_watch_sends_no_cwd(env, monkeypatch):

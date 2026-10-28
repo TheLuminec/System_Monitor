@@ -52,8 +52,9 @@ Local policy - only this file sets these; the hub can never override them:
     AVM_ALLOW_DOWNGRADE false   install a signed release whose version is LOWER than the one installed (a deliberate
                                 rollback); off, the hub cannot replay an older signed release onto this host
     AVM_TASK_LOG_OFF_DIRS (none) directories (comma list) whose work stays here: avm task logs from them are off, Claude
-                                sessions whose cwd is inside one report no snippets (see AVM_SESSION_SNIPPETS), and a
-                                dashboard prompt run inside one sends at most a summary transcript (AVM_JOB_TRANSCRIPT)
+                                sessions that worked inside one (any cwd their transcript recorded) or whose cwd is
+                                unknown report no snippets or name (see AVM_SESSION_SNIPPETS), and a dashboard prompt
+                                sends at most a summary transcript once it works inside one (AVM_JOB_TRANSCRIPT)
     AVM_STATE_DIR       directory for state kept across restarts (default: beside the config file)
 
 The hub may override the AVM_WATCH_* / AVM_PROCESSES / AVM_TAGS / AVM_MEM_AVAILABLE_WARN_GB
@@ -1005,6 +1006,7 @@ class ClaudeRunner:
     MAX_EVENTS_PER_POST = 200
     AGENTS_REFRESH_SEC = 30
     AGENTS_MAX = 40
+    OFF_LOOK_SEC = 2.0   # how often a running prompt's transcript is checked for a cwd in an off dir (I-02)
     FEATURES = ["agent_actions", "fork_session"]   # fork_session: may run a prompt on a copy of a live session   # tells the hub it may queue restart/stop jobs here (older agents would run them as prompts)
 
     def __init__(self, cfg: Dict[str, str]):
@@ -1023,6 +1025,8 @@ class ClaudeRunner:
         self._agents: List[Dict[str, Any]] = []
         self._agents_at = -1e9
         self._agents_busy = False
+        self._cwd_scan: Dict[str, Tuple[int, set]] = {}   # transcript -> (bytes read, every cwd seen in them): I-02
+        self._cwd_lock = threading.Lock()
 
     MODE_RANK = {"plan": 0, "acceptEdits": 1, "full": 2}
 
@@ -1143,8 +1147,11 @@ class ClaudeRunner:
             return []
         files.sort(reverse=True)
         out = []
+        offs = bool(_csv(self.cfg.get("AVM_TASK_LOG_OFF_DIRS", "")))
         for mtime, fp, slug, sid in files[:limit]:
             info = self._session_summary(fp)
+            if offs:
+                info["_cwds"] = self._seen_cwds(fp)
             info.update({"session_id": sid, "project": slug, "last_activity": mtime, "active": now - mtime < 120,
                          "dashboard_job": sid in self.job_sessions})
             out.append(info)
@@ -1206,6 +1213,39 @@ class ClaudeRunner:
                 break
         return {"cwd": cwd, "first_prompt": first_prompt, "last_user": last_user, "last_assistant": last_assistant,
                 "first_ts": first_ts, "last_ts": last_ts, "claude_version": version, "git_branch": branch}
+
+    _CWD_RE = re.compile(rb'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+    def _seen_cwds(self, fp: str) -> set:
+        """Every directory a transcript has recorded as its cwd so far (I-02): a session started in ~ may work in an off
+        dir later, or only for a while in the middle. The whole file is read once, then only what was appended since."""
+        try:
+            size = os.path.getsize(fp)
+        except OSError:
+            return set()
+        with self._cwd_lock:
+            start, seen = self._cwd_scan.get(fp, (0, set()))
+            if size < start:   # rewritten: read it again
+                start, seen = 0, set()
+            done, rest = 0, b""
+            try:
+                with open(fp, "rb") as f:
+                    f.seek(start)
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        buf = rest + chunk
+                        cut = buf.rfind(b"\n") + 1   # whole lines only: one still being written is read next time
+                        for m in self._CWD_RE.finditer(buf, 0, cut):
+                            try:
+                                seen.add(json.loads(b'"' + m.group(1) + b'"'))
+                            except ValueError:
+                                seen.add(m.group(1).decode("utf-8", "replace"))
+                        done, rest = done + cut, buf[cut:]
+            except OSError:
+                pass
+            if len(self._cwd_scan) > 200:
+                self._cwd_scan = {k: v for k, v in self._cwd_scan.items() if os.path.exists(k)}
+            self._cwd_scan[fp] = (start + done, seen)
+            return set(seen)
 
     _scope_prefix: Optional[List[str]] = None
 
@@ -1337,6 +1377,8 @@ class ClaudeRunner:
                 a["last_said"] = summ.get("last_assistant") or ""
                 a["cwd"] = a.get("cwd") or summ.get("cwd") or ""
                 a["first_prompt"] = summ.get("first_prompt") or ""
+                if _csv(self.cfg.get("AVM_TASK_LOG_OFF_DIRS", "")):
+                    a["_cwds"] = self._seen_cwds(fp)
             shaped.append(a)
         return shaped
 
@@ -1366,6 +1408,13 @@ class ClaudeRunner:
 
     SNIPPET_KEYS = ("first_prompt", "last_user", "last_assistant", "last_said", "detail", "args")
 
+    def _off_row(self, d: Dict[str, Any]) -> bool:
+        """With AVM_TASK_LOG_OFF_DIRS set, does this row's text stay here? Fails closed (I-02): yes when ANY directory
+        its transcript recorded is inside an off dir, and when its directory is unknown (a process whose cwd can't be
+        read, a transcript without one)."""
+        cwds = [d.get("cwd") or ""] + sorted(d.get("_cwds") or ())
+        return not cwds[0] or any(in_off_dir(self.cfg, c) for c in cwds)
+
     def report(self) -> Dict[str, Any]:
         with self.lock:
             cur = self.current
@@ -1375,12 +1424,20 @@ class ClaudeRunner:
         policy = self.policy()
         # "redacted": the hub must also forget text it stored for the row earlier (a tracked session's last line), which
         # a merely absent key can't say - the keys are also absent when a session simply has no transcript yet
-        strip = lambda d: dict({k: v for k, v in d.items() if k not in self.SNIPPET_KEYS}, redacted=True)
+        public = lambda d: {k: v for k, v in d.items() if k != "_cwds"}   # never sent (copies: agents is a cache)
+        strip = lambda d: dict({k: v for k, v in public(d).items() if k not in self.SNIPPET_KEYS}, redacted=True)
         if not policy["snippets"]:   # conversation text of every session on this host stays here: ids, names, state, times only
             sessions, processes, agents = ([strip(d) for d in rows] for rows in (sessions, processes, agents))
         elif _csv(self.cfg.get("AVM_TASK_LOG_OFF_DIRS", "")):   # G-02: the same, per session, for work in an off dir
-            sessions, processes, agents = ([strip(d) if in_off_dir(self.cfg, d.get("cwd")) else d for d in rows]
-                                           for rows in (sessions, processes, agents))
+            # I-02: and its name, which Claude Code may have made from the first prompt (absent = the hub keeps its own)
+            hide = lambda d: {k: v for k, v in strip(d).items() if k != "name"}
+            off = [self._off_row(d) for d in agents]
+            off_pids = {d.get("pid") for d, o in zip(agents, off) if o and d.get("pid")}   # that session's process too
+            sessions = [hide(d) if self._off_row(d) else public(d) for d in sessions]
+            agents = [hide(d) if o else public(d) for d, o in zip(agents, off)]
+            processes = [hide(d) if self._off_row(d) or d.get("pid") in off_pids else public(d) for d in processes]
+        else:
+            sessions, processes, agents = ([public(d) for d in rows] for rows in (sessions, processes, agents))
         return {"available": bool(self.bin), "bin": self.bin, "version": self.check_version(), "user": _whoami(), "home": self.home,
                 "sessions": sessions, "processes": processes,
                 "agents": agents, "features": self.FEATURES, "policy": policy,
@@ -1490,9 +1547,12 @@ class ClaudeRunner:
 
         stderr_tail: deque = deque(maxlen=30)
         transcript = self.policy()["transcript"]
-        if transcript == "full" and in_off_dir(self.cfg, cwd):   # G-02: min(configured, summary) inside an off dir
-            transcript = "summary"
+        offs = transcript == "full" and bool(_csv(self.cfg.get("AVM_TASK_LOG_OFF_DIRS", "")))
+        # G-02: min(configured, summary) inside an off dir - or resuming a session that worked in one (I-02)
+        if offs and (in_off_dir(self.cfg, cwd) or self._worked_off(job.get("resume_session"))):
+            transcript, offs = "summary", False
             log.info("claude job #%d runs in an AVM_TASK_LOG_OFF_DIRS directory: summary transcript only", jid)
+        last_look = -1e9
 
         def drain_err() -> None:
             assert proc.stderr is not None
@@ -1530,6 +1590,13 @@ class ClaudeRunner:
                 session_id = ev["session_id"]
             if ev.get("type") == "result":
                 final = ev
+            if offs:   # I-02: checked while it runs - from the first event that shows work in an off dir, summary only
+                look = bool(session_id) and time.monotonic() - last_look >= self.OFF_LOOK_SEC
+                if look:
+                    last_look = time.monotonic()
+                if _shows_off_dir(self.cfg, ev) or (look and self._worked_off(session_id)):
+                    transcript, offs = "summary", False
+                    log.info("claude job #%d works in an AVM_TASK_LOG_OFF_DIRS directory: summary transcript from here on", jid)
             compact = _compact_event(ev, transcript)
             if compact is not None:
                 batch.append(compact)
@@ -1558,6 +1625,11 @@ class ClaudeRunner:
             "cost_usd": final.get("total_cost_usd"), "duration_ms": final.get("duration_ms"), "num_turns": final.get("num_turns"), "error": err})
         log.info("claude job #%d %s (rc=%s)", jid, status, rc)
         self._done()
+
+    def _worked_off(self, session_id: Optional[str]) -> bool:
+        """Has this session's transcript (on this host) recorded a cwd inside an AVM_TASK_LOG_OFF_DIRS dir? (I-02)"""
+        fp = self._transcript(session_id) if session_id and re.fullmatch(r"[0-9a-f-]{8,64}", session_id) else None
+        return bool(fp) and any(in_off_dir(self.cfg, c) for c in self._seen_cwds(fp))
 
     def _done(self) -> None:
         with self.lock:
@@ -1680,6 +1752,43 @@ class ClaudeRunner:
             body["new_key"] = new_key
         self._post("/claude/jobs/%d/finish" % jid, body)
         log.info("claude %s of %s: %s%s", action, key or sid, "ok" if ok else "failed", " -> " + new_key if new_key else "")
+
+
+def _shows_off_dir(cfg: Dict[str, str], ev: Dict[str, Any]) -> bool:
+    """Does a dashboard job's stream-json event show work in an AVM_TASK_LOG_OFF_DIRS dir (I-02)? Its cwd, or a tool
+    input naming a path in one (a Read of a file there, a Bash `cd` there) - checked before that event is sent. A
+    path reached some other way (a relative cd, a variable) shows later as the cwd its transcript records."""
+    if ev.get("cwd") and in_off_dir(cfg, str(ev["cwd"])):
+        return True
+    content = (ev.get("message") or {}).get("content") if isinstance(ev.get("message"), dict) else None
+    texts: List[str] = []
+
+    def walk(x: Any) -> None:
+        if isinstance(x, str):
+            texts.append(os.path.normcase(x))
+        elif isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+
+    for c in content if isinstance(content, list) else []:
+        if isinstance(c, dict) and c.get("type") == "tool_use":
+            walk(c.get("input"))
+    if not texts:
+        return False
+    home = os.path.expanduser("~")
+    needles = set()
+    for d in _csv(cfg.get("AVM_TASK_LOG_OFF_DIRS", "")):
+        for n in (os.path.expanduser(d), os.path.realpath(os.path.expanduser(d))):
+            n = os.path.normcase(n).rstrip("/\\")
+            if n:
+                needles.add(n)
+                if n.startswith(os.path.normcase(home) + os.sep):   # ~/data as the tool wrote it
+                    needles.add("~" + n[len(home):])
+    # a substring, not a path match: /data/ab also counts for /data/a - more summaries, never fewer
+    return any(n in t for n in needles for t in texts)
 
 
 def _compact_event(ev: Dict[str, Any], level: str = "full") -> Optional[Dict[str, Any]]:

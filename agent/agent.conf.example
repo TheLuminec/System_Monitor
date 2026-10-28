@@ -88,12 +88,14 @@ AVM_AUTO_UPDATE=true
 #AVM_STATE_DIR=
 
 # --- avm (the task CLI reads this file too) ------------------------------------------------
-# off = no output lines, command line or working directory of avm tasks leave this host (name, status, rc, timing and
-# note still do). "off" in any agent.conf avm can read wins. Per run: avm run --log / --no-log.
+# off = no output lines, command line, working directory, --note text or queue reasons of avm tasks leave this host
+# (name, status, rc, timing and avm's own status note still do). "off" in any agent.conf avm can read wins. Per run:
+# avm run --log / --no-log.
 #AVM_TASK_LOG=on
-# Same, only for runs whose working directory is inside one of these (comma list). The agent applies it too: Claude
-# sessions working inside one report no snippets, and a dashboard prompt run inside one sends at most a summary
-# transcript (the agent reads its own agent.conf only, so list them here, not just in another avm config).
+# Same, only for runs whose working directory is inside one of these (comma list). The agent applies it too: a Claude
+# session that worked inside one at any point (any cwd its transcript recorded), or whose directory can't be read,
+# reports no snippets, name or process arguments; a dashboard prompt sends at most a summary transcript from the
+# moment it works inside one (the agent reads its own agent.conf only, so list them here, not just in another avm config).
 #AVM_TASK_LOG_OFF_DIRS=
 # Queue (`avm run --wait`, --gpu/--mem/--vram): free-RAM headroom in GB, how long a started job's declared
 # reservation counts, and the shared queue directory (default /run/avm-queue if it exists, else /tmp/avm-queue).
