@@ -14,7 +14,7 @@ from . import checks as ck
 from .auth import Identity
 from .core import db, hub, require_agent, require_same_origin, require_operator, require_viewer
 from .db import HostRow
-from .routes_ops import tracked_public
+from .routes_ops import JOB_MODES, tracked_public
 
 log = logging.getLogger("avalon.checks")
 router = APIRouter(prefix="/api/v1")
@@ -22,6 +22,9 @@ router = APIRouter(prefix="/api/v1")
 # The non-check host settings the panel edits (every key of the UI's SETTING_LABELS: the panel sends them all, and the
 # checklist must show the current AVM_DATA_USE, or saving another setting would erase a sticky data-use flag).
 SETTING_KEYS = ("AVM_COMMIT_WARN_PCT", "AVM_TAILSCALE_MIN", "AVM_DATA_USE", "AVM_PROCESSES", "AVM_TAGS")
+ALERT_MODE = r"^(" + "|".join(JOB_MODES) + r")$"   # the modes a dashboard prompt may use (routes_ops.JOB_MODES)
+# what an agent token may not change on a check an operator raised above plan: who is woken, where, and for what
+OPERATOR_ONLY_WHEN_RAISED = ("target", "notify", "notify_cwd")
 
 
 class CheckIn(BaseModel):
@@ -35,6 +38,8 @@ class CheckIn(BaseModel):
     cooldown_min: Optional[float] = Field(default=None, ge=ck.MIN_COOLDOWN_MIN, le=7 * 1440)
     daily_cap: Optional[int] = Field(default=None, ge=1, le=48)
     session: Optional[dict] = None       # avm: the calling Claude session (key, session_id, kind, name, cwd) for notify=self
+    alert_mode: Optional[str] = Field(default=None, pattern=ALERT_MODE)   # operator routes only above plan
+    confirm_full: bool = False           # alert_mode=full, as for a dashboard prompt
 
 
 class CheckPatch(BaseModel):
@@ -47,6 +52,8 @@ class CheckPatch(BaseModel):
     cooldown_min: Optional[float] = Field(default=None, ge=ck.MIN_COOLDOWN_MIN, le=7 * 1440)
     daily_cap: Optional[int] = Field(default=None, ge=1, le=48)
     session: Optional[dict] = None
+    alert_mode: Optional[str] = Field(default=None, pattern=ALERT_MODE)
+    confirm_full: bool = False
 
 
 def _clean(target: str, kind: str) -> str:
@@ -99,6 +106,34 @@ async def _fields(host: HostRow, body: Any, owner: Optional[str]) -> dict:
     return f
 
 
+def _operator_mode(body: Any) -> dict:
+    """Alert mode: the alert_mode column from an operator's CheckIn/CheckPatch ({} when the body has none, so a save
+    without it keeps the current mode). plan is stored as NULL; full needs confirm_full, as for a dashboard prompt."""
+    if body.alert_mode is None:
+        return {}
+    if body.alert_mode == "full" and not body.confirm_full:
+        raise HTTPException(422, "alert mode full requires confirm_full=true")
+    return {"alert_mode": None if body.alert_mode == "plan" else body.alert_mode}
+
+
+def _agent_mode(body: Any, row: Optional[dict]) -> dict:
+    """Alert mode: what an agent token (avm check add/set) may do to it. It can't raise a check above plan (403), can
+    lower one to plan by sending plan, and leaves it alone otherwise. On a check an operator raised it also can't
+    change the target, the responder or its working dir (403), or a session could point a raised alert at itself."""
+    if body.alert_mode not in (None, "plan"):
+        raise HTTPException(403, "only an operator (the dashboard) can raise a check's alert mode above plan")
+    if row is not None and row.get("alert_mode") and body.alert_mode is None:
+        sent = {k: getattr(body, k, None) for k in OPERATOR_ONLY_WHEN_RAISED}
+        same = {"target": (sent["target"] or "").strip() == row["target"],
+                "notify": sent["notify"] == (row.get("notify") or "none"),   # "self" never counts as the same
+                "notify_cwd": (sent["notify_cwd"] or "").strip() == (row.get("notify_cwd") or "")}
+        changing = [k for k in OPERATOR_ONLY_WHEN_RAISED if sent[k] is not None and not same[k]]
+        if changing:
+            raise HTTPException(403, f"this check's alert mode is {row['alert_mode']} (set by an operator): change its "
+                                     f"{', '.join(changing)} from the dashboard, or send alert_mode=plan first")
+    return {"alert_mode": None} if body.alert_mode == "plan" else {}
+
+
 async def _changed(host_id: int, name: str, row: Optional[dict] = None, deleted: Optional[int] = None) -> None:
     rev = await run_in_threadpool(ck.sync_config, db, host_id)
     if rev is not None:
@@ -109,14 +144,23 @@ async def _changed(host_id: int, name: str, row: Optional[dict] = None, deleted:
         await hub.broadcast({"type": "check_deleted", "id": deleted, "host": name})
 
 
-async def _add(host: HostRow, body: CheckIn, by: str, owner: Optional[str]) -> dict:
+async def _add(host: HostRow, body: CheckIn, by: str, owner: Optional[str], operator: bool) -> dict:
     key = ck.KINDS[body.kind][0]
     target = _clean(body.target, body.kind)
+    rows = await run_in_threadpool(db.checks_list, host.id)
+    if operator:
+        mode = _operator_mode(body)
+    else:   # avm check add on an existing key+target updates that row: the same limits as avm check set
+        mode = _agent_mode(body, next((r for r in rows if r["key"] == key and r["target"] == target), None))
+        for r in rows:   # replacing an operator-raised memory floor is changing its target
+            if key in ck.SINGLE_KEYS and r["key"] == key and r["target"] != target and r.get("alert_mode") and body.alert_mode is None:
+                raise HTTPException(403, f"the memory floor's alert mode is {r['alert_mode']} (set by an operator): "
+                                         "change it from the dashboard")
     if key in ck.SINGLE_KEYS:   # one memory floor per host: replace the old one
-        for r in await run_in_threadpool(db.checks_list, host.id):
+        for r in rows:
             if r["key"] == key and r["target"] != target:
                 await run_in_threadpool(db.check_delete, r["id"])
-    fields = await _fields(host, body, owner)
+    fields = {**await _fields(host, body, owner), **mode}
     row = await run_in_threadpool(db.check_add, host.id, key, target, fields, by)
     log.info("%s added check %s %s on %s", by, body.kind, target, host.name)
     await _changed(host.id, host.name, row)
@@ -124,10 +168,12 @@ async def _add(host: HostRow, body: CheckIn, by: str, owner: Optional[str]) -> d
 
 
 async def _patch(host: HostRow, cid: int, body: CheckPatch, host_only: bool) -> dict:
+    """host_only: the agent-token route (its own host only, and the agent's limits on alert mode)."""
     row = await run_in_threadpool(db.check_get, cid)
     if not row or row["host_id"] != host.id:
         raise HTTPException(404, "no such check" + (" on this host" if host_only else ""))
-    fields = await _fields(host, body, None)
+    mode = _agent_mode(body, row) if host_only else _operator_mode(body)
+    fields = {**await _fields(host, body, None), **mode}
     if body.target is not None:
         fields["target"] = _clean(body.target, ck.KIND_OF_KEY.get(row["key"], ""))
     try:
@@ -190,7 +236,7 @@ async def checklist_add(name: str, body: CheckIn, request: Request, ident: Ident
     require_same_origin(request)
     if body.notify == "self":
         raise HTTPException(422, "notify=self is for avm inside a Claude session; pick a tracked agent here")
-    return {"ok": True, "check": await _add(await _host(name), body, ident.subject, None)}
+    return {"ok": True, "check": await _add(await _host(name), body, ident.subject, None, True)}
 
 
 @router.patch("/checklist/{cid}")
@@ -231,7 +277,7 @@ async def agent_checks(host: HostRow = Depends(require_agent)):
 @router.post("/agent/checks")
 async def agent_check_add(body: CheckIn, host: HostRow = Depends(require_agent)):
     owner = (body.session or {}).get("key")
-    return {"ok": True, "check": await _add(host, body, f"avm@{host.name}", owner)}
+    return {"ok": True, "check": await _add(host, body, f"avm@{host.name}", owner, False)}
 
 
 @router.patch("/agent/checks/{cid}")

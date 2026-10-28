@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS claude_jobs (
     status          TEXT NOT NULL,        -- queued | running | done | failed | cancelled
     prompt          TEXT NOT NULL,
     cwd             TEXT,
-    mode            TEXT NOT NULL,        -- plan | acceptEdits | full
+    mode            TEXT NOT NULL,        -- plan | acceptEdits | auto | full
     model           TEXT,
     resume_session  TEXT,
     session_id      TEXT,
@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS host_checks (
     known_state     TEXT,                 -- last ok | failing reported (state may be unknown in between)
     fire_log        TEXT,                 -- JSON list of alert times in the last 24 h (the rolling cap)
     hold_reason     TEXT,                 -- why a pending alert hasn't gone out (cap, cooldown, host policy, ...)
+    alert_mode      TEXT,                 -- permission mode of its responder prompt (NULL = plan; operator-set only)
     UNIQUE(host_id, key, target)
 );
 
@@ -331,9 +332,9 @@ class Database:
                                   # acked: a failed prompt dismissed from Alerts
                 self._conn.execute(f"ALTER TABLE claude_jobs ADD COLUMN {col} {ddl}")
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(host_checks)")}
-        for col, ddl in (("known_state", "TEXT"), ("fire_log", "TEXT"), ("hold_reason", "TEXT")):
+        for col, ddl in (("known_state", "TEXT"), ("fire_log", "TEXT"), ("hold_reason", "TEXT"), ("alert_mode", "TEXT")):
             if col not in cols:   # known_state: last ok/failing across unknown gaps; fire_log: rolling 24 h alert cap;
-                                  # hold_reason: why a pending alert is held
+                                  # hold_reason: why a pending alert is held; alert_mode: responder mode (NULL = plan)
                 self._conn.execute(f"ALTER TABLE host_checks ADD COLUMN {col} {ddl}")
         self._backfill_known_state()
         self._import_legacy_checks()
@@ -861,7 +862,8 @@ class Database:
             return self._conn.execute("DELETE FROM claude_jobs WHERE status IN ('done','failed','cancelled') AND created < ?", (now - days * 86400,)).rowcount
 
     # ------------------------------------------------------------- checks
-    CHECK_EDITABLE = ("label", "expires", "notify", "notify_cwd", "notify_log", "cooldown_min", "daily_cap", "target", "owner")
+    CHECK_EDITABLE = ("label", "expires", "notify", "notify_cwd", "notify_log", "cooldown_min", "daily_cap", "target", "owner",
+                      "alert_mode")
     CHECK_STATE = ("state", "since", "last_ok", "detail", "last_fired", "fires_day", "fires_n", "open_job", "pending",
                    "known_state", "fire_log", "hold_reason")
 

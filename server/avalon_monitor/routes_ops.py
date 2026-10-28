@@ -18,7 +18,7 @@ from .db import HostRow
 log = logging.getLogger("avalon.ops")
 router = APIRouter(prefix="/api/v1")
 
-JOB_MODES = ("plan", "acceptEdits", "full")
+JOB_MODES = ("plan", "acceptEdits", "auto", "full")   # lowest to highest; "auto" = Claude Code's auto mode
 MAX_PROMPT = 20000
 
 
@@ -231,7 +231,7 @@ class JobFinish(BaseModel):
     new_key: Optional[str] = Field(default=None, max_length=80)   # restart came back as a new background agent
 
 
-MODE_RANK = {"plan": 0, "acceptEdits": 1, "full": 2}
+MODE_RANK = {m: i for i, m in enumerate(JOB_MODES)}   # plan < acceptEdits < auto < full
 
 
 def host_policy_refusal(h: HostRow, mode: Optional[str] = None, action: Optional[str] = None,

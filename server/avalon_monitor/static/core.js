@@ -54,7 +54,7 @@ export function guard(el) {
 // A host's own limits on dashboard prompts (agent.conf, E-04), as its agent reports them in sample.claude.policy:
 // {max_mode, actions, jobs, transcript, snippets}. Older agents send none and enforce no cap of their own: the hub
 // refuses prompts and actions to them (F-06), so nothing is offered here either.
-export const MODE_RANK = { plan: 0, acceptEdits: 1, full: 2 };
+export const MODE_RANK = { plan: 0, acceptEdits: 1, auto: 2, full: 3 };   // the hub's routes_ops.JOB_MODES order
 export function modeAllowed(mode, policy) {
   if (!policy || policy.jobs === false) return false;
   return (MODE_RANK[mode] ?? 99) <= (MODE_RANK[policy.max_mode] ?? 0);   // the agent treats an unknown cap as plan

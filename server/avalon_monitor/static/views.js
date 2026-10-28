@@ -318,7 +318,7 @@ async function trackedAction(t, action) {
   catch (e) { toast(e.message, true); }
 }
 
-const MODE_LABEL = { plan: "Plan / read-only", acceptEdits: "Accept edits", full: "Full access" };
+const MODE_LABEL = { plan: "Plan / read-only", acceptEdits: "Accept edits", auto: "Auto", full: "Full access" };
 
 export async function renderAgents(params = {}) {
   const app = $("#app"); app.innerHTML = "";

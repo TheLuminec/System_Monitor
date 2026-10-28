@@ -115,7 +115,7 @@ hub, the dashboard and a modified hub can't raise them:
 
 | Setting | Default | Effect |
 |---------|---------|--------|
-| `AVM_MAX_JOB_MODE` | `plan` | highest permission mode a dashboard prompt may use here: `plan`, `acceptEdits` or `full`. A higher request is refused, not downgraded |
+| `AVM_MAX_JOB_MODE` | `plan` | highest permission mode a dashboard prompt may use here: `plan`, `acceptEdits`, `auto` (Claude Code's auto mode) or `full`, in that order. A higher request is refused, not downgraded |
 | `AVM_ALLOW_ACTIONS` | `true` | allow restart/stop of tracked Claude sessions from the dashboard |
 | `AVM_ALLOW_ROOT_JOBS` | `false` | an agent running as root (Linux) or SYSTEM (Windows) refuses all prompts, responder alerts and actions unless this is on. A Windows agent installed as SYSTEM (e.g. LAPTOP-C) is in this state; use the rootless / `-AsCurrentUser` install for prompts |
 | `AVM_JOB_TRANSCRIPT` | `full` | what a prompt's transcript sends to the hub: `full`, `summary` (final answer and tool names only) or `off` (status and metadata only) |
@@ -128,8 +128,15 @@ hub, the dashboard and a modified hub can't raise them:
 `AVM_AUTO_UPDATE=false` stops self-updates on a host entirely.
 
 The hub may set only `AVM_WATCH_*`, `AVM_MEM_AVAILABLE_WARN_GB`, `AVM_PROCESSES` and `AVM_TAGS` on an agent. Responder
-alerts from checks are always plan-mode prompts, never include a content check's file line, and are held (not
-queued, the reason shown on the check) when the host's agent policy would refuse a plan prompt.
+alerts from checks are plan-mode prompts by default and never include a content check's file line. An operator (the
+dashboard's Checks panel, an operator-guarded route) can raise one check's *alert mode* to `acceptEdits`, `auto` or `full`
+(`full` needs `confirm_full`, as for a dashboard prompt); the agent token (`avm check add/set`) can't, and can't
+retarget the responder, working dir or target of a check whose mode was raised. The mode is still capped by the
+host's own `AVM_MAX_JOB_MODE`: an alert whose mode the host's reported policy refuses (above its cap, no policy, or
+root) is held, not queued, with the reason shown on the check - never sent in a lower mode - and the agent refuses
+it again on its side. This is acceptable because the alert text is fixed by the hub (the template, the check, the
+host's own detail and task lines, the read-only guard text): a check failing only chooses *when* that prompt goes
+out, never what it says, and the operator chose the session and mode beforehand.
 
 ## Hosts with data-use agreements
 
