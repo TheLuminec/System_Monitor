@@ -7,6 +7,7 @@ and on every request notes which agent/ is in the deploy root: that is what the 
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -121,6 +122,8 @@ class World:
                          "AVM_DEPLOY_ROOT": str(self.root), "AVM_DEPLOY_UNIT_DIR": str(tmp / "units"),
                          "AVM_DEPLOY_HEALTH_URL": self.hub.url, "AVM_DEPLOY_HEALTH_TRIES": "2",
                          "AVM_DEPLOY_BACKUP_AVM": str(tmp / "no-backup-avm.py"),   # not this box's real one
+                         "AVM_DEPLOY_BACKUP_CONF": str(tmp / "no-backup-config.json"),
+                         "AVM_DEPLOY_BACKUP_SBIN": str(tmp / "no-sbin"),
                          "AVM_TEST_PYTHON": sys.executable})
 
     def git(self, *args, cwd=None):
@@ -354,8 +357,8 @@ def test_flaky():
 
 @pytest.mark.parametrize("always", [False, True])
 def test_failed_tests_are_retried_once(world, always):
-    """F-11: a failure of pytest alone gets one retry of only the failed tests (pytest --lf): a flaky test then passes
-    and the deploy goes ahead (logged as flaky), a real failure fails twice and refuses. Both attempts are in tests.log."""
+    """F-11: a failure of pytest alone gets one retry of the failed tests' files (whole since I-07): a flaky test then
+    passes and the deploy goes ahead (logged as flaky), a real failure fails twice and refuses. Both attempts are in tests.log."""
     world.write("tests/run.sh", FAKE_SUITE)
     world.write("tests/test_flaky.py", FLAKY)
     world.commit("a flaky test", push=True)
@@ -363,8 +366,8 @@ def test_failed_tests_are_retried_once(world, always):
     flaky.mkdir()
     r = world.deploy("main", env={"FLAKY_DIR": str(flaky), **({"FLAKY_ALWAYS": "1"} if always else {})})
     log = world.log("tests.log")
-    assert "retry of the failed tests only: tests/test_flaky.py::test_flaky" in log
-    assert (flaky / "solid").read_text() == "x"   # the retry ran only the test that failed
+    assert "retry of the files with failed tests: tests/test_flaky.py" in log
+    assert (flaky / "solid").read_text() == "xx"   # the retry reran the failed test's whole file (I-07)
     if always:
         assert r.returncode != 0 and "test suite failed" in r.stderr
         assert log.count("FAILED tests/test_flaky.py::test_flaky") == 2
@@ -409,12 +412,14 @@ def test_run_sh_can_skip_only_pytest(tmp_path):
 
 
 def test_agent_signatures_go_in_place_before_the_code(world):
-    """F-22: a single rsync renames in name order, so agent/avalon_agent.py went live before avalon_agent.py.sig and
-    for a moment the hub served the new code with the old signature. The *.sig files now land first."""
-    world.write("agent/avalon_agent.py.sig", "new-sig\n")
+    """I-08 (F-22): a single rsync renames in name order, so agent/avalon_agent.py went live before avalon_agent.py.sig
+    and for a moment the hub served the new code with the old signature. The *.sig files now land first - and the
+    .sig2 files too (the first rsync took only '*.sig', yet .sig2 is the only signature agents 1.10+ read)."""
+    for ext in ("sig", "sig2"):
+        world.write(f"agent/avalon_agent.py.{ext}", f"new-{ext}\n")
+        (world.root / f"agent/avalon_agent.py.{ext}").write_text(f"old-{ext}\n")
+        os.utime(world.root / f"agent/avalon_agent.py.{ext}", (1_600_000_000, 1_600_000_000))   # an earlier deploy
     world.commit("signed", push=True)
-    (world.root / "agent/avalon_agent.py.sig").write_text("old-sig\n")
-    os.utime(world.root / "agent/avalon_agent.py.sig", (1_600_000_000, 1_600_000_000))   # an earlier deploy (see World)
     real, order = shutil.which("rsync"), world.tmp / "rsync-order"
     # copies INTO the deployed agent/ list what they replace, in the order they replace it
     world.shim("rsync", f'[[ "${{!#}}" != "{world.root}/agent/" ]] || {{ {real} --out-format=%n "$@" >> {order}; exit; }}\n'
@@ -423,7 +428,9 @@ def test_agent_signatures_go_in_place_before_the_code(world):
     assert r.returncode == 0, r.stderr
     names = order.read_text().split()
     assert names.index("avalon_agent.py.sig") < names.index("avalon_agent.py"), names
+    assert names.index("avalon_agent.py.sig2") < names.index("avalon_agent.py"), names
     assert world.agent() == NEW_AGENT and (world.root / "agent/avalon_agent.py.sig").read_text() == "new-sig\n"
+    assert (world.root / "agent/avalon_agent.py.sig2").read_text() == "new-sig2\n"
 
 
 @pytest.mark.parametrize("copy", ["1.9.0", "1.9.1", None])
@@ -443,3 +450,196 @@ def test_warns_when_the_backup_services_avm_is_stale(world, copy):
     if stale:
         assert f"({backup}, v1.9.0), not this release's v1.9.1" in r.stderr
         assert f"sudo {world.repo}/deploy/backup/install-restic-backup.sh /etc/avalon-backup/config.json" in r.stderr
+
+
+def state(world, name):
+    return world.tmp / "state" / "avalon-monitor-deploy" / name
+
+
+def test_redeploying_the_live_commit_keeps_the_rollback_copy(world):
+    """I-05: the agent/ copy failed after the hub went live; the advised re-run of the same commit replaced the rollback
+    copy with a copy of that same release, so --rollback "rolled back" to what was live and v1.1.0 was gone. A redeploy
+    of the live commit now keeps the existing copy."""
+    real = shutil.which("rsync")
+    world.shim("rsync", f'for a in "$@"; do [[ "$a" == */stage.*/agent/ ]] && exit 23; done\nexec {real} "$@"\n')
+    r = world.deploy("main")
+    assert r.returncode != 0 and "copying agent/ failed" in r.stderr
+    assert world.deployed() == "1.2.0" and world.agent() == OLD_AGENT
+    (world.bin / "rsync").unlink()
+
+    r = world.deploy("main")   # the re-run
+    assert r.returncode == 0, r.stderr
+    assert "already live - kept the rollback copy (to v1.1.0)" in r.stdout
+    assert world.agent() == NEW_AGENT
+    assert "rollback: to v1.1.0" in world.deploy("--status").stdout
+
+    r = world.deploy("--rollback")
+    assert r.returncode == 0, r.stderr
+    assert world.deployed() == "1.1.0" and world.agent() == OLD_AGENT
+
+
+def test_rollback_refuses_a_copy_of_the_release_it_undoes(world):
+    """I-05: a rollback copy whose meta has commit == for_commit (what an older deploy-hub.sh left after a redeploy of
+    the live commit) cannot go back anywhere. --rollback refuses it, even with --force, and touches nothing."""
+    assert world.deploy("main").returncode == 0
+    head = world.git("rev-parse", "HEAD")
+    state(world, "rollback/meta").write_text(f"commit={head}\nversion=1.2.0\nfor_commit={head}\nfor_version=1.2.0\n")
+    for args in (["--rollback"], ["--force", "--rollback"]):
+        r = world.deploy(*args)
+        assert r.returncode != 0 and "the same commit it undoes" in r.stderr, r.stderr
+    assert world.restarts() == 1 and world.agent() == NEW_AGENT
+
+
+@pytest.mark.parametrize("sig", ["INT", "TERM", "HUP"])
+def test_interrupt_while_the_new_hub_is_checked_rolls_back(world, sig):
+    """I-06: Ctrl-C / SIGTERM / a dropped ssh during the health wait (or the smoke test) left the new, unchecked release
+    live with no automatic rollback, and neither $STATE/current nor the rollback copy updated. It now restores and
+    restarts the previous code, as a failed health check does, and leaves current and the copy as they were."""
+    assert world.deploy("main").returncode == 0           # 1.1.0 -> 1.2.0
+    v12 = world.git("rev-parse", "HEAD")
+    world.write("server/avalon_monitor/web.py", "N = 1\n")
+    world.commit("v1.30.0", version="1.30.0", push=True)   # not 1.3.0: same size, maybe same mtime second as 1.2.0 - rsync would skip it
+    world.hub.broken = {"1.30.0": "healthz"}               # the deploy sits in wait_healthy
+    p = subprocess.Popen(["bash", str(world.repo / "deploy" / "deploy-hub.sh"), "main"],
+                         env={**world.env, "AVM_DEPLOY_HEALTH_TRIES": "60"},
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        for _ in range(300):
+            if world.hub.version == "1.30.0":   # restarted on the new code: now in wait_healthy
+                break
+            time.sleep(0.1)
+        assert world.restarts() == 2 and world.hub.version == "1.30.0"
+        time.sleep(0.5)
+        p.send_signal(getattr(signal, "SIG" + sig))
+        out, err = p.communicate(timeout=60)
+    finally:
+        p.kill()
+    assert p.returncode != 0
+    assert f"interrupted ({sig})" in err and "rolled back, previous version is live" in err, err
+    assert world.deployed() == "1.2.0" and world.hub.version == "1.2.0" and world.restarts() == 3
+    assert world.agent() == NEW_AGENT
+    assert state(world, "current").read_text().strip() == v12
+    assert "INTERRUPTED" in world.log("deploy.log")
+    # the way back from 1.2.0 is still there and still applies
+    assert "rollback: to v1.1.0" in world.deploy("--status").stdout
+    r = world.deploy("--rollback")
+    assert r.returncode == 0, r.stderr
+    assert world.deployed() == "1.1.0" and world.agent() == OLD_AGENT
+
+
+ORDER = """STATE = {}
+def test_a_sets_global():
+    STATE["x"] = 1
+def test_b_assumes_clean():
+    assert "x" not in STATE
+"""
+
+
+def test_order_dependent_failure_fails_the_retry(world):
+    """I-07: the F-11 retry ran only the failed node ids (--lf), so a test that fails because of an earlier test in
+    its file passed alone and the release shipped as "flaky". The retry reruns the failed tests' whole files."""
+    world.write("tests/run.sh", FAKE_SUITE)
+    world.write("tests/test_order.py", ORDER)
+    world.commit("order-dependent bug", push=True)
+    r = world.deploy("main")
+    log = world.log("tests.log")
+    assert r.returncode != 0 and "test suite failed" in r.stderr
+    assert "retry of the files with failed tests: tests/test_order.py" in log
+    assert log.count("FAILED tests/test_order.py::test_b_assumes_clean") == 2
+    assert world.deployed() == "1.1.0" and world.restarts() == 0
+
+
+def test_a_deploy_that_needed_the_retry_says_flaky_on_stdout(world):
+    """I-07: a deploy that passed only on the retry noted it in deploy.log/syslog alone. It now ends with a FLAKY line
+    on stdout. The retry reruns the failed test's file, not the files that passed."""
+    world.write("tests/run.sh", FAKE_SUITE)
+    world.write("tests/test_flaky.py", FLAKY)
+    world.write("tests/test_other.py", 'import os, pathlib\ndef test_other():\n'
+                                        '    with open(pathlib.Path(os.environ["FLAKY_DIR"]) / "other", "a") as f:\n'
+                                        '        f.write("x")\n')
+    world.commit("a flaky test", push=True)
+    flaky = world.tmp / "flaky"
+    flaky.mkdir()
+    r = world.deploy("main", env={"FLAKY_DIR": str(flaky)})
+    assert r.returncode == 0, r.stderr
+    last = r.stdout.strip().splitlines()[-1]
+    assert last.startswith("FLAKY: pytest failed on ") and "tests/test_flaky.py::test_flaky" in last, r.stdout
+    assert (flaky / "solid").read_text() == "xx" and (flaky / "other").read_text() == "x"
+
+
+def test_sudo_upgrade_records_the_commit_it_installed(world):
+    """I-15: sudo upgrade.sh never wrote $STATE/current, so --status and the next deploy's rollback meta named the
+    commit of the deploy before it, and a --rollback to that copy recorded the wrong commit. upgrade.sh now runs
+    `deploy-hub.sh --record-install` as the operator: HEAD for a clean tree, otherwise current is removed (unknown)."""
+    upgrade = (ROOT / "deploy" / "upgrade.sh").read_text()
+    assert 'sudo -u "$TARGET_USER" -H bash "$REPO_DIR/deploy/deploy-hub.sh" --record-install' in upgrade
+
+    assert world.deploy("main").returncode == 0          # A: 1.2.0
+    world.write("server/avalon_monitor/web.py", "B = 1\n")
+    b = world.commit("B", version="1.3.0", push=True)
+    # what install-server.sh does: the working tree into the deploy root, and a restart
+    (world.root / "server/avalon_monitor/__init__.py").write_text(version_file("1.3.0"))
+    os.utime(world.root / "server/avalon_monitor/__init__.py", (1_600_000_000, 1_600_000_000))   # see World
+    world.hub.version = "1.3.0"
+    r = world.deploy("--record-install")
+    assert r.returncode == 0, r.stderr
+    assert f"recorded the installed commit {b[:7]}" in r.stdout
+    assert f"commit:  {b}" in world.deploy("--status").stdout
+
+    world.write("server/avalon_monitor/web.py", "C = 1\n")
+    world.commit("C", version="1.4.0", push=True)
+    assert world.deploy("main").returncode == 0          # its copy undoes C and holds B
+    r = world.deploy("--rollback")
+    assert r.returncode == 0, r.stderr
+    assert world.deployed() == "1.3.0" and state(world, "current").read_text().strip() == b
+
+    world.write("server/avalon_monitor/web.py", "UNCOMMITTED = 1\n")   # install-server.sh copies the working tree
+    r = world.deploy("--record-install")
+    assert r.returncode == 0 and "not a clean commit" in r.stdout
+    assert not state(world, "current").exists()
+    assert "commit:  unknown" in world.deploy("--status").stdout
+
+
+@pytest.mark.parametrize("runner", ["stale", "current", None])
+def test_warns_when_the_backup_services_runner_is_stale(world, runner):
+    """I-13: F-05 compared only the backup service's copy of avm; its runner (/usr/local/sbin/<unit>, the installed
+    config's "unit") is a root-owned copy of deploy/backup/restic-backup.py that no deploy refreshes either. A copy that
+    differs from the release's warns, with the same refresh command; a current copy, or none, says nothing."""
+    world.write("deploy/backup/restic-backup.py", "# runner v2\n")
+    world.commit("runner", push=True)
+    conf, sbin = world.tmp / "backup-config.json", world.tmp / "sbin"
+    conf.write_text(json.dumps({"name": "AVALON backup", "unit": "my-backup"}))
+    sbin.mkdir()
+    if runner:
+        (sbin / "my-backup").write_text("# runner v1\n" if runner == "stale" else "# runner v2\n")
+    r = world.deploy("main", env={"AVM_DEPLOY_BACKUP_CONF": str(conf), "AVM_DEPLOY_BACKUP_SBIN": str(sbin)})
+    assert r.returncode == 0, r.stderr
+    stale = runner == "stale"
+    assert (f"own copy of the runner ({sbin}/my-backup)" in r.stderr) == stale, r.stderr
+    assert ("install-restic-backup.sh /etc/avalon-backup/config.json" in r.stderr) == stale
+
+
+def test_rollback_says_agents_will_not_follow_a_downgrade(world):
+    """I-14: since F-12, agents 1.10+ refuse a release older than what they run, so after --rollback the hosts stay on
+    the newer agent (with a self-update error) unless their own agent.conf sets AVM_ALLOW_DOWNGRADE=1. --rollback says
+    so when it put back an older agent."""
+    world.write("agent/avalon_agent.py", 'AGENT_VERSION = "1.10.1"\n')
+    world.commit("agent 1.10.1", push=True)
+    (world.root / "agent/avalon_agent.py").write_text('AGENT_VERSION = "1.10.0"\n')
+    os.utime(world.root / "agent/avalon_agent.py", (1_600_000_000, 1_600_000_000))   # an earlier deploy (see World)
+    assert world.deploy("main").returncode == 0
+    assert world.agent() == 'AGENT_VERSION = "1.10.1"\n'
+    r = world.deploy("--rollback")
+    assert r.returncode == 0, r.stderr
+    assert "back at 1.10.0" in r.stdout and "will NOT follow it down" in r.stdout and "AVM_ALLOW_DOWNGRADE=1" in r.stdout
+
+
+def test_rollback_runs_the_smoke_test(world):
+    """I-17: (c) --rollback checked only /healthz, which touches neither the DB nor the UI. It now runs the deploy's
+    smoke test too, and a rolled-back hub that fails it does not get agent/ put back."""
+    assert world.deploy("main").returncode == 0
+    world.hub.broken = {"1.1.0": "stats"}
+    r = world.deploy("--rollback")
+    assert r.returncode != 0
+    assert "smoke test" in r.stderr and "agent/ not restored" in r.stderr, r.stderr
+    assert world.deployed() == "1.1.0" and world.agent() == NEW_AGENT

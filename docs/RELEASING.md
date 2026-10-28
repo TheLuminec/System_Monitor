@@ -147,8 +147,17 @@ deploy/deploy-hub.sh --rollback      # put back what was live before the last de
 `--rollback` restores the copy taken before the last **successful** deploy, server/ first: restart, health check,
 and only then `agent/`, like a deploy. It refuses (unless `--rollback --force`) when that copy doesn't belong to what is
 live now: the last deploy-hub.sh deploy isn't the one it undoes (it was already rolled back), or the version on disk or
-on `/healthz` isn't that deploy's (a `sudo upgrade.sh` since). A deploy that fails keeps the previous copy, so
-`--rollback` still undoes the last good deploy. `--status` shows what the copy holds.
+on `/healthz` isn't that deploy's (a `sudo upgrade.sh` since). A deploy that fails, or is interrupted, keeps the
+previous copy, so `--rollback` still undoes the last good deploy. Redeploying the commit that is already live (the
+re-run after a failed `agent/` copy) keeps it too. A copy that holds the same commit it undoes (left by an older
+deploy-hub.sh) is refused even with `--force`. Like a deploy, `--rollback` smoke-tests the restored hub before it puts
+`agent/` back. `--status` shows what the copy holds.
+
+Rolling back the agent: agents 1.10+ refuse a release older than the one they run (audit F-12). After a `--rollback`
+that put back an older `agent/`, hosts already on the newer agent stay on it and show a self-update error until a
+release with a higher agent version ships (`--rollback` prints a note). To take one host down on purpose, set
+`AVM_ALLOW_DOWNGRADE=1` in that host's own `agent.conf`. Usually the better way back for the fleet is a new release: the
+old code under a new, higher version number, signed and deployed as usual.
 
 What it does, in order:
 
@@ -161,8 +170,9 @@ What it does, in order:
 4. Refuses a lower `__version__` than the deployed one unless `--force` (with a downgrade, every host would
    self-update down too). For a mistake, `--rollback` is the usual way back.
 5. Runs `tests/run.sh` on exactly that tree, with the repo's `.venv`, for at most 600 s. A failure stops the deploy
-   (full output in `~/.local/state/avalon-monitor-deploy/tests.log`). When only pytest failed, the failed tests get
-   one retry (`pytest --lf`) first; a pass then is logged as flaky in `deploy.log`, and both attempts are in
+   (full output in `~/.local/state/avalon-monitor-deploy/tests.log`). When only pytest failed, the files of the failed
+   tests get one retry first, whole, so a test that fails because of an earlier test in its file fails again. A pass
+   then is logged as flaky in `deploy.log` and the deploy ends with a `FLAKY:` line on stdout. Both attempts are in
    `tests.log`. A timeout or a failed static check is not retried. A checkout without `.venv` fails this gate: create
    it as in [Tests](#tests). `--skip-tests` skips pytest, loudly, and is logged; the static checks (`bash -n`,
    `node --check`, `py_compile`) still run.
@@ -170,12 +180,15 @@ What it does, in order:
    `deploy/polkit/50-avalon-monitor-deploy.rules`), waits for `/healthz` to report the new version, and smoke-tests
    `GET /`, `/api/v1/hosts` and `/api/v1/stats` from localhost. If any of that fails, it restores the previous
    `server/` and restarts it. A copy that fails part-way is restored too, so the code on disk is never a mix of old and new.
+   An interrupt in that window (Ctrl-C, SIGTERM, a dropped ssh session) does the same: the previous `server/` goes
+   back and is restarted, and the deployed commit and the rollback copy stay as they were.
 7. Only then copies `agent/`, if `/opt/avalon-monitor/agent` is writable by you. The hub serves it to every host on
-   its next report, so a release that gets rolled back never reaches the fleet. The `.sig` files go in before the code,
-   so the hub never serves new code with an old signature. A failed agent copy is restored.
+   its next report, so a release that gets rolled back never reaches the fleet. The `.sig` and `.sig2` files go in before
+   the code, so the hub never serves new code with an old signature. A failed agent copy is restored.
 8. Warns when the backup service's own root-owned copy of avm (`/usr/local/lib/avalon-backup/avm.py`, from
-   `deploy/backup/install-restic-backup.sh`) has another `AVM_VERSION` than this release. Deploys can't refresh it and
-   it doesn't self-update. Refresh it from a checkout of the deployed commit with
+   `deploy/backup/install-restic-backup.sh`) has another `AVM_VERSION` than this release, or when its copy of the
+   runner (`/usr/local/sbin/<unit>`, the installed config's `unit`) differs from `deploy/backup/restic-backup.py`.
+   Deploys can't refresh them and they don't self-update. Refresh it from a checkout of the deployed commit with
    `sudo deploy/backup/install-restic-backup.sh /etc/avalon-backup/config.json`: that re-reads the installed config,
    keeps the repository, password, schedule and the last run's status, and only re-installs the runner, the config,
    avm and the units (no `--now`, so no backup starts).
@@ -199,6 +212,11 @@ check origin/main or the version, runs no tests, has no health check and no roll
 same time as `server/`. So the fleet sees the new agent before the hub is known to work. Use it only from a clean
 checkout of a pushed commit (`git status` empty), run `tests/run.sh` first, and check the hub afterwards
 (`curl -s http://127.0.0.1:8787/healthz`, the dashboard). Agents still refuse unsigned agent code.
+
+`upgrade.sh` then tells deploy-hub.sh what it installed (`deploy-hub.sh --record-install`, run as `$SUDO_USER`). That
+is the checkout's HEAD when `server/`, `agent/` and the unit file are clean and the installed version is the
+checkout's; otherwise the deployed commit becomes unknown. So `--status` and the next deploy's rollback copy name the
+right commit, and an older rollback copy no longer matches what is live (`--rollback` refuses it).
 
 ## After a deploy
 
