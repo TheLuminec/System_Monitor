@@ -366,7 +366,8 @@ console.log(JSON.stringify([65261.85, 200, 199.6, 80.85, 120, 0, null, undefined
 def test_narrow_host_tables_drop_low_value_columns():
     """F-20, static (source-text) check (no layout engine here): host-page table cards are size containers; below 640 px
     of card width the GPU Fan/Clock and Storage Type columns are hidden and the usage bar shrinks, below 460 px also GPU
-    Power and Storage Size; a table still too wide scrolls with edge shadows and a visible scrollbar."""
+    Power, Storage Size and (I-12) the Top processes User column; a table still too wide scrolls with edge shadows and
+    a visible scrollbar."""
     css = (STATIC / "app.css").read_text()
     assert ".tables > .table-card { container-type: inline-size; }" in css
     assert "@container (max-width: 640px) { .hide-narrow { display: none; } td .bar { width: 56px; } }" in css
@@ -380,3 +381,4 @@ def test_narrow_host_tables_drop_low_value_columns():
     # the header's class is on the matching body cells too
     assert js.count('class: "r num hide-narrow"') == 2 and js.count('class: "r num hide-xnarrow"') == 2
     assert 'class: "muted hide-narrow"' in js
+    assert '["PID", "Name", "User|hide-xnarrow", "r:CPU", "r:Memory"]' in js and 'class: "muted hide-xnarrow" }, p.user' in js

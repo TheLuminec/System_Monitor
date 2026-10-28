@@ -423,6 +423,8 @@ async function renderConsole() {
     ta.placeholder = desktopOnly(c) ? `Prompting ${host.display_name} needs the Claude Code CLI installed there (Claude Desktop's built-in copy only runs inside the app).` : ta.placeholder;
   } else if (!canChange()) { guard(ta); guard(sendBtn); ta.placeholder = roTip(); }   // options stay browsable: they show this host's caps
   const continueIn = (sid, dir) => { resume.value = sid; if (dir) cwd.value = dir; ta.focus(); toast("Next prompt continues this session"); };
+  // a tracked row's directory: the live report's full path when listed (a data-use host's row keeps only the last part)
+  const trackedDir = (t) => [...(c?.agents || []), ...sessions].find((x) => t.session_id && x.session_id === t.session_id && x.cwd)?.cwd || (/[\\/]/.test(t.cwd || "") ? t.cwd : null);
 
   // ---- tracked sessions (registered; kept when stopped or the host is offline)
   const canAct = (c?.features || []).includes("agent_actions");   // c is the raw report: the summary's "actions" flag is not in it
@@ -442,11 +444,11 @@ async function renderConsole() {
     if (pend) actions.push(h("span", { class: "chip warn" }, `${pend.action} ${pend.status === "queued" ? (host.status === "online" ? "queued…" : "queued until the host is back") : "running…"}`));
     else if (t.kind === "desktop") {   // owned by the Desktop app: nothing to restart or prompt from here
       if (!t.live) actions.push(h("span", { class: "muted", style: "font-size:12px" }, "reopen it in Claude Desktop"));
-      if (!t.live && t.session_id && !desktopOnly(c)) actions.push(btn("Prompt it", "", () => continueIn(t.session_id, t.cwd), { title: "continue this conversation with the Claude Code CLI on this host (claude -p --resume)" }));
+      if (!t.live && t.session_id && !desktopOnly(c)) actions.push(btn("Prompt it", "", () => continueIn(t.session_id, trackedDir(t)), { title: "continue this conversation with the Claude Code CLI on this host (claude -p --resume)" }));
     } else if (!t.live || host.status !== "online") {
       actions.push(btn("Restart", "primary", () => trackedAction(t, "restart"), !actBlock ? { title: t.kind === "background" ? "claude respawn: same agent, same conversation" : "resume as a background agent" }
         : { disabled: "", title: actBlock }));
-      if (t.session_id && !desktopOnly(c)) actions.push(btn("Prompt it", "", () => continueIn(t.session_id, t.cwd), { title: "send one prompt that continues this conversation (claude -p --resume)" }));
+      if (t.session_id && !desktopOnly(c)) actions.push(btn("Prompt it", "", () => continueIn(t.session_id, trackedDir(t)), { title: "send one prompt that continues this conversation (claude -p --resume)" }));
     } else if (t.kind === "background") actions.push(btn("Stop", "danger", () => { if (confirm(`Stop ${t.name || t.key}?`)) trackedAction(t, "stop"); }, !actBlock ? {} : { disabled: "", title: actBlock }));
     actions.push(btn("Untrack", "", async () => { if (!confirm(`Stop tracking ${t.name || t.key}? (The session itself is not touched.)`)) return; try { await post(`/api/v1/claude/tracked/${t.id}`, undefined, "DELETE"); } catch (e) { toast(e.message, true); } }, { style: "margin-left:auto" }));
     tbox.append(h("div", { class: "session tracked" },

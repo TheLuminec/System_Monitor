@@ -139,7 +139,12 @@ content-check first lines; and, for checks created with `--with-log`, task log t
 local switches that stop each of these are in [HOSTS.md → Hosts with data-use agreements](HOSTS.md#hosts-with-data-use-agreements).
 
 The hub drops all of these itself for a host marked `AVM_DATA_USE=restricted` or whose agent reports a restricted
-policy (`datause.py`). The mark is sticky: a restricted policy on a host with no `AVM_DATA_USE` stores `restricted`,
-so an agent.conf that later loses its lines can't un-restrict the host - the hub keeps scrubbing and shows a failing
-`data-use policy` check instead. Only an operator lifts it, with `AVM_DATA_USE=off` (also `normal`/`none`), which the
-hub never overwrites.
+policy (`datause.py`). Of a task's meta it keeps only resources, queue timing/position and the code sha
+(`datause.META_KEEP`: never the `--note` or queue reason avm also puts there); tracked sessions keep no text and only
+the last part of their working directory. The mark is sticky: a restricted policy on a host with no `AVM_DATA_USE`
+stores `restricted`, so an agent.conf that later loses its lines can't un-restrict the host - the hub keeps scrubbing
+and shows a failing `data-use policy` check instead. Storing the mark also clears what the hub already held for the
+host: its tasks' command lines, working directories, notes, output and meta text, its prompts' stored transcripts
+(cut to tool names and final answers) and its tracked sessions' text. Only an operator lifts it, with
+`AVM_DATA_USE=off` (also `normal`/`none`), which the hub never overwrites; settings saves change only the keys they
+name, on the settings as stored at that moment, so a save from a page loaded earlier can't drop the mark either.

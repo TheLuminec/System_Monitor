@@ -107,9 +107,11 @@ async def _emit_task(t: dict) -> None:
 async def task_start(body: TaskStart, host: HostRow = Depends(require_agent)):
     if body.source not in ("run", "task", "watch"):
         raise HTTPException(422, "source must be run, task or watch")
-    hide = datause.restricted(host)   # data-use host: no command lines or paths (they can name the data)
+    hide = datause.restricted(host)   # data-use host: no command lines or paths (they can name the data), and of the
+                                      # meta only datause.META_KEEP (avm puts --note and queue reasons there too)
     t = await run_in_threadpool(db.task_create, host.id, body.name, body.source, body.expect_beat, None if hide else body.command,
-                                None if hide else body.cwd, body.pid, body.user, body.meta, body.status)
+                                None if hide else body.cwd, body.pid, body.user, datause.keep_meta(body.meta) if hide else body.meta,
+                                body.status)
     log.info("task #%d '%s' %s on %s", t["id"], t["name"], "queued" if body.status == "queued" else "started", host.name)
     await _emit_task(t)
     return {"ok": True, "id": t["id"], "task": task_public(t)}
@@ -117,9 +119,10 @@ async def task_start(body: TaskStart, host: HostRow = Depends(require_agent)):
 
 @router.post("/tasks/{task_id}/beat")
 async def task_beat(task_id: int, body: TaskUpdate, host: HostRow = Depends(require_agent)):
-    hide = datause.restricted(host)   # data-use host: no output lines, and no notes (free text: `avm ... --note`)
+    hide = datause.restricted(host)   # data-use host: no output lines, no notes (free text: `avm ... --note`), meta as at start
     t = await run_in_threadpool(db.task_update, task_id, host.id, progress=body.progress, note=None if hide else body.note,
-                                pid=body.pid, log_lines=None if hide else body.log, status=body.status, meta=body.meta)
+                                pid=body.pid, log_lines=None if hide else body.log, status=body.status,
+                                meta=datause.keep_meta(body.meta) if hide else body.meta)
     if t is None:
         raise HTTPException(404, "no such task on this host")
     await _emit_task(t)

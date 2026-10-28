@@ -215,9 +215,8 @@ async def check_settings(name: str, request: Request, ident: Identity = Depends(
     if not isinstance(body, dict) or any(k not in SETTING_KEYS for k in body):
         raise HTTPException(422, f"settable here: {', '.join(SETTING_KEYS)}")
     h = await _host(name)
-    cfg = {k: v for k, v in (h.check_config or {}).items() if k not in SETTING_KEYS}
-    cfg.update({k: str(v).strip() for k, v in body.items() if v is not None and str(v).strip()})
-    rev = await run_in_threadpool(db.set_check_config, h.name, ck.render_settings(cfg, await run_in_threadpool(db.checks_list, h.id)))
+    # only the keys in the body change (a partial body never drops AVM_DATA_USE or another setting it leaves out)
+    rev = await run_in_threadpool(ck.put_settings, db, h, body, ident.subject)
     return {"ok": True, "rev": rev}
 
 
