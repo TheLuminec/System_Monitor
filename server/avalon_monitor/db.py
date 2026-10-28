@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from . import datause
 from .models import Sample
 
 _log = logging.getLogger("avalon")
@@ -388,6 +389,11 @@ class Database:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def locked(self) -> threading.RLock:
+        """`with db.locked():` - a read-modify-write across several calls (every method takes this re-entrant lock, so
+        nothing else writes in between): checks.put_settings re-reads a host's settings under it."""
+        return self._lock
 
     # ---------------------------------------------------------------- hosts
     def create_host(self, name: str, display_name: str | None = None, notes: str | None = None) -> tuple[HostRow, str]:
@@ -1008,7 +1014,7 @@ class Database:
                                 continue   # agent < 1.7.2: unknown, keep what we knew
                             v = 1 if v else 0
                         elif isinstance(v, str):
-                            v = v[:500]
+                            v = (datause.last_part(v) if forget and k == "cwd" else v)[:500]
                         if v is None and k in ("name", "cwd", "session_id", "kind", "detail", "last_said"):
                             continue   # keep what we knew
                         if v != r[k]:
@@ -1017,11 +1023,52 @@ class Database:
                         upd["last_live"] = now   # throttled: a heartbeat, not a change worth broadcasting
                 if forget:
                     upd.update({k: None for k in self.TRACK_TEXT if r[k] is not None})
+                    if "cwd" not in upd and r["cwd"] and datause.last_part(r["cwd"]) != r["cwd"]:
+                        upd["cwd"] = datause.last_part(r["cwd"])   # the last part tells rows apart; the path can name the data
                 if upd:
                     self._conn.execute(f"UPDATE claude_tracked SET {', '.join(f'{k}=?' for k in upd)} WHERE id=?", [*upd.values(), r["id"]])
                     if set(upd) - {"last_live", "last_activity"}:
                         changed.append({**r, **upd})
             return changed
+
+    def datause_purge(self, host_id: int) -> tuple[list[dict], list[dict]]:
+        """A host just became a data-use host (AVM_DATA_USE=restricted first stored, main.py ingest): clear what the hub
+        holds from before, as if it had been restricted all along (datause.py). Its tasks lose command, cwd, note and
+        output lines and keep only datause.META_KEEP of their meta; its prompts' stored events are reduced to what
+        AVM_JOB_TRANSCRIPT=summary sends (datause.scrub_event); tracked rows lose their text and all but the last part of
+        their cwd. One transaction. Returns the (tasks, tracked rows) that changed, for broadcasting."""
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                tasks = []
+                for r in self._conn.execute("SELECT * FROM tasks WHERE host_id=?", (host_id,)).fetchall():
+                    meta = json.loads(r["meta"]) if r["meta"] else None
+                    kept = datause.keep_meta(meta)
+                    if r["command"] is None and r["cwd"] is None and r["note"] is None and not r["log"] and kept == meta:
+                        continue
+                    self._conn.execute("UPDATE tasks SET command=NULL, cwd=NULL, note=NULL, log='', meta=? WHERE id=?",
+                                       (json.dumps(kept) if kept else None, r["id"]))
+                    tasks.append(_row(self._conn.execute("SELECT * FROM tasks WHERE id=?", (r["id"],)).fetchone()))
+                for r in self._conn.execute("SELECT e.job_id, e.seq, e.data FROM claude_events e JOIN claude_jobs j ON j.id=e.job_id"
+                                            " WHERE j.host_id=?", (host_id,)).fetchall():
+                    ev = json.loads(r["data"])
+                    small = datause.scrub_event(ev)
+                    if small != ev:
+                        self._conn.execute("UPDATE claude_events SET data=? WHERE job_id=? AND seq=?",
+                                           (json.dumps(small, separators=(",", ":")), r["job_id"], r["seq"]))
+                tracked = []
+                for r in self._conn.execute("SELECT * FROM claude_tracked WHERE host_id=?", (host_id,)).fetchall():
+                    upd = {k: None for k in self.TRACK_TEXT if r[k] is not None}
+                    if r["cwd"] and datause.last_part(r["cwd"]) != r["cwd"]:
+                        upd["cwd"] = datause.last_part(r["cwd"])
+                    if upd:
+                        self._conn.execute(f"UPDATE claude_tracked SET {', '.join(f'{k}=?' for k in upd)} WHERE id=?", [*upd.values(), r["id"]])
+                        tracked.append({**dict(r), **upd})
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return tasks, tracked
 
     # ---------------------------------------------------------------- prefs
     def prefs_get(self, user: str) -> dict:

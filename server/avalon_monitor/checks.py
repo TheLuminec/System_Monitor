@@ -128,24 +128,28 @@ def put_settings(db: Any, host: Any, body: dict, by: Optional[str]) -> int:
     in `body` change: an AVM_WATCH_* key replaces that kind's rows with its entries (rows of entries that stay keep
     their labels, responders and state; "" removes them all), any other key is stored ("" or None removes it).
     Rows of other kinds and settings not in the body are untouched, and a hub-managed host stays managed.
+    The settings are re-read under the database lock, not taken from `host` (read when the request came in): a save
+    racing another (an operator's, the data-use flag stored by ingest) never writes back the value it replaced.
     Returns the new revision."""
-    cfg = {k: v for k, v in (host.check_config or {}).items() if k not in CHECK_KEYS}
-    rows = db.checks_list(host.id)
-    for key, raw in body.items():
-        value = "" if raw is None else str(raw).strip()
-        if key not in CHECK_KEYS:
-            if value:
-                cfg[key] = value
-            else:
-                cfg.pop(key, None)
-            continue
-        wanted = [e.strip() for e in ([value] if key in SINGLE_KEYS else value.split(",")) if e.strip()]
-        for r in rows:
-            if r["key"] == key and r["target"] not in wanted:
-                db.check_delete(r["id"])
-        for target in wanted:
-            db.check_add(host.id, key, target, {}, by)
-    return db.set_check_config(host.name, render_settings(cfg, db.checks_list(host.id)))
+    with db.locked():
+        host = db.host_by_id(host.id) or host
+        cfg = {k: v for k, v in (host.check_config or {}).items() if k not in CHECK_KEYS}
+        rows = db.checks_list(host.id)
+        for key, raw in body.items():
+            value = "" if raw is None else str(raw).strip()
+            if key not in CHECK_KEYS:
+                if value:
+                    cfg[key] = value
+                else:
+                    cfg.pop(key, None)
+                continue
+            wanted = [e.strip() for e in ([value] if key in SINGLE_KEYS else value.split(",")) if e.strip()]
+            for r in rows:
+                if r["key"] == key and r["target"] not in wanted:
+                    db.check_delete(r["id"])
+            for target in wanted:
+                db.check_add(host.id, key, target, {}, by)
+        return db.set_check_config(host.name, render_settings(cfg, db.checks_list(host.id)))
 
 
 def _base(p: str) -> str:
@@ -307,7 +311,7 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                     target = "new"
                 else:
                     live = next((a for a in agents if a.get("key") == t["key"] or (t.get("session_id") and a.get("session_id") == t["session_id"])), None)
-                    cwd = cwd or t.get("cwd")
+                    cwd = cwd or (live or {}).get("cwd") or t.get("cwd")   # a data-use host's row keeps only the last part
                     if live and live.get("live"):
                         if live.get("status") == "busy":
                             hold("the target session is mid-turn")   # try again on a later report

@@ -4,13 +4,15 @@ The agent's own switches (AVM_TASK_LOG, AVM_JOB_TRANSCRIPT, AVM_SESSION_SNIPPETS
 host; this makes a forgotten agent.conf line fail safe. A host is restricted when its hub setting AVM_DATA_USE is
 "restricted" (set on the host page, kept by the hub) OR its agent reports a transcript level below "full". For a
 restricted host the hub drops, before anything is stored or broadcast: task output lines, commands, working
-directories and notes; prompt tool inputs/results and intermediate text; Claude session snippets and process
-arguments; and content-check text.
+directories and notes (of a task's meta only `keep_meta` is stored: never avm's meta.note or queue reason); prompt
+tool inputs/results and intermediate text; Claude session snippets and process arguments; tracked sessions' text and
+all but the last part of their working directory; and content-check text.
 
 Sticky: the first report whose policy is restricted, from a host whose AVM_DATA_USE is unset (empty, or a value that
 is neither on nor off), makes the hub store AVM_DATA_USE=restricted for it (see `sticky`) - so an agent.conf that
 later loses its lines doesn't quietly un-restrict the host: the hub raises a "data-use policy" alert instead and keeps
-scrubbing. Only an operator lifts it, by setting an explicit off value (OFF) on the host page; the hub never
+scrubbing. Storing it also clears what the hub already holds from the host's unrestricted days (db.datause_purge).
+Only an operator lifts it, by setting an explicit off value (OFF) on the host page; the hub never
 overwrites that (while the agent still reports a restricted policy, the host stays restricted through it anyway).
 """
 from __future__ import annotations
@@ -23,6 +25,10 @@ OFF = ("off", "normal", "none", "false", "0", "no")   # an operator lifted it: n
 SNIPPET_KEYS = ("first_prompt", "last_user", "last_assistant", "last_said", "detail", "args")
 WITHHELD = "(withheld: data-use host)"
 CHECK_NAME = "data-use policy"   # hub rule check, failing while the agent's policy no longer matches AVM_DATA_USE
+# A data-use host's task meta keeps only these (avm sends hostname, resources, queue, code and note): key -> allowed
+# subkeys, None = scalars as is. Never meta.note or meta.queue.reason/.disabled - free text that can name the data.
+META_KEEP = {"hostname": None, "resources": None, "queue": ("since", "position", "waited", "max_wait", "inherited"),
+             "code": ("sha", "dirty", "at")}
 
 
 def setting(host: Any) -> str:
@@ -66,6 +72,30 @@ def sticky(host: Any, claude: Optional[dict]) -> tuple[bool, Optional[str]]:
                        "AVM_SESSION_SNIPPETS? The hub keeps scrubbing. Restore those lines, or set "
                        f"{KEY}=off in the host settings if it no longer holds agreement data")
     return False, None
+
+
+def keep_meta(meta: Optional[dict]) -> Optional[dict]:
+    """A task meta reduced to META_KEEP (task start and beat, and stored tasks when the flag is first set). A None
+    value stays: on a beat it removes that key (db.task_update)."""
+    if not isinstance(meta, dict):
+        return None
+    out: dict = {}
+    for k, sub in META_KEEP.items():
+        v = meta.get(k)
+        if k not in meta or isinstance(v, list):
+            continue
+        if isinstance(v, dict):
+            out[k] = {kk: vv for kk, vv in v.items() if (sub is None or kk in sub) and not isinstance(vv, (dict, list))}
+        elif sub is None or v is None:
+            out[k] = v
+    return out or None
+
+
+def last_part(path: Optional[str]) -> Optional[str]:
+    """A working directory's last component: what a tracked session on a data-use host keeps of it."""
+    if not path:
+        return path
+    return path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or path
 
 
 def scrub_claude(claude: Optional[dict]) -> Optional[dict]:

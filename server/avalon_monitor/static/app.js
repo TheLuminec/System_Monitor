@@ -523,8 +523,8 @@ function updateDetail(host) {
     h("td", { class: "r num" }, fmt.temp(g.temp_c)), h("td", { class: "r num hide-xnarrow" }, g.power_w != null ? `${Math.round(g.power_w)}${g.power_limit_w ? " / " + Math.round(g.power_limit_w) : ""} W` : "—"),
     h("td", { class: "r num hide-narrow" }, fmt.pct(g.fan_percent)), h("td", { class: "r num hide-narrow" }, g.clock_mhz != null ? Math.round(g.clock_mhz) + " MHz" : "—")))));
   show("procs", (s.processes || []).length);
-  if ((s.processes || []).length) body("procs").append(table(["PID", "Name", "User", "r:CPU", "r:Memory"], s.processes.map((p) => h("tr", {},
-    h("td", { class: "num muted" }, p.pid), h("td", {}, p.name), h("td", { class: "muted" }, p.user || ""), h("td", { class: "r num" }, fmt.pct(p.cpu_percent, 1)), h("td", { class: "r num" }, `${fmt.bytes(p.mem_rss, 0)} · ${fmt.pct(p.mem_percent, 1)}`)))));
+  if ((s.processes || []).length) body("procs").append(table(["PID", "Name", "User|hide-xnarrow", "r:CPU", "r:Memory"], s.processes.map((p) => h("tr", {},
+    h("td", { class: "num muted" }, p.pid), h("td", {}, p.name), h("td", { class: "muted hide-xnarrow" }, p.user || ""), h("td", { class: "r num" }, fmt.pct(p.cpu_percent, 1)), h("td", { class: "r num" }, `${fmt.bytes(p.mem_rss, 0)} · ${fmt.pct(p.mem_percent, 1)}`)))));
   show("net-if", (s.network?.interfaces || []).length);
   if ((s.network?.interfaces || []).length) body("net-if").append(table(["Interface", "r:Receive", "r:Transmit", "r:Link"], s.network.interfaces.map((i) => h("tr", {},
     h("td", {}, i.name), h("td", { class: "r num" }, fmt.bps(i.rx_bps)), h("td", { class: "r num" }, fmt.bps(i.tx_bps)), h("td", { class: "r num muted" }, i.speed_mbps ? i.speed_mbps + " Mb/s" : (i.up ? "up" : "down"))))));

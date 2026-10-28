@@ -252,13 +252,16 @@ level below `full`, session snippets (the first/last lines of every Claude sessi
 processes' arguments) stay on the host too (`AVM_SESSION_SNIPPETS=auto`).
 
 **Hub-side safety net:** also set *Data-use host* (`AVM_DATA_USE=restricted`) in the host's settings on the
-dashboard. The hub then drops task output lines, commands, working directories and notes, prompt tool
-inputs/results and intermediate text, session snippets and content-check text before storing anything - even if the
-agent.conf lines above are missing. A host whose agent reports a transcript level below `full` (or session snippets
-off) is treated the same way.
+dashboard. The hub then drops task output lines, commands, working directories and notes (also the note and queue
+reason inside a task's meta: only resources, queue timing and the code sha are kept), prompt tool inputs/results and
+intermediate text, session snippets, tracked sessions' text (their working directory keeps only its last part) and
+content-check text before storing anything - even if the agent.conf lines above are missing. A host whose agent
+reports a transcript level below `full` (or session snippets off) is treated the same way.
 
 The restriction is **sticky**. The first report with such a policy from a host whose *Data-use host* setting is
-empty sets it to `restricted` for you (the hub logs it). If the agent later reports `full` again - say its
+empty sets it to `restricted` for you (the hub logs it) and clears what the hub stored from the host before: task
+command lines, working directories, notes and output, prompt transcripts (cut to tool names and final answers) and
+tracked sessions' text. If the agent later reports `full` again - say its
 agent.conf lost the lines above - the host stays restricted, and its card shows a failing **data-use policy**
 check until the agent.conf is fixed. Only you can lift it: set *Data-use host* to `off` (`normal` and `none` work
 too). The hub never overwrites an explicit `off`; while the agent itself still reports a restricted policy the host

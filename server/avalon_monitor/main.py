@@ -107,6 +107,19 @@ _REPORTERS: dict[int, dict[tuple, list[float]]] = {}   # host id -> {(pid, user)
 _DATA_USE_MISMATCH: set[int] = set()   # hosts whose "data-use policy" check is failing (logged once per episode)
 
 
+def _store_data_use(host_id: int, claude: Any) -> Optional[tuple[list[dict], list[dict]]]:
+    """Store AVM_DATA_USE=restricted for a host whose report asks for it (datause.sticky) and clear the text the hub
+    already holds for it (db.datause_purge). Decided again on the settings as they are now, under the database lock:
+    an operator's save that landed since the report came in (=off, say) wins. Returns the purged (tasks, tracked
+    rows), or None when nothing was stored."""
+    with db.locked():
+        h = db.host_by_id(host_id)
+        if h is None or not datause.sticky(h, claude if isinstance(claude, dict) else None)[0]:
+            return None
+        checks_mod.put_settings(db, h, {datause.KEY: "restricted"}, "data-use policy")
+        return db.datause_purge(h.id)
+
+
 def _duplicate_reporters(host_id: int, sample: Sample, now: float) -> Optional[str]:
     """Two agents sharing one host token (e.g. a leftover SYSTEM agent next to a per-user one) make the dashboard
     flip between their reports. Say so when two identities each reported twice within the last minute and are both
@@ -320,10 +333,15 @@ async def ingest(request: Request):
     # AVM_DATA_USE=restricted (the host-settings storage), so a later agent.conf that lost its lines can't un-restrict it;
     # a non-restricted policy on a restricted host raises a failing "data-use policy" check while the hub keeps scrubbing.
     persist, mismatch = datause.sticky(host, sample.claude if isinstance(sample.claude, dict) else None)
-    if persist:
-        await run_in_threadpool(checks_mod.put_settings, db, host, {datause.KEY: "restricted"}, "data-use policy")
-        log.warning("%s reports a restricted data-use policy: %s=restricted stored for it (an operator lifts it with %s=off)",
-                    host.name, datause.KEY, datause.KEY)
+    purged = await run_in_threadpool(_store_data_use, host.id, sample.claude) if persist else None
+    if purged is not None:
+        log.warning("%s reports a restricted data-use policy: %s=restricted stored for it, %d task(s) and %d tracked "
+                    "session(s) cleared of text stored before (an operator lifts it with %s=off)",
+                    host.name, datause.KEY, len(purged[0]), len(purged[1]), datause.KEY)
+        for t in purged[0]:
+            await hub.broadcast({"type": "task", "task": task_public({k: v for k, v in t.items() if k != "log"})})
+        for row in purged[1]:
+            await hub.broadcast({"type": "claude_tracked", "row": tracked_public(row)})
         host = await run_in_threadpool(db.host_by_name, host.name) or host   # adopt/evaluate below must see the new settings
     if mismatch:
         sample.checks.append(Check(name=datause.CHECK_NAME, kind="rule", ok=False, detail=mismatch))
