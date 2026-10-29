@@ -37,9 +37,15 @@ Ready-to-use `agent.conf` contents for the current fleet. Tokens come from
 > session handles it in its own permission mode; the relay's mode, model and tools are fixed by the agent and the check's
 > alert mode doesn't apply to it. If the relay doesn't answer `SENT` (no or several sessions with that name, an
 > error, a timeout) the agent forks the session as before and the job's result says why. Each delivered alert costs
-> one small Haiku turn. A busy session still holds the alert until it is idle; an offline one is resumed; agents
-> without the feature, or with actions off, fork. Details and the prompt-injection limits are in
-> [SECURITY.md](SECURITY.md#agent-local-policy).
+> one small Haiku turn. A busy session still holds the alert until it is idle. An offline **background** session is
+> respawned first (agents that advertise `respawn_deliver`, actions on): the agent runs `claude respawn <id>`, waits
+> (up to 120 s in all) until it is running and not mid-turn, gives its messaging link ~10 s, then relays the alert into
+> it as above (a relay that can't see the name yet is retried up to twice, 15 s apart); the job's result says
+> "respawned <id> and delivered to <name>". Offline terminal sessions, agents without the feature, and any respawn or
+> relay failure fall back to a headless `claude -p --resume` into the session's own conversation (no fork), in the
+> working dir this host recorded for the session; the result says why. Respawning counts as a session action
+> (`AVM_ALLOW_ACTIONS`). Live targets on agents without `deliver_session`, or with actions off, fork. Details and the
+> prompt-injection limits are in [SECURITY.md](SECURITY.md#agent-local-policy).
 
 > **Interpreter isolation.** Both installers create a venv **owned by the agent**
 > (`/opt/avalon-agent/venv` on Linux, `%ProgramData%\AvalonAgent\venv` on Windows)

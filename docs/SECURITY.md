@@ -116,7 +116,7 @@ hub, the dashboard and a modified hub can't raise them:
 | Setting | Default | Effect |
 |---------|---------|--------|
 | `AVM_MAX_JOB_MODE` | `plan` | highest permission mode a dashboard prompt may use here: `plan`, `acceptEdits`, `auto` (Claude Code's auto mode) or `full`, in that order. A higher request is refused, not downgraded |
-| `AVM_ALLOW_ACTIONS` | `true` | allow restart/stop of tracked Claude sessions from the dashboard, and exact-session delivery of check alerts into a live session (off: alerts fork it instead) |
+| `AVM_ALLOW_ACTIONS` | `true` | allow restart/stop of tracked Claude sessions from the dashboard, and exact-session delivery of check alerts into a live session, or into an offline background session after respawning it (off: alerts fork a live session, resume an offline one) |
 | `AVM_ALLOW_ROOT_JOBS` | `false` | an agent running as root (Linux) or SYSTEM (Windows) refuses all prompts, responder alerts and actions unless this is on. A Windows agent installed as SYSTEM (e.g. LAPTOP-C) is in this state; use the rootless / `-AsCurrentUser` install for prompts |
 | `AVM_JOB_TRANSCRIPT` | `full` | what a prompt's transcript sends to the hub: `full`, `summary` (final answer and tool names only) or `off` (status and metadata only) |
 | `AVM_SESSION_SNIPPETS` | `auto` | first/last lines of every Claude session on the host and claude processes' arguments in each report: `on`, `off`, or `auto` (on only when `AVM_JOB_TRANSCRIPT=full`) |
@@ -153,7 +153,16 @@ agent finishes the job "delivered to <name>" only on a final `SENT`; anything el
 an answer falls back to the old fork of the session (in the alert mode, under the same cap), and the job's result
 says why. Deliver jobs need `AVM_ALLOW_ACTIONS` (like restart-with-prompt: messaging a live session is an action on
 it) and jobs allowed (not root); an agent with actions off refuses them, and the hub doesn't queue them there.
-Agents without the feature fork as before; an offline target is still resumed. Prompt injection: the alert text
+Agents without the feature fork as before. An **offline background** session on an agent that advertises
+`respawn_deliver` (actions on) is respawned in place (`claude respawn <id>`: same id, name and conversation) and then
+receives the alert through the same relay: the agent first checks that its own `claude agents` lists that id as a
+background agent (never an id or kind the hub made up), skips the respawn if it is already running, waits up to
+120 s in all for it to run and not be mid-turn, lets its messaging link settle, and retries a relay that answers
+`NOT_SENT` up to twice. Respawning is a session action, so these jobs need `AVM_ALLOW_ACTIONS` as well; an agent with
+actions off refuses them and the hub doesn't queue them there. Offline terminal sessions, agents without the feature,
+and any failure (respawn error, never came back, still busy, relay never `SENT`) fall back to a headless resume of
+the session into its own conversation (no fork) in the alert mode, running in the working dir this host recorded for
+the session (G-03), never the hub's. Prompt injection: the alert text
 includes host-observed paths and task names, so it is untrusted input to the relay. The worst case is that the
 relay sends the alert to a different session on the same host, which sees a peer message, not a user instruction;
 the relay itself can do nothing else, and only its one-line verdict (at most 160 characters) reaches the hub. Cost:

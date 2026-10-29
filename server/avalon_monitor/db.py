@@ -327,10 +327,12 @@ class Database:
             self._conn.execute("ALTER TABLE claude_tracked ADD COLUMN remote_control INTEGER")
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(claude_jobs)")}
         for col, ddl in (("action", "TEXT"), ("target", "TEXT"), ("fork_session", "INTEGER NOT NULL DEFAULT 0"),
-                         ("acked", "REAL"), ("acked_by", "TEXT"), ("deliver", "INTEGER"), ("deliver_name", "TEXT")):
+                         ("acked", "REAL"), ("acked_by", "TEXT"), ("deliver", "INTEGER"), ("deliver_name", "TEXT"),
+                         ("respawn_key", "TEXT")):
             if col not in cols:   # action: restart/stop a tracked session; fork_session: prompt a copy of a live session;
                                   # acked: a failed prompt dismissed from Alerts; deliver: send the prompt into the live
-                                  # session named deliver_name itself (a relay on its host), forking only if that fails
+                                  # session named deliver_name itself (a relay on its host), forking only if that fails;
+                                  # respawn_key: an offline background session to respawn first (headless resume if that fails)
                 self._conn.execute(f"ALTER TABLE claude_jobs ADD COLUMN {col} {ddl}")
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(host_checks)")}
         for col, ddl in (("known_state", "TEXT"), ("fire_log", "TEXT"), ("hold_reason", "TEXT"), ("alert_mode", "TEXT")):
@@ -749,18 +751,19 @@ class Database:
     def job_create(self, host_id: int, prompt: str, cwd: str | None, mode: str, model: str | None,
                    resume_session: str | None, created_by: str | None, action: str | None = None,
                    target: dict | None = None, title: str | None = None, fork_session: bool = False,
-                   deliver_name: str | None = None) -> dict:
+                   deliver_name: str | None = None, respawn_key: str | None = None) -> dict:
         """deliver_name: a check alert for a live session - the agent relays the prompt into the session with that
-        name (exact-session delivery); fork_session/resume_session stay set as its fallback."""
+        name (exact-session delivery); fork_session/resume_session stay set as its fallback. respawn_key: the session
+        is an offline background agent - the agent respawns it first; its fallback is a headless resume (no fork)."""
         now = time.time()
         title = title or (prompt.strip().splitlines()[0][:80] if prompt.strip() else "(empty)")
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO claude_jobs(host_id, status, prompt, cwd, mode, model, resume_session, created, created_by, title, action, target,"
-                " fork_session, deliver, deliver_name) VALUES (?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " fork_session, deliver, deliver_name, respawn_key) VALUES (?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (host_id, prompt, cwd, mode, model, resume_session, now, created_by, title, action,
                  json.dumps(target) if target is not None else None, 1 if fork_session else 0,
-                 1 if deliver_name else None, deliver_name or None),
+                 1 if deliver_name else None, deliver_name or None, (respawn_key or None) if deliver_name else None),
             )
             return _row(self._conn.execute("SELECT * FROM claude_jobs WHERE id=?", (cur.lastrowid,)).fetchone())
 
@@ -781,8 +784,8 @@ class Database:
         with self._lock:
             queued = []
             for r in self._conn.execute(
-                    "SELECT id, prompt, cwd, mode, model, resume_session, action, target, fork_session, deliver, deliver_name"
-                    " FROM claude_jobs WHERE host_id=? AND status='queued' ORDER BY id", (host_id,)).fetchall():
+                    "SELECT id, prompt, cwd, mode, model, resume_session, action, target, fork_session, deliver, deliver_name,"
+                    " respawn_key FROM claude_jobs WHERE host_id=? AND status='queued' ORDER BY id", (host_id,)).fetchall():
                 j = dict(r)
                 if j["action"] and not actions_ok:
                     continue
@@ -790,6 +793,8 @@ class Database:
                     del j["fork_session"]
                 if not (j["deliver"] and j["deliver_name"]):
                     del j["deliver"], j["deliver_name"]
+                if not (j["respawn_key"] and "deliver" in j):
+                    del j["respawn_key"]   # only a respawn delivery carries it
                 if not j["action"]:
                     del j["action"], j["target"]   # prompt jobs look exactly as they did for older agents
                 else:

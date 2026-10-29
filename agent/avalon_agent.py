@@ -1009,8 +1009,16 @@ class ClaudeRunner:
     AGENTS_MAX = 40
     OFF_LOOK_SEC = 2.0   # how often a running prompt's transcript is checked for a cwd in an off dir (I-02)
     # agent_actions: the hub may queue restart/stop jobs here (older agents would run them as prompts); fork_session: may
-    # run a prompt on a copy of a live session; deliver_session: may relay a check alert into a live session itself
-    FEATURES = ["agent_actions", "fork_session", "deliver_session"]
+    # run a prompt on a copy of a live session; deliver_session: may relay a check alert into a live session itself;
+    # respawn_deliver: may respawn an offline background session (respawn_key) and then relay the alert into it
+    FEATURES = ["agent_actions", "fork_session", "deliver_session", "respawn_deliver"]
+    # respawn delivery: the whole respawn -> running -> not busy wait shares one budget; then a short settle for the new
+    # process's Remote Control / messaging link, and a relay that can't see the name yet is retried a little later
+    RESPAWN_READY_SEC = 120
+    RESPAWN_POLL_SEC = 3
+    RESPAWN_SETTLE_SEC = 10
+    RESPAWN_RELAY_TRIES = 3
+    RESPAWN_RETRY_SEC = 15
     RELAY_TIMEOUT_SEC = 120
     RELAY_MODEL = "haiku"   # fixed here (never the job's model): the relay only lists sessions and sends one message
     # exact-session delivery: fixed here, never taken from the hub. The relay may only list sessions and send one
@@ -1059,6 +1067,9 @@ class ClaudeRunner:
                     "with full privileges; run the agent as a normal user to use prompts" % _whoami())
         if job.get("action"):
             return None if p["actions"] else "refused: AVM_ALLOW_ACTIONS is off in this host's agent.conf"
+        if job.get("respawn_key") and not p["actions"]:   # respawning a session (then messaging it) is an action on it
+            return ("refused: AVM_ALLOW_ACTIONS is off in this host's agent.conf (needed to respawn a session and deliver "
+                    "an alert into it)")
         if job.get("deliver") and not p["actions"]:   # messaging a live session is an action on it (like restart-with-prompt)
             return "refused: AVM_ALLOW_ACTIONS is off in this host's agent.conf (needed to deliver an alert into a live session)"
         mode = job.get("mode") or "plan"
@@ -1521,18 +1532,27 @@ class ClaudeRunner:
             return
         fallback = None
         if job.get("deliver") and job.get("deliver_name"):
-            ok, why = self._deliver(job)
+            respawn = job.get("respawn_key")
+            ok, why = self._respawn_deliver(job) if respawn else self._deliver(job)
             if ok:
-                self._post("/claude/jobs/%d/finish" % jid, {"status": "done", "result": "delivered to %s (exact session: it handles "
-                           "the alert in its own conversation and permission mode)" % job["deliver_name"]})
-                log.info("claude job #%d delivered to session %r", jid, job["deliver_name"])
+                done = why if respawn else "delivered to %s" % job["deliver_name"]
+                self._post("/claude/jobs/%d/finish" % jid, {"status": "done", "result": "%s (exact session: it handles "
+                           "the alert in its own conversation and permission mode)" % done})
+                log.info("claude job #%d %s", jid, done)
                 self._done()
                 return
             if why == "cancelled":
                 self._post("/claude/jobs/%d/finish" % jid, {"status": "cancelled"})
                 self._done()
                 return
-            fallback = "exact-session delivery to %s failed (%s); answered in a fork instead" % (job["deliver_name"], why)
+            if respawn:
+                # an offline session: wake it headless into its own conversation (no fork: nothing else writes to it), in
+                # the directory THIS host recorded for it (G-03), never the one the hub named (unknown or gone: home)
+                own = (self._local_session(respawn, job.get("resume_session") or "") or {}).get("cwd") or ""
+                job = dict(job, fork_session=0, cwd=own if own and os.path.isdir(own) else self.home)
+                fallback = "respawn/delivery failed (%s); resumed headless instead" % why
+            else:
+                fallback = "exact-session delivery to %s failed (%s); answered in a fork instead" % (job["deliver_name"], why)
             log.warning("claude job #%d %s", jid, fallback)
         cwd = job.get("cwd") or self.home
         if not os.path.isdir(cwd):
@@ -1673,7 +1693,7 @@ class ClaudeRunner:
             "5. Your final output is exactly one line: SENT if the message was sent; otherwise NOT_SENT: <short reason>.",
             "%s-BEGIN" % mark, text, "%s-END" % mark])
 
-    def _deliver(self, job: Dict[str, Any]) -> Tuple[bool, str]:
+    def _deliver(self, job: Dict[str, Any], announce: bool = True) -> Tuple[bool, str]:
         """Exact-session delivery: a short relay session on Haiku (its own scope, outside every other session's process tree) sends
         the alert text into the live session named job["deliver_name"] as a cross-session message; that session handles
         it in its own permission mode. The relay's mode, model and tools are fixed here - never the job's mode or model, which only the
@@ -1690,7 +1710,8 @@ class ClaudeRunner:
         with self.lock:
             if self.current and self.current["id"] == jid:
                 self.current["proc"] = proc
-        self._post("/claude/jobs/%d/start" % jid, {})
+        if announce:   # a respawn delivery already said so before respawning
+            self._post("/claude/jobs/%d/start" % jid, {})
         log.info("claude job #%d: relaying the alert to session %r", jid, name)
         try:
             out, _err = proc.communicate(timeout=self.RELAY_TIMEOUT_SEC)
@@ -1711,6 +1732,79 @@ class ClaudeRunner:
             return False, "relay exit code %s" % proc.returncode
         # only the relay's own one-line verdict is passed on (what it reported, not anything it may have seen)
         return False, ("relay said: %s" % last[:160]) if last.startswith("NOT_SENT") else "relay did not confirm sending"
+
+    def _now(self) -> float:   # the respawn-delivery clock (tests replace it)
+        return time.monotonic()
+
+    def _sleep(self, secs: float) -> None:
+        time.sleep(secs)
+
+    def _wait(self, jid: int, secs: float) -> bool:
+        """Sleep secs in short steps; False as soon as the job is cancelled."""
+        end = self._now() + secs
+        while self._now() < end:
+            if jid in self.cancel_ids:
+                return False
+            self._sleep(min(1.0, max(0.0, end - self._now())))
+        return jid not in self.cancel_ids
+
+    def _agent_row(self, key: str) -> Optional[Dict[str, Any]]:
+        """`claude agents --json --all`'s row for background agent `key` right now (None: not listed / no answer)."""
+        rc, out = self._claude(["agents", "--json", "--all"], timeout=30)
+        try:
+            rows = json.loads(out[out.index("["):]) if rc == 0 and "[" in out else []
+        except ValueError:
+            rows = []
+        return next((r for r in rows if isinstance(r, dict) and r.get("id") == key), None) if isinstance(rows, list) else None
+
+    def _respawn_deliver(self, job: Dict[str, Any]) -> Tuple[bool, str]:
+        """Respawn delivery: an alert for an OFFLINE background session. Respawn it in place (`claude respawn <key>`: same
+        id, name and conversation) unless it is already running, wait until it is running and not mid-turn, let its
+        messaging link settle, then relay the alert into it like any live session (retrying a relay that can't see the
+        name yet). Everything shares RESPAWN_READY_SEC. Returns (True, what was done) or (False, why not)."""
+        jid, key, name = job["id"], job["respawn_key"], job["deliver_name"]
+        self._post("/claude/jobs/%d/start" % jid, {})
+        deadline = self._now() + self.RESPAWN_READY_SEC
+        local = self._local_session(key, job.get("resume_session") or "")
+        if not local or local.get("kind") != "background":   # only what THIS host lists as a background agent (F-01)
+            return False, "%s is not a background session on this host" % key
+        row = self._agent_row(key)
+        respawned = not (row and row.get("pid"))
+        if respawned:
+            log.info("claude job #%d: respawning background session %s for the alert", jid, key)
+            rc, out = self._claude(["respawn", key], timeout=90)
+            if jid in self.cancel_ids:
+                return False, "cancelled"
+            if rc != 0:
+                tail = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", out or "").strip().splitlines()
+                return False, "respawn %s exit code %s%s" % (key, rc, (": " + tail[-1][:160]) if tail else "")
+            if not self._came_back(key, wait=max(0.0, deadline - self._now())):
+                return False, "%s did not come back after respawn" % key
+            self._agents_at = -1e9   # the dashboard should see it running again on the next report
+        while True:   # running and not mid-turn (idle / waiting): ready for a message
+            if jid in self.cancel_ids:
+                return False, "cancelled"
+            row = self._agent_row(key)
+            if row and row.get("pid") and row.get("status") != "busy":
+                break
+            if self._now() >= deadline:
+                return False, ("%s still busy after %d s" if row and row.get("pid") else "%s not running after %d s") % (
+                    key, self.RESPAWN_READY_SEC)
+            self._sleep(self.RESPAWN_POLL_SEC)
+        if respawned and not self._wait(jid, self.RESPAWN_SETTLE_SEC):
+            return False, "cancelled"
+        why = ""
+        for attempt in range(self.RESPAWN_RELAY_TRIES):
+            if attempt and not self._wait(jid, self.RESPAWN_RETRY_SEC):
+                return False, "cancelled"
+            ok, why = self._deliver(job, announce=False)
+            if ok:
+                return True, ("respawned %s and delivered to %s" % (key, name) if respawned else
+                              "%s was already running; delivered to %s" % (key, name))
+            # NOT_SENT (typically: the name isn't listed yet) is worth another try; a failed or timed-out relay is not
+            if why == "cancelled" or not why.startswith("relay said: NOT_SENT") or self._now() + self.RESPAWN_RETRY_SEC > deadline:
+                break
+        return False, why
 
     def _worked_off(self, session_id: Optional[str]) -> bool:
         """Has this session's transcript (on this host) recorded a cwd inside an AVM_TASK_LOG_OFF_DIRS dir? (I-02)"""

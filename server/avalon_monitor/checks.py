@@ -283,6 +283,10 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
     # only list sessions and send one message); it needs AVM_ALLOW_ACTIONS there, like restart-with-prompt
     can_deliver = "deliver_session" in (claude.get("features") or []) and \
         bool((claude.get("policy") if isinstance(claude.get("policy"), dict) else {}).get("actions"))
+    # respawn delivery: an OFFLINE background session is respawned by the agent and then gets the alert the same way
+    # (respawning is a session action too); its fallback is the headless resume into its own conversation
+    can_respawn = "respawn_deliver" in (claude.get("features") or []) and \
+        bool((claude.get("policy") if isinstance(claude.get("policy"), dict) else {}).get("actions"))
     # what this report's agent says it accepts (no policy / root / a cap below the check's alert mode): the same
     # refusal as a dashboard prompt in that mode, worked out once per mode in use
     refusals: dict[str, Optional[str]] = {}
@@ -346,7 +350,7 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                 fire = False
                 hold(why)
         if fire:
-            resume, fork, deliver, cwd = None, False, None, r.get("notify_cwd")
+            resume, fork, deliver, respawn, cwd = None, False, None, None, r.get("notify_cwd")
             target = r["notify"]
             if target.startswith("tracked:"):
                 t = db.tracked_get(int(target.split(":", 1)[1]))
@@ -368,6 +372,10 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                         # read-only session in its working dir handles it (as for an untracked owner / "new")
                     else:
                         resume = t.get("session_id")   # offline: wake it into its own conversation
+                        name = ((live or {}).get("name") or t.get("name") or "").strip()
+                        kind = (live or {}).get("kind") or t.get("kind")
+                        if can_respawn and kind == "background" and t.get("key") and name:
+                            respawn, deliver = t["key"], name   # better: respawn it, then deliver into it
             if fire:
                 if tasks_cache is None:
                     recent = db.task_list(host.id, None, 60, with_log=bool(r.get("notify_log")))
@@ -378,7 +386,7 @@ def evaluate(db: Any, host: Any, sample: dict, now: float) -> tuple[list[dict], 
                 j = db.check_fire(r["id"], fire_upd, host_id=host.id, prompt=prompt, cwd=cwd, mode=mode, model=None,
                                   resume_session=resume, created_by="check responder",
                                   title=f"alert · {r.get('label') or r['target']}"[:80], fork_session=fork,
-                                  deliver_name=deliver)
+                                  deliver_name=deliver, respawn_key=respawn)
                 if j is not None:   # None: another report for this host fired it first
                     jobs.append(j)
                     upd.update(fire_upd, open_job=j["id"])
