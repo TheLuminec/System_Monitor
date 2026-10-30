@@ -134,9 +134,15 @@ JSON objects with `schema: "<name>-results/<n>"`, `project` equal to the URL slu
 `status`: running / closed / fail / partial / registered / reference, `status_text`, `key_result`,
 `registration`, `updated`, `eta`), `bars` (`title`, `unit`, optional `domain`, `better`, `rows` of
 `label` / `value` / `ci`), `distributions` (`title`, `series` of `label` / `values`, optional
-`point_labels` to join one unit across series) and `notes` (strings). Keep headline `id`s stable:
-history is keyed on them. The hub renders only what is pushed and never reads the project itself,
-so a feed must carry aggregates only.
+`point_labels` to join one unit across series) and `notes` (strings). `bars` also take an optional
+`band: [lo, hi]` with `band_label`, and `dotbars` take `groups` of `bars` (`variant`, `sublabel`, `value`,
+`ci`, `points`, `point_labels`) with `variants`, `series_colors` and `reference_lines`. Optional per-figure
+display fields (hub 1.14.3+; older hubs ignore them): `decimals` (0-6, the precision of value labels;
+default 3), and for dot-bars `points_label` (what the dots are, shown in the legend; default "test users")
+and `baseline` (the value bars grow from, e.g. 0.5 for an AUC; default 0). Keep headline `id`s stable:
+history is keyed on them. There's no dry run and a push can't be deleted, so check a document on a
+throwaway hub before pushing it. The hub renders only what is pushed and never reads the project
+itself, so a feed must carry aggregates only.
 
 Claude sessions launched from the Agents tab are told (via system prompt) to wrap
 long-running work in `avm run`, so their training runs show up as tasks.

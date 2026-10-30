@@ -1,7 +1,7 @@
 // Research results pages: renders the latest document a project pushed with `avm results push`
 // (schema "<name>-results/<n>") and per-metric history across pushes. Everything is rendered as
 // text/SVG from the pushed document only - nothing is ever fetched from the project itself.
-import { $, h, fmt, state, api, on, navigate, toast } from "./core.js?v=1.14.2";
+import { $, h, fmt, state, api, on, navigate, toast } from "./core.js?v=1.14.3";
 
 const NS = "http://www.w3.org/2000/svg";
 function s(tag, attrs = {}, ...kids) {
@@ -12,6 +12,14 @@ function s(tag, attrs = {}, ...kids) {
 }
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const fv = (v) => (num(v) == null ? "—" : Math.abs(v) < 10 ? v.toFixed(3) : v.toPrecision(4));
+// Per-figure options a document may set (all optional; absent = the old behaviour):
+//   decimals      0-6: value labels and tooltips with that many decimals (else 3 below 10)
+//   points_label  dot-bars: what the dots are, in the legend (else "test users")
+//   baseline      dot-bars: bars grow up or down from this value, e.g. 0.5 for an AUC (else 0)
+export const decOf = (fig) => (Number.isInteger(fig?.decimals) && fig.decimals >= 0 && fig.decimals <= 6 ? fig.decimals : null);
+export const fvd = (v, d) => (d == null || num(v) == null ? fv(v) : v.toFixed(d));
+export const pointsLabel = (fig) => "dots: " + (typeof fig?.points_label === "string" && fig.points_label.trim() ? fig.points_label.trim() : "test users");
+export const baseOf = (fig) => (num(fig?.baseline) != null ? fig.baseline : 0);
 const fci = (ci) => (Array.isArray(ci) && num(ci[0]) != null && num(ci[1]) != null ? `[${fv(ci[0])}, ${fv(ci[1])}]` : null);
 const clip = (t, n) => { t = String(t ?? ""); if (t.length <= n) return t; const a = Math.ceil((n - 1) / 2), b = Math.floor((n - 1) / 2); return t.slice(0, a) + "…" + (b ? t.slice(-b) : ""); };
 // Categorical order (validated against both surfaces); identity is always also carried by a text label.
@@ -189,6 +197,7 @@ function programmes(doc) {
 // ---------------------------------------------------------------- bars
 function barFigure(fig) {
   const rows = (fig.rows || []).filter((r) => r && typeof r === "object");
+  const dec = decOf(fig), fval = (v) => fvd(v, dec), fcid = (ci) => (fci(ci) ? `[${fval(ci[0])}, ${fval(ci[1])}]` : null);
   const dom = Array.isArray(fig.domain) && num(fig.domain[0]) != null && num(fig.domain[1]) != null && fig.domain[1] > fig.domain[0]
     ? fig.domain : domainOf(rows.flatMap((r) => [r.value, ...(Array.isArray(r.ci) ? r.ci : [])]), fig.unit === "rate");
   const draw = (W) => {
@@ -201,7 +210,7 @@ function barFigure(fig) {
     const band = Array.isArray(fig.band) && num(fig.band[0]) != null && num(fig.band[1]) != null && fig.band[1] > fig.band[0] ? fig.band : null;
     if (band) {
       const bx = s("rect", { x: x(band[0]), y: top, width: Math.max(1, x(band[1]) - x(band[0])), height: H - axisH - top + 2, class: "band" });
-      tip(bx, `${fig.band_label || "band"}: ${fv(band[0])} to ${fv(band[1])}`);
+      tip(bx, `${fig.band_label || "band"}: ${fval(band[0])} to ${fval(band[1])}`);
       g.append(bx);
     }
     for (const t of ticksFor(dom)) {
@@ -224,10 +233,10 @@ function barFigure(fig) {
           for (const c of r.ci) g.append(s("line", { x1: x(c), x2: x(c), y1: yc - 4, y2: yc + 4, class: "whisk-bar" }));
         }
       }
-      g.append(s("text", { x: W - 2, y: yc + 4, "text-anchor": "end", class: "val" }, fv(v)));
+      g.append(s("text", { x: W - 2, y: yc + 4, "text-anchor": "end", class: "val" }, fval(v)));
       const hit = s("rect", { x: 0, y: yc - RH / 2 - off, width: W, height: RH, fill: "transparent" });
       const extra = Object.entries(r).filter(([k, val]) => !["label", "value", "ci"].includes(k) && (typeof val === "number" || typeof val === "string")).map(([k, val]) => `${k} ${val}`);
-      tip(hit, [`${r.label}: ${fv(v)}`, fci(r.ci) ? "95% CI " + fci(r.ci) : null, ...extra].filter(Boolean).join("\n"));
+      tip(hit, [`${r.label}: ${fval(v)}`, fcid(r.ci) ? "95% CI " + fcid(r.ci) : null, ...extra].filter(Boolean).join("\n"));
       g.append(hit);
     });
     return g;
@@ -368,10 +377,13 @@ function dotbarFigure(fig, colors) {
   const vLabel = (b) => variants.get(b.variant)?.label || b.variant || "";
   const okCi = (ci) => Array.isArray(ci) && num(ci[0]) != null && num(ci[1]) != null;
   const ptsOf = (b) => (Array.isArray(b.points) ? b.points.map((v, i) => ({ v: num(v), i })).filter((p) => p.v != null) : []);
+  const dec = decOf(fig), fval = (v) => fvd(v, dec), fcid = (ci) => (fci(ci) ? `[${fval(ci[0])}, ${fval(ci[1])}]` : null);
+  const base = baseOf(fig);
   const refs = (fig.reference_lines || []).filter((r) => r && num(r.value) != null)
-    .map((r) => ({ ...r, dotted: r.style ? r.style === "dotted" : !r.color_key, color: colors.get(r.color_key) || "var(--ink-3)", lines: wrapText(r.label || fv(r.value), 19, 2) }));
+    .map((r) => ({ ...r, dotted: r.style ? r.style === "dotted" : !r.color_key, color: colors.get(r.color_key) || "var(--ink-3)", lines: wrapText(r.label || fval(r.value), 19, 2) }));
   const dom = Array.isArray(fig.domain) && num(fig.domain[0]) != null && num(fig.domain[1]) != null && fig.domain[1] > fig.domain[0]
-    ? fig.domain : domainOf([...groups.flatMap((g) => g.bars.flatMap((b) => [b.value, ...(okCi(b.ci) ? b.ci : []), ...ptsOf(b).map((p) => p.v)])), ...refs.map((r) => r.value)], fig.unit === "rate");
+    ? fig.domain : domainOf([...groups.flatMap((g) => g.bars.flatMap((b) => [b.value, ...(okCi(b.ci) ? b.ci : []), ...ptsOf(b).map((p) => p.v)])), ...refs.map((r) => r.value),
+      ...(num(fig.baseline) != null ? [base] : [])], fig.unit === "rate");
   const nb = groups.reduce((a, g) => a + g.bars.length, 0);
 
   const draw = (W) => {
@@ -382,7 +394,7 @@ function dotbarFigure(fig, colors) {
     const u = (x1 - x0) / (nb + inU * (nb - groups.length) + gapU * groups.length);
     const bw = Math.min(u, 96);
     const y = (v) => top + plotH - ((Math.max(dom[0], Math.min(dom[1], v)) - dom[0]) / (dom[1] - dom[0])) * plotH;
-    const yb = y(Math.max(dom[0], Math.min(dom[1], 0)));
+    const yb = y(Math.max(dom[0], Math.min(dom[1], base)));   // bars grow up or down from the baseline (0 unless set)
     // horizontal layout: bar centres and group extents
     let cur = x0 + (u * gapU) / 2;
     const lay = groups.map((g) => {
@@ -420,7 +432,7 @@ function dotbarFigure(fig, colors) {
             class: "db-bar " + (hat ? "hatched" : "solid"), fill: hat ? `url(#${patFor(grp.color)})` : null }));
         }
         const hit = s("rect", { x: c - u / 2, y: top, width: u, height: plotH, fill: "transparent" });
-        tip(hit, [`${grp.label || ""} · ${vLabel(b)}${b.sublabel ? " (" + b.sublabel + ")" : ""}`, `value ${fv(v)}${ci ? " · 95% CI " + fci(ci) : ""}`,
+        tip(hit, [`${grp.label || ""} · ${vLabel(b)}${b.sublabel ? " (" + b.sublabel + ")" : ""}`, `value ${fval(v)}${ci ? " · 95% CI " + fcid(ci) : ""}`,
           pts.length ? `${pts.length} point${pts.length === 1 ? "" : "s"}` : null].filter(Boolean).join("\n"));
         fore.push(hit);
         if (ci) {
@@ -433,11 +445,16 @@ function dotbarFigure(fig, colors) {
         pts.forEach((p, k) => {
           const dot = s("circle", { cx: c - span / 2 + (pts.length === 1 ? span / 2 : (span * k) / (pts.length - 1)), cy: y(p.v), r, class: "db-dot" });
           const lab = Array.isArray(b.point_labels) && b.point_labels[p.i] != null ? String(b.point_labels[p.i]) : `#${p.i + 1}`;
-          tip(dot, `${lab}: ${fv(p.v)}\n${grp.label || ""} · ${vLabel(b)}`);
+          tip(dot, `${lab}: ${fval(p.v)}\n${grp.label || ""} · ${vLabel(b)}`);
           fore.push(dot);
         });
-        const yTop = Math.min(v != null ? y(v) : Infinity, ci ? y(Math.max(...ci)) : Infinity, ...pts.map((p) => y(p.v) - r));
-        if (v != null) fore.push(s("text", { x: c, y: Math.max(11, yTop - 6), "text-anchor": "middle", class: "val db-val" }, fv(v)));
+        if (v != null && v < base) {   // a bar below the baseline: its label goes under its lowest mark
+          const yLow = Math.max(y(v), ci ? y(Math.min(...ci)) : -Infinity, ...pts.map((p) => y(p.v) + r));
+          fore.push(s("text", { x: c, y: Math.min(top + plotH - 2, yLow + 13), "text-anchor": "middle", class: "val db-val" }, fval(v)));
+        } else if (v != null) {
+          const yTop = Math.min(y(v), ci ? y(Math.max(...ci)) : Infinity, ...pts.map((p) => y(p.v) - r));
+          fore.push(s("text", { x: c, y: Math.max(11, yTop - 6), "text-anchor": "middle", class: "val db-val" }, fval(v)));
+        }
         subs[gi][j].forEach((line, k) => g.append(s("text", { x: c, y: yLab + 10 + k * 13, "text-anchor": "middle", class: "db-sub" }, line)));
       });
       const gx = (lay[gi].g0 + lay[gi].g1) / 2;
@@ -456,14 +473,14 @@ function dotbarFigure(fig, colors) {
         placed.push({ start: ly, end: ly + 12 * rf.lines.length });
         const t = s("text", { x: W - 2, y: ly, "text-anchor": "end", class: "db-ref-lab" },
           rf.lines.map((l, k) => s("tspan", { x: W - 2, dy: k ? 12 : 0 }, l)));
-        tip(t, `${rf.label || "reference"}: ${fv(rf.value)}`);
+        tip(t, `${rf.label || "reference"}: ${fval(rf.value)}`);
         g.append(t);
       }
     });
     if (narrow) refs.forEach((rf, k) => {
       const yy = yKey + k * 16 + 8;
       g.append(s("line", { x1: x0, x2: x0 + 22, y1: yy, y2: yy, class: "db-c db-ref" + (rf.dotted ? " dotted" : ""), style: `--sc:${rf.color}` }),
-        s("text", { x: x0 + 28, y: yy + 4, class: "db-ref-lab" }, `${rf.label || "reference"} · ${fv(rf.value)}`));
+        s("text", { x: x0 + 28, y: yy + 4, class: "db-ref-lab" }, `${rf.label || "reference"} · ${fval(rf.value)}`));
     });
     g.append(...fore);
     return g;
@@ -473,7 +490,7 @@ function dotbarFigure(fig, colors) {
   const anyPts = groups.some((g) => g.bars.some((b) => ptsOf(b).length)), anyCi = groups.some((g) => g.bars.some((b) => okCi(b.ci)));
   const legend = h("div", { class: "viz-legend" },
     used.map((k) => h("span", {}, swatch(isHatched({ variant: k })), variants.get(k)?.label || k || "value")),
-    anyPts || anyCi ? h("span", { class: "muted" }, [anyPts ? "dots: test users" : null, anyCi ? "whiskers: 95% intervals" : null].filter(Boolean).join("; ")) : null);
+    anyPts || anyCi ? h("span", { class: "muted" }, [anyPts ? pointsLabel(fig) : null, anyCi ? "whiskers: 95% intervals" : null].filter(Boolean).join("; ")) : null);
   const notes = (fig.notes || []).filter((n) => typeof n === "string" && n.trim());
   return h("div", { class: "card table-card fig" },
     h("div", { class: "fig-head" }, h("h3", {}, fig.title || fig.id), fig.unit ? h("span", { class: "muted fig-cap" }, fig.unit) : null),
